@@ -12,19 +12,16 @@ if (!MINDBODY_SOURCE_NAME || !MINDBODY_SOURCE_PASSWORD) {
 }
 
 // Health check
-app.get("/", (req, res) => {
-  res.send("Flow AI Mindbody Webhook is running");
-});
-
-// Mindbody webhook
 app.post("/mindbody", (req, res) => {
   console.log("Incoming Mindbody payload:", req.body);
 
   res.json({
     success: true,
-    message: "Mindbody webhook received",
+    sourceConfigured: Boolean(MINDBODY_SOURCE_NAME),
+    message: "Mindbody webhook received successfully",
   });
 });
+
 
 // ⚠️ THIS MUST EXIST ONCE — NOT TWICE
 const PORT = process.env.PORT || 3000;
