@@ -2,6 +2,14 @@ import express from "express";
 
 const app = express();
 app.use(express.json());
+// Mindbody credentials (read from Railway env vars)
+const MINDBODY_SOURCE_NAME = process.env.MINDBODY_SOURCE_NAME;
+const MINDBODY_SOURCE_PASSWORD = process.env.MINDBODY_SOURCE_PASSWORD;
+
+// Safety check (this will NOT crash the server)
+if (!MINDBODY_SOURCE_NAME || !MINDBODY_SOURCE_PASSWORD) {
+  console.warn("⚠️ Mindbody credentials not set yet");
+}
 
 // Health check
 app.get("/", (req, res) => {
