@@ -9,20 +9,31 @@ app.get("/", (req, res) => {
 });
 
 // MAIN endpoint (Agency Vault will call this)
-app.post("/mindbody", async (req, res) => {
-  try {
-    // Required env vars
-    const siteId = process.env.MINDBODY_SITE_ID; // 5744527
-    const apiKey = process.env.MINDBODY_API_KEY; // you will add later (if needed)
-    const sourceName = process.env.MINDBODY_SOURCE_NAME; // optional depending on API type
-    const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD; // optional depending on API type
+app.post("/mindbody", (req, res) => {
+  const siteId = process.env.MINDBODY_SITE_ID;
 
-    if (!siteId) {
-      return res.status(500).json({
-        success: false,
-        message: "Missing MINDBODY_SITE_ID in Railway Variables",
-      });
-    }
+  // Agency Vault sends parameters as query string, not JSON body
+  const action = req.query.action;
+  const params = { ...req.query };
+  delete params.action;
+
+  if (!action) {
+    return res.status(400).json({
+      success: false,
+      message: "Missing action parameter from AV"
+    });
+  }
+
+  console.log("AV → Webhook", { siteId, action, params });
+
+  return res.json({
+    success: true,
+    siteIdUsed: siteId,
+    actionReceived: action,
+    paramsReceived: params
+  });
+});
+
 
     // What Agency Vault should send
     const { action, params = {} } = req.body || {};
