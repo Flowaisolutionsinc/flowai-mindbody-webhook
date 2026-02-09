@@ -52,40 +52,25 @@ function safeJsonParse(x) {
   }
 }
 
-function normalizeClasses(payload) {
-  // Mindbody responses vary; handle common shapes
+function normalizeArray(payload, keys = []) {
   if (!payload) return [];
   if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload.Classes)) return payload.Classes;
-  if (Array.isArray(payload.classes)) return payload.classes;
-  if (Array.isArray(payload.Results)) return payload.Results;
-  return [];
-}
-
-function normalizePrices(payload) {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload.OnlinePrices)) return payload.OnlinePrices;
-  if (Array.isArray(payload.Prices)) return payload.Prices;
-  if (Array.isArray(payload.Results)) return payload.Results;
-  return [];
-}
-
-function normalizeClients(payload) {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload.Clients)) return payload.Clients;
-  if (Array.isArray(payload.clients)) return payload.clients;
+  for (const k of keys) {
+    if (Array.isArray(payload[k])) return payload[k];
+  }
   if (Array.isArray(payload.Results)) return payload.Results;
   return [];
 }
 
 function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
-  // Mindbody often accepts ISO strings. We'll use "day start" to "day end" as UTC-ish.
-  // If your studio timezone is strict, Mindbody still typically interprets dates correctly server-side.
   const start = new Date(`${dateStr}T00:00:00`);
   const end = new Date(`${dateStr}T23:59:59`);
   return { startISO: start.toISOString(), endISO: end.toISOString() };
+}
+
+function normalizePhone(phone) {
+  if (!phone) return "";
+  return String(phone).trim();
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -107,11 +92,9 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
   const headers = {
     "Content-Type": "application/json",
-    // Mindbody public API headers (common pattern)
     "Api-Key": apiKey,
     SiteId: siteId,
     "Source-Name": sourceName,
-    // Some setups expect "Password", others "SourcePassword"—we send both to be safe.
     Password: sourcePassword,
     SourcePassword: sourcePassword,
   };
@@ -128,7 +111,7 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   if (!res.ok) {
     const detail =
       json ||
-      (text ? { raw: text.slice(0, 500) } : { raw: "(no response body)" });
+      (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
     throw new Error(
       `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
     );
@@ -166,9 +149,6 @@ app.get("/health", (req, res) => {
  * Accepts either:
  * - Query:  /mindbody?action=get_today_schedule&date=YYYY-MM-DD
  * - JSON:   { "action": "get_today_schedule", "params": { ... } }
- *
- * Agency Vault typically sends JSON fields you define as top-level or nested.
- * We accept BOTH.
  */
 app.all("/mindbody", async (req, res) => {
   try {
@@ -179,22 +159,19 @@ app.all("/mindbody", async (req, res) => {
       req.body?.action_type ||
       "";
 
-    // 2) Pull params from:
-    // - req.body.params (preferred)
-    // - plus any extra top-level body fields (if AV sends them)
-    // - plus query params (except action)
+    // 2) Pull params from body.params + extra top-level + query (query wins)
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
 
     const bodyObj = req.body && typeof req.body === "object" ? req.body : {};
-    const paramsFromBody = bodyObj.params && typeof bodyObj.params === "object" ? bodyObj.params : {};
+    const paramsFromBody =
+      bodyObj.params && typeof bodyObj.params === "object" ? bodyObj.params : {};
 
     const extraTopLevelBody = { ...bodyObj };
     delete extraTopLevelBody.action;
     delete extraTopLevelBody.action_type;
     delete extraTopLevelBody.params;
 
-    // Merge order: paramsFromBody <- extraTopLevelBody <- paramsFromQuery (query wins)
     const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
 
     console.log("WEBHOOK_HIT", {
@@ -217,15 +194,12 @@ app.all("/mindbody", async (req, res) => {
      * =====================
      * ACTION: get_today_schedule
      * =====================
-     * Params accepted:
-     * - date (YYYY-MM-DD) optional; defaults to today in America/Vancouver
+     * Mindbody: GET /class/classes :contentReference[oaicite:2]{index=2}
      */
     if (action === "get_today_schedule") {
       const date = params.date || nowInTZDateString("America/Vancouver");
       const { startISO, endISO } = toISODateRangeForDay(date);
 
-      // Mindbody endpoint commonly used for schedule:
-      // GET /class/classes?StartDateTime=...&EndDateTime=...
       const data = await mbFetch("/class/classes", {
         method: "GET",
         query: {
@@ -234,7 +208,8 @@ app.all("/mindbody", async (req, res) => {
         },
       });
 
-      const classes = normalizeClasses(data).map((c) => ({
+      const classesRaw = normalizeArray(data, ["Classes", "classes"]);
+      const classes = classesRaw.map((c) => ({
         classId: c.Id ?? c.ClassId ?? c.classId ?? null,
         name: c.ClassDescription?.Name ?? c.Name ?? c.className ?? "Class",
         startDateTime: c.StartDateTime ?? c.startDateTime ?? null,
@@ -253,7 +228,6 @@ app.all("/mindbody", async (req, res) => {
         actionReceived: action,
         date,
         classes,
-        raw: data, // keep for debugging
       });
     }
 
@@ -261,41 +235,51 @@ app.all("/mindbody", async (req, res) => {
      * =====================
      * ACTION: get_pricing_offers
      * =====================
-     * Params accepted (optional, used mainly for filtering or future logic):
-     * - pricing_interest
-     * - is_new_client
-     * - membership_interest
-     * - class_pack_interest
-     * - notes
+     * Public v6 Sale endpoints:
+     * - GET /sale/services
+     * - GET /sale/packages
+     * - GET /sale/contracts :contentReference[oaicite:3]{index=3}
      */
     if (action === "get_pricing_offers") {
-      // Mindbody endpoint commonly used:
-      // GET /sale/onlineprices
-      const data = await mbFetch("/sale/onlineprices", { method: "GET" });
+      const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
+        mbFetch("/sale/services", { method: "GET" }),
+        mbFetch("/sale/packages", { method: "GET" }),
+        mbFetch("/sale/contracts", { method: "GET" }),
+      ]);
 
-      const prices = normalizePrices(data).map((p) => ({
-        id: p.Id ?? p.id ?? null,
-        name: p.Name ?? p.name ?? "Offer",
-        price: p.Price ?? p.price ?? null,
-        onlinePrice: p.OnlinePrice ?? p.onlinePrice ?? null,
-        taxIncluded: p.TaxIncluded ?? p.taxIncluded ?? null,
-        type: p.Type ?? p.type ?? null,
-        duration: p.Duration ?? p.duration ?? null,
-        description: p.Description ?? p.description ?? null,
-      }));
+      const services =
+        servicesResp.status === "fulfilled"
+          ? normalizeArray(servicesResp.value, ["Services", "services"])
+          : [];
+      const packages =
+        packagesResp.status === "fulfilled"
+          ? normalizeArray(packagesResp.value, ["Packages", "packages"])
+          : [];
+      const contracts =
+        contractsResp.status === "fulfilled"
+          ? normalizeArray(contractsResp.value, ["Contracts", "contracts"])
+          : [];
 
       return res.status(200).json({
         success: true,
         actionReceived: action,
         filtersReceived: {
           pricing_interest: params.pricing_interest || null,
-          is_new_client: params.is_new_client || null,
+          is_new_client: params.is_new_client ?? null,
           membership_interest: params.membership_interest || null,
           class_pack_interest: params.class_pack_interest || null,
           notes: params.notes || null,
         },
-        prices,
-        raw: data,
+        offers: {
+          services,
+          packages,
+          contracts,
+        },
+        warnings: {
+          services: servicesResp.status === "rejected" ? String(servicesResp.reason?.message || servicesResp.reason) : null,
+          packages: packagesResp.status === "rejected" ? String(packagesResp.reason?.message || packagesResp.reason) : null,
+          contracts: contractsResp.status === "rejected" ? String(contractsResp.reason?.message || contractsResp.reason) : null,
+        },
       });
     }
 
@@ -303,26 +287,16 @@ app.all("/mindbody", async (req, res) => {
      * =====================
      * ACTION: book_class
      * =====================
-     * BEST CASE: AV passes these:
-     * - class_id
-     * - client_id
-     *
-     * Otherwise we try to find:
-     * - class_name + date + time
-     * - client_first_name + client_last_name (+ optional phone/email)
-     *
-     * Params accepted:
-     * - date (YYYY-MM-DD)
-     * - time (e.g. "6:00 PM" or ISO)
-     * - class_name
-     * - class_id
-     * - client_id
-     * - client_first_name
-     * - client_last_name
-     * - email
-     * - phone
+     * - Books a client into a class: POST /class/addclienttoclass :contentReference[oaicite:4]{index=4}
+     * - If is_new_client=true and we can't find them, we create them:
+     *   POST /client/addclient :contentReference[oaicite:5]{index=5}
      */
     if (action === "book_class") {
+      const isNewClient =
+        params.is_new_client === true ||
+        String(params.is_new_client || "").toLowerCase() === "true" ||
+        String(params.is_new_client || "").toLowerCase() === "yes";
+
       // 1) Determine classId
       let classId = params.class_id || params.classId || null;
 
@@ -335,22 +309,30 @@ app.all("/mindbody", async (req, res) => {
           query: { StartDateTime: startISO, EndDateTime: endISO },
         });
 
-        const classes = normalizeClasses(sched);
+        const classes = normalizeArray(sched, ["Classes", "classes"]);
 
         const desiredName = (params.class_name || "").toString().toLowerCase().trim();
-        const desiredTime = (params.time || "").toString().toLowerCase().replace(/\s+/g, " ").trim();
+        const desiredTime = (params.time || "")
+          .toString()
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .trim();
 
         const match = classes.find((c) => {
           const nm =
             (c.ClassDescription?.Name ?? c.Name ?? "").toString().toLowerCase().trim();
           const st = (c.StartDateTime ?? "").toString();
-          const stHuman = st ? new Date(st).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }).toLowerCase() : "";
-          const stHuman2 = st ? new Date(st).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true }).toLowerCase() : "";
+
+          const stHuman = st
+            ? new Date(st).toLocaleTimeString("en-US", {
+                hour: "numeric",
+                minute: "2-digit",
+                hour12: true,
+              }).toLowerCase()
+            : "";
 
           const nameOk = desiredName ? nm.includes(desiredName) : true;
-          const timeOk = desiredTime
-            ? (stHuman.includes(desiredTime) || stHuman2.includes(desiredTime) || st.toLowerCase().includes(desiredTime))
-            : true;
+          const timeOk = desiredTime ? stHuman.includes(desiredTime) : true;
 
           return nameOk && timeOk;
         });
@@ -363,53 +345,73 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Missing class_id and could not match a class. Provide class_id OR (class_name + date + time).",
+            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
           paramsReceived: params,
         });
       }
 
-      // 2) Determine clientId
+      // 2) Determine clientId (find existing)
       let clientId = params.client_id || params.clientId || null;
 
-      if (!clientId) {
-        const first = (params.client_first_name || "").toString().trim();
-        const last = (params.client_last_name || "").toString().trim();
-        const email = (params.email || "").toString().trim();
-        const phone = (params.phone || "").toString().trim();
+      const first = (params.client_first_name || "").toString().trim();
+      const last = (params.client_last_name || "").toString().trim();
+      const email = (params.email || "").toString().trim();
+      const phone = normalizePhone(params.phone);
 
+      if (!clientId) {
         const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
 
-        if (!searchText) {
+        if (searchText) {
+          const clientResp = await mbFetch("/client/clients", {
+            method: "GET",
+            query: { SearchText: searchText },
+          });
+
+          const clients = normalizeArray(clientResp, ["Clients", "clients"]);
+
+          const firstLower = first.toLowerCase();
+          const lastLower = last.toLowerCase();
+
+          const best =
+            clients.find((c) => {
+              const fn = (c.FirstName ?? "").toString().toLowerCase();
+              const ln = (c.LastName ?? "").toString().toLowerCase();
+              return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
+            }) || clients[0];
+
+          clientId = best?.Id ?? best?.ClientId ?? null;
+        }
+      }
+
+      // 2b) If still no client and is_new_client=true => create client
+      if (!clientId && isNewClient) {
+        if (!first || !last) {
           return res.status(400).json({
             success: false,
             actionReceived: action,
             message:
-              "Missing client_id and not enough info to search client. Provide client_id OR (client_first_name + client_last_name) plus optional email/phone.",
+              "New client booking needs client_first_name and client_last_name (and ideally email/phone).",
             paramsReceived: params,
           });
         }
 
-        // Mindbody client search endpoint often:
-        // GET /client/clients?SearchText=...
-        const clientResp = await mbFetch("/client/clients", {
-          method: "GET",
-          query: { SearchText: searchText },
+        const createResp = await mbFetch("/client/addclient", {
+          method: "POST",
+          body: {
+            FirstName: first,
+            LastName: last,
+            Email: email || undefined,
+            MobilePhone: phone || undefined,
+          },
         });
 
-        const clients = normalizeClients(clientResp);
-
-        // pick best match by name if possible
-        const firstLower = first.toLowerCase();
-        const lastLower = last.toLowerCase();
-
-        const best =
-          clients.find((c) => {
-            const fn = (c.FirstName ?? "").toString().toLowerCase();
-            const ln = (c.LastName ?? "").toString().toLowerCase();
-            return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
-          }) || clients[0];
-
-        clientId = best?.Id ?? best?.ClientId ?? null;
+        // Common response includes the created client object/id
+        clientId =
+          createResp?.Client?.Id ||
+          createResp?.Client?.ClientId ||
+          createResp?.Id ||
+          createResp?.ClientId ||
+          null;
       }
 
       if (!clientId) {
@@ -417,13 +419,12 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Could not find client. Provide a valid client_id or ensure name/email/phone matches an existing client in Mindbody.",
+            "Could not find client. If this is a NEW client, set is_new_client=true and provide first/last (+ email/phone). Otherwise provide client_id.",
           paramsReceived: params,
         });
       }
 
-      // 3) Book: Mindbody commonly supports:
-      // POST /class/addclienttoclass  { ClientId, ClassId, RequirePayment }
+      // 3) Book into class
       const bookResp = await mbFetch("/class/addclienttoclass", {
         method: "POST",
         body: {
@@ -443,7 +444,6 @@ app.all("/mindbody", async (req, res) => {
       });
     }
 
-    // Unknown action
     return res.status(400).json({
       success: false,
       actionReceived: action,
@@ -462,6 +462,7 @@ app.all("/mindbody", async (req, res) => {
 // IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
