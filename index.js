@@ -1,17 +1,14 @@
-const express = require("express");
+import express from "express";
 
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-
-const MINDBODY_SOURCE_NAME = process.env.MINDBODY_SOURCE_NAME;
-const MINDBODY_SOURCE_PASSWORD = process.env.MINDBODY_SOURCE_PASSWORD;
-
+// Health check
 app.get("/", (req, res) => {
-  res.status(200).send("Flow AI Mindbody Webhook is running");
+  res.send("Flow AI Mindbody Webhook is running");
 });
 
+// Mindbody webhook
 app.post("/mindbody", (req, res) => {
   console.log("Incoming Mindbody payload:", req.body);
 
@@ -21,12 +18,10 @@ app.post("/mindbody", (req, res) => {
   });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-
+// ⚠️ THIS MUST EXIST ONCE — NOT TWICE
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
+
