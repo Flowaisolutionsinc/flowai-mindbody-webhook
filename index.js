@@ -2,59 +2,62 @@ import express from "express";
 
 const app = express();
 app.use(express.json());
-// Mindbody credentials (read from Railway env vars)
-const MINDBODY_SOURCE_NAME = process.env.MINDBODY_SOURCE_NAME;
-const MINDBODY_SOURCE_PASSWORD = process.env.MINDBODY_SOURCE_PASSWORD;
 
-// Safety check (this will NOT crash the server)
-if (!MINDBODY_SOURCE_NAME || !MINDBODY_SOURCE_PASSWORD) {
-  console.warn("⚠️ Mindbody credentials not set yet");
-}
+// Health check (for browser)
+app.get("/", (req, res) => {
+  res.status(200).send("Flow AI webhook is running");
+});
 
-// Health check
-// ONE endpoint that Agency Vault calls
+// MAIN endpoint (Agency Vault will call this)
 app.post("/mindbody", async (req, res) => {
   try {
-    const siteId = process.env.MINDBODY_SITE_ID;
-    const apiKey = process.env.MINDBODY_API_KEY;
+    // Required env vars
+    const siteId = process.env.MINDBODY_SITE_ID; // 5744527
+    const apiKey = process.env.MINDBODY_API_KEY; // you will add later (if needed)
+    const sourceName = process.env.MINDBODY_SOURCE_NAME; // optional depending on API type
+    const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD; // optional depending on API type
 
     if (!siteId) {
-      return res.status(500).json({ success: false, message: "Missing MINDBODY_SITE_ID in Railway Variables" });
-    }
-    if (!apiKey) {
-      return res.status(500).json({ success: false, message: "Missing MINDBODY_API_KEY in Railway Variables" });
-    }
-
-    const { action, params = {} } = req.body || {};
-
-    if (!action) {
-      return res.status(400).json({
+      return res.status(500).json({
         success: false,
-        message: "Missing 'action' in request body. Example: { action: 'get_today_schedule', params: {...} }",
+        message: "Missing MINDBODY_SITE_ID in Railway Variables",
       });
     }
 
-    // For now we just confirm
+    // What Agency Vault should send
+    const { action, params = {} } = req.body || {};
+    if (!action) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Missing 'action' in request body. Example: { action: 'get_today_schedule', params: {...} }",
+      });
+    }
 
-
-  console.log("Incoming Mindbody payload:", {
-    siteId,
-    body: req.body
-  });
-
-  return res.json({
-    success: true,
-    siteIdUsed: siteId,
-    received: req.body
-  });
+    // ✅ For now: echo back so we KNOW AV -> Railway is working.
+    // Next step will be: switch(action) and call Mindbody APIs per action.
+    return res.status(200).json({
+      success: true,
+      siteIdUsed: siteId,
+      actionReceived: action,
+      paramsReceived: params,
+      envDetected: {
+        hasApiKey: Boolean(apiKey),
+        hasSourceName: Boolean(sourceName),
+        hasSourcePassword: Boolean(sourcePassword),
+      },
+    });
+  } catch (err) {
+    console.error("Webhook error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err?.message || err),
+    });
+  }
 });
 
-
-
-// ⚠️ THIS MUST EXIST ONCE — NOT TWICE
+// IMPORTANT: declare PORT once, only once
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
 
