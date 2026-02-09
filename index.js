@@ -13,14 +13,27 @@ if (!MINDBODY_SOURCE_NAME || !MINDBODY_SOURCE_PASSWORD) {
 
 // Health check
 app.post("/mindbody", (req, res) => {
-  console.log("Incoming Mindbody payload:", req.body);
+  const siteId = process.env.MINDBODY_SITE_ID; // Oxygen Roundhouse
 
-  res.json({
+  if (!siteId) {
+    return res.status(500).json({
+      success: false,
+      message: "Missing MINDBODY_SITE_ID in Railway Variables"
+    });
+  }
+
+  console.log("Incoming Mindbody payload:", {
+    siteId,
+    body: req.body
+  });
+
+  return res.json({
     success: true,
-    sourceConfigured: Boolean(MINDBODY_SOURCE_NAME),
-    message: "Mindbody webhook received successfully",
+    siteIdUsed: siteId,
+    received: req.body
   });
 });
+
 
 
 // ⚠️ THIS MUST EXIST ONCE — NOT TWICE
