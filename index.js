@@ -3,6 +3,26 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
+/**
+ * LOG EVERYTHING (so Railway Logs actually show requests)
+ * This is what you were missing — requests were coming in,
+ * but nothing was being printed to stdout.
+ */
+app.use((req, res, next) => {
+  try {
+    console.log(
+      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`,
+      "query=",
+      req.query || {},
+      "body=",
+      req.body || {}
+    );
+  } catch (e) {
+    console.log("Log middleware error:", e?.message || e);
+  }
+  next();
+});
+
 // Health check (browser)
 app.get("/", (req, res) => {
   res.status(200).send("Flow AI Mindbody webhook is running");
@@ -19,21 +39,27 @@ app.all("/mindbody", (req, res) => {
   const sourceName = process.env.MINDBODY_SOURCE_NAME || "";
   const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
-  // 1) Pull action/params from EITHER query OR JSON body
+  // 1) Pull action from EITHER query OR JSON body
   const action =
-    req.query?.action ||
-    req.body?.action ||
+    (req.query && req.query.action) ||
+    (req.body && req.body.action) ||
     "";
 
+  // 2) Pull params from EITHER query (minus action) OR JSON body params
   const paramsFromQuery = { ...(req.query || {}) };
   delete paramsFromQuery.action;
 
-  const paramsFromBody = (req.body && typeof req.body === "object") ? (req.body.params || {}) : {};
+  const paramsFromBody =
+    req.body && typeof req.body === "object" ? req.body.params || {} : {};
 
   // Merge params (query wins if duplicates)
   const params = { ...paramsFromBody, ...paramsFromQuery };
 
-  // 2) Basic validation (this prevents crashes)
+  // EXTRA: print parsed action/params so it's obvious in logs
+  console.log("PARSED_ACTION:", action || "(missing)");
+  console.log("PARSED_PARAMS:", params);
+
+  // 3) Basic validation (this prevents crashes)
   if (!action) {
     return res.status(400).json({
       success: false,
@@ -44,7 +70,7 @@ app.all("/mindbody", (req, res) => {
     });
   }
 
-  // 3) For now: echo back so we KNOW AV -> Railway works
+  // 4) For now: echo back so we KNOW AV -> Railway works
   return res.status(200).json({
     success: true,
     siteIdUsed: siteId,
@@ -62,5 +88,6 @@ app.all("/mindbody", (req, res) => {
 // IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
