@@ -7,6 +7,14 @@ app.use(express.json({ limit: "1mb" }));
  * ============
  * CONFIG / ENV
  * ============
+ * Set these in Railway Variables:
+ * - MINDBODY_SITE_ID
+ * - MINDBODY_API_KEY
+ * - MINDBODY_SOURCE_NAME
+ * - MINDBODY_SOURCE_PASSWORD
+ *
+ * Optional:
+ * - MINDBODY_BASE_URL (default below)
  */
 const MINDBODY_BASE_URL =
   process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
@@ -18,7 +26,7 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
 /**
  * ============
- * HELPERS
+ * SMALL HELPERS
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
@@ -46,12 +54,14 @@ function safeJsonParse(x) {
 function normalizeArray(payload, keys = []) {
   if (!payload) return [];
   if (Array.isArray(payload)) return payload;
-  for (const k of keys) if (Array.isArray(payload[k])) return payload[k];
+  for (const k of keys) {
+    if (Array.isArray(payload[k])) return payload[k];
+  }
   if (Array.isArray(payload.Results)) return payload.Results;
   return [];
 }
 
-function toISODateRangeForDay(dateStr) {
+function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
   const start = new Date(`${dateStr}T00:00:00`);
   const end = new Date(`${dateStr}T23:59:59`);
   return { startISO: start.toISOString(), endISO: end.toISOString() };
@@ -62,14 +72,39 @@ function normalizePhone(phone) {
   return String(phone).trim();
 }
 
-function isTruthy(v) {
+function asBool(v) {
   if (v === true) return true;
-  const s = String(v ?? "").toLowerCase().trim();
-  return s === "true" || s === "yes" || s === "y" || s === "1";
+  const s = String(v || "").toLowerCase().trim();
+  return s === "true" || s === "yes" || s === "1";
 }
 
-function mbHeaders() {
-  return {
+// Capture HTTP status from Mindbody errors so we don't always return 500
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function mbFetch(path, { method = "GET", query, body } = {}) {
+  if (!siteId || !apiKey || !sourceName || !sourcePassword) {
+    throw new HttpError(
+      500,
+      `Missing ENV. hasSiteId=${Boolean(siteId)} hasApiKey=${Boolean(apiKey)} hasSourceName=${Boolean(
+        sourceName
+      )} hasSourcePassword=${Boolean(sourcePassword)}`
+    );
+  }
+
+  const url = new URL(`${MINDBODY_BASE_URL}${path}`);
+  if (query && typeof query === "object") {
+    Object.entries(query).forEach(([k, v]) => {
+      if (v === undefined || v === null || v === "") return;
+      url.searchParams.set(k, String(v));
+    });
+  }
+
+  const headers = {
     "Content-Type": "application/json",
     "Api-Key": apiKey,
     SiteId: siteId,
@@ -77,30 +112,10 @@ function mbHeaders() {
     Password: sourcePassword,
     SourcePassword: sourcePassword,
   };
-}
-
-async function mbFetch(path, { method = "GET", query, body } = {}) {
-  if (!siteId || !apiKey || !sourceName || !sourcePassword) {
-    const e = new Error(
-      `Missing ENV. hasSiteId=${Boolean(siteId)} hasApiKey=${Boolean(apiKey)} hasSourceName=${Boolean(
-        sourceName
-      )} hasSourcePassword=${Boolean(sourcePassword)}`
-    );
-    e.status = 500;
-    throw e;
-  }
-
-  const url = new URL(`${MINDBODY_BASE_URL}${path}`);
-  if (query && typeof query === "object") {
-    for (const [k, v] of Object.entries(query)) {
-      if (v === undefined || v === null || v === "") continue;
-      url.searchParams.set(k, String(v));
-    }
-  }
 
   const res = await fetch(url.toString(), {
     method,
-    headers: mbHeaders(),
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
 
@@ -108,58 +123,26 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   const json = safeJsonParse(text);
 
   if (!res.ok) {
-    const detail = json || (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
-    const e = new Error(
+    const detail =
+      json || (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
+
+    throw new HttpError(
+      res.status,
       `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
     );
-    e.status = res.status;
-    e.detail = detail;
-    throw e;
   }
 
   return json ?? { raw: text };
 }
 
-// Search helper: try email first, then phone, then name
-async function findClientId({ first, last, email, phone }) {
-  const attempts = [];
-
-  if (email && email.length >= 3) attempts.push(email);
-  if (phone && phone.length >= 3) attempts.push(phone);
-  const fullName = `${first} ${last}`.trim();
-  if (fullName.length >= 3) attempts.push(fullName);
-
-  for (const searchText of attempts) {
-    const clientResp = await mbFetch("/client/clients", {
-      method: "GET",
-      query: { SearchText: searchText },
-    });
-
-    const clients = normalizeArray(clientResp, ["Clients", "clients"]);
-    if (!clients.length) continue;
-
-    const firstLower = (first || "").toLowerCase();
-    const lastLower = (last || "").toLowerCase();
-
-    const best =
-      clients.find((c) => {
-        const fn = (c.FirstName ?? "").toString().toLowerCase();
-        const ln = (c.LastName ?? "").toString().toLowerCase();
-        return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
-      }) || clients[0];
-
-    return best?.Id ?? best?.ClientId ?? null;
-  }
-
-  return null;
-}
-
 /**
  * ============
- * HEALTH
+ * HEALTH CHECKS
  * ============
  */
-app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
+app.get("/", (req, res) => {
+  res.status(200).send("Flow AI Mindbody webhook is running");
+});
 
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -181,13 +164,16 @@ app.get("/health", (req, res) => {
  */
 app.all("/mindbody", async (req, res) => {
   try {
+    // 1) Pull action from query OR body OR action_type
     const action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
+    // 2) Pull params from body.params + extra top-level + query (query wins)
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
 
     const bodyObj = req.body && typeof req.body === "object" ? req.body : {};
-    const paramsFromBody = bodyObj.params && typeof bodyObj.params === "object" ? bodyObj.params : {};
+    const paramsFromBody =
+      bodyObj.params && typeof bodyObj.params === "object" ? bodyObj.params : {};
 
     const extraTopLevelBody = { ...bodyObj };
     delete extraTopLevelBody.action;
@@ -198,18 +184,32 @@ app.all("/mindbody", async (req, res) => {
 
     console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
+    // ✅ DRY RUN: Allows Agency Vault "Test Webhook" / "Initialize" to succeed
+    // Use by sending: dry_run=true
+    if (asBool(params.dry_run)) {
+      return res.status(200).json({
+        success: true,
+        dry_run: true,
+        actionReceived: action || "(missing)",
+        paramsReceived: params,
+        message:
+          "Dry run success. Remove dry_run for real Mindbody execution.",
+      });
+    }
+
     if (!action) {
       return res.status(400).json({
         success: false,
-        message: "Missing action. Send ?action=... OR JSON { action:'...', params:{...} }",
+        message:
+          "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
         receivedQuery: req.query || {},
         receivedBody: req.body || {},
       });
     }
 
-    // ---------------------
-    // get_today_schedule
-    // ---------------------
+    /**
+     * ACTION: get_today_schedule
+     */
     if (action === "get_today_schedule") {
       const date = params.date || nowInTZDateString("America/Vancouver");
       const { startISO, endISO } = toISODateRangeForDay(date);
@@ -225,16 +225,26 @@ app.all("/mindbody", async (req, res) => {
         name: c.ClassDescription?.Name ?? c.Name ?? c.className ?? "Class",
         startDateTime: c.StartDateTime ?? c.startDateTime ?? null,
         endDateTime: c.EndDateTime ?? c.endDateTime ?? null,
-        instructor: c.Staff?.Name ?? c.Staff?.FirstName ?? c.InstructorName ?? c.instructor ?? null,
+        instructor:
+          c.Staff?.Name ??
+          c.Staff?.FirstName ??
+          c.InstructorName ??
+          c.instructor ??
+          null,
         location: c.Location?.Name ?? c.LocationName ?? c.location ?? null,
       }));
 
-      return res.status(200).json({ success: true, actionReceived: action, date, classes });
+      return res.status(200).json({
+        success: true,
+        actionReceived: action,
+        date,
+        classes,
+      });
     }
 
-    // ---------------------
-    // get_pricing_offers
-    // ---------------------
+    /**
+     * ACTION: get_pricing_offers
+     */
     if (action === "get_pricing_offers") {
       const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
         mbFetch("/sale/services", { method: "GET" }),
@@ -267,64 +277,116 @@ app.all("/mindbody", async (req, res) => {
         },
         offers: { services, packages, contracts },
         warnings: {
-          services: servicesResp.status === "rejected" ? String(servicesResp.reason?.message || servicesResp.reason) : null,
-          packages: packagesResp.status === "rejected" ? String(packagesResp.reason?.message || packagesResp.reason) : null,
-          contracts: contractsResp.status === "rejected" ? String(contractsResp.reason?.message || contractsResp.reason) : null,
+          services:
+            servicesResp.status === "rejected"
+              ? String(servicesResp.reason?.message || servicesResp.reason)
+              : null,
+          packages:
+            packagesResp.status === "rejected"
+              ? String(packagesResp.reason?.message || packagesResp.reason)
+              : null,
+          contracts:
+            contractsResp.status === "rejected"
+              ? String(contractsResp.reason?.message || contractsResp.reason)
+              : null,
         },
       });
     }
 
-    // ---------------------
-    // book_class
-    // ---------------------
+    /**
+     * ACTION: book_class
+     */
     if (action === "book_class") {
-      const isNewClient = isTruthy(params.is_new_client);
+      const isNewClient = asBool(params.is_new_client);
 
-      // REQUIRED for booking
-      const classId = params.class_id || params.classId || null;
-      const first = (params.client_first_name || "").toString().trim();
-      const last = (params.client_last_name || "").toString().trim();
-      const email = (params.email || "").toString().trim();
-      const phone = normalizePhone(params.phone);
+      // 1) Determine classId
+      let classId = params.class_id || params.classId || null;
+
+      if (!classId) {
+        const date = params.date || nowInTZDateString("America/Vancouver");
+        const { startISO, endISO } = toISODateRangeForDay(date);
+
+        const sched = await mbFetch("/class/classes", {
+          method: "GET",
+          query: { StartDateTime: startISO, EndDateTime: endISO },
+        });
+
+        const classes = normalizeArray(sched, ["Classes", "classes"]);
+
+        const desiredName = (params.class_name || "").toString().toLowerCase().trim();
+        const desiredTime = (params.time || "")
+          .toString()
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .trim();
+
+        const match = classes.find((c) => {
+          const nm =
+            (c.ClassDescription?.Name ?? c.Name ?? "").toString().toLowerCase().trim();
+          const st = (c.StartDateTime ?? "").toString();
+
+          const stHuman = st
+            ? new Date(st)
+                .toLocaleTimeString("en-US", {
+                  hour: "numeric",
+                  minute: "2-digit",
+                  hour12: true,
+                })
+                .toLowerCase()
+            : "";
+
+          const nameOk = desiredName ? nm.includes(desiredName) : true;
+          const timeOk = desiredTime ? stHuman.includes(desiredTime) : true;
+
+          return nameOk && timeOk;
+        });
+
+        classId = match?.Id ?? match?.ClassId ?? null;
+      }
 
       if (!classId) {
         return res.status(400).json({
           success: false,
           actionReceived: action,
-          message: "Missing class_id. (Best practice: pick from get_today_schedule and pass class_id.)",
-          paramsReceived: params,
-        });
-      }
-
-      if (!first || !last) {
-        return res.status(400).json({
-          success: false,
-          actionReceived: action,
-          message: "Missing client_first_name or client_last_name.",
-          paramsReceived: params,
-        });
-      }
-
-      // Existing clients MUST provide at least email or phone to find them
-      if (!isNewClient && !email && !phone && !params.client_id && !params.clientId) {
-        return res.status(400).json({
-          success: false,
-          actionReceived: action,
           message:
-            "Existing client booking requires email or phone (or client_id). Ask caller for the email/phone they used at Oxygen.",
+            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
           paramsReceived: params,
         });
       }
 
-      // If client_id passed, skip search/create
+      // 2) Determine clientId
       let clientId = params.client_id || params.clientId || null;
 
-      // Otherwise find by search
+      const first = (params.client_first_name || "").toString().trim();
+      const last = (params.client_last_name || "").toString().trim();
+      const email = (params.email || "").toString().trim();
+      const phone = normalizePhone(params.phone);
+
       if (!clientId) {
-        clientId = await findClientId({ first, last, email, phone });
+        const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
+
+        if (searchText) {
+          const clientResp = await mbFetch("/client/clients", {
+            method: "GET",
+            query: { SearchText: searchText },
+          });
+
+          const clients = normalizeArray(clientResp, ["Clients", "clients"]);
+          const firstLower = first.toLowerCase();
+          const lastLower = last.toLowerCase();
+
+          const best =
+            clients.find((c) => {
+              const fn = (c.FirstName ?? "").toString().toLowerCase();
+              const ln = (c.LastName ?? "").toString().toLowerCase();
+              return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
+            }) || clients[0];
+
+          clientId = best?.Id ?? best?.ClientId ?? null;
+        }
       }
 
-      // If not found and new client => create
+      // 2b) Create client if new
       if (!clientId && isNewClient) {
         const address1 = (params.address_line1 || "").toString().trim();
         const city = (params.city || "").toString().trim();
@@ -332,98 +394,80 @@ app.all("/mindbody", async (req, res) => {
         const postal = (params.postal_code || "").toString().trim();
         const country = (params.country || "CA").toString().trim();
 
+        if (!first || !last) {
+          return res.status(400).json({
+            success: false,
+            actionReceived: action,
+            message:
+              "New client booking needs client_first_name and client_last_name (and ideally email/phone).",
+            paramsReceived: params,
+          });
+        }
+
+        // Mindbody requires address fields in your account config (as your error showed)
         if (!address1 || !city || !state || !postal) {
           return res.status(400).json({
             success: false,
             actionReceived: action,
             message:
-              "New client requires address_line1, city, state, postal_code (Mindbody requires these to create a client).",
+              "Mindbody requires address for new client creation. Provide address_line1, city, state, postal_code (country optional).",
             paramsReceived: params,
           });
         }
 
-        try {
-          const createResp = await mbFetch("/client/addclient", {
-            method: "POST",
-            body: {
-              FirstName: first,
-              LastName: last,
-              Email: email || undefined,
-              MobilePhone: phone || undefined,
-              AddressLine1: address1,
-              City: city,
-              State: state,
-              PostalCode: postal,
-              Country: country,
-            },
-          });
+        const createResp = await mbFetch("/client/addclient", {
+          method: "POST",
+          body: {
+            FirstName: first,
+            LastName: last,
+            Email: email || undefined,
+            MobilePhone: phone || undefined,
+            AddressLine1: address1,
+            City: city,
+            State: state,
+            PostalCode: postal,
+            Country: country,
+          },
+        });
 
-          clientId =
-            createResp?.Client?.Id ||
-            createResp?.Client?.ClientId ||
-            createResp?.Id ||
-            createResp?.ClientId ||
-            null;
-        } catch (e) {
-          // If duplicate error, try searching again
-          const msg = String(e?.message || "");
-          if (msg.includes("duplicate") || msg.includes("InvalidClientCreation")) {
-            clientId = await findClientId({ first, last, email, phone });
-            if (!clientId) {
-              return res.status(409).json({
-                success: false,
-                actionReceived: action,
-                message:
-                  "Client likely already exists but could not be located via search. Ask caller for the exact email/phone on file, or use client_id.",
-              });
-            }
-          } else {
-            // bubble others
-            throw e;
-          }
-        }
+        clientId =
+          createResp?.Client?.Id ||
+          createResp?.Client?.ClientId ||
+          createResp?.Id ||
+          createResp?.ClientId ||
+          null;
       }
 
       if (!clientId) {
-        return res.status(404).json({
+        return res.status(409).json({
           success: false,
           actionReceived: action,
           message:
-            "Could not find client. If NEW client set is_new_client=true and provide address fields. If existing, collect exact email/phone or use client_id.",
+            "Client could not be found (or already exists but search did not match). For now, book existing clients using client_id. If new client, ensure email/phone exactly correct and include full address fields.",
           paramsReceived: params,
         });
       }
 
-      // Book into class
-      try {
-        const bookResp = await mbFetch("/class/addclienttoclass", {
-          method: "POST",
-          body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
-        });
+      // 3) Book
+      const bookResp = await mbFetch("/class/addclienttoclass", {
+        method: "POST",
+        body: {
+          ClientId: clientId,
+          ClassId: classId,
+          RequirePayment: false,
+        },
+      });
 
-        return res.status(200).json({
-          success: true,
-          actionReceived: action,
-          booked: true,
-          clientId,
-          classId,
-          raw: bookResp,
-        });
-      } catch (e) {
-        const msg = String(e?.message || "");
-        if (msg.includes("SchedulingWindowViolated")) {
-          return res.status(422).json({
-            success: false,
-            actionReceived: action,
-            message:
-              "Mindbody says booking is outside the scheduling window for this class. Try a different class_id/time, or adjust booking rules in Mindbody.",
-          });
-        }
-        throw e;
-      }
+      return res.status(200).json({
+        success: true,
+        actionReceived: action,
+        booked: true,
+        clientId,
+        classId,
+        raw: bookResp,
+      });
     }
 
-    // Unknown action
     return res.status(400).json({
       success: false,
       actionReceived: action,
@@ -431,12 +475,9 @@ app.all("/mindbody", async (req, res) => {
       paramsReceived: params,
     });
   } catch (err) {
+    const status = err?.status || 500;
     console.error("WEBHOOK_ERROR", err?.message || err, err?.stack || "");
-
-    // If Mindbody threw an HTTP status, return that instead of 500
-    const status = Number(err?.status) || 500;
-
-    return res.status(status >= 400 && status < 600 ? status : 500).json({
+    return res.status(status).json({
       success: false,
       message: err?.message || "Server error",
     });
