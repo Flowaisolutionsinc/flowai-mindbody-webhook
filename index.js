@@ -1,4 +1,5 @@
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -7,7 +8,7 @@ app.use(express.json({ limit: "1mb" }));
  * ============
  * CONFIG / ENV
  * ============
- * Set these in Railway Variables:
+ * Railway Variables:
  * - MINDBODY_SITE_ID
  * - MINDBODY_API_KEY
  * - MINDBODY_SOURCE_NAME
@@ -26,11 +27,10 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
 /**
  * ============
- * SMALL HELPERS
+ * HELPERS
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
-  // returns YYYY-MM-DD for the given TZ
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
     year: "numeric",
@@ -62,7 +62,7 @@ function normalizeArray(payload, keys = []) {
   return [];
 }
 
-function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
+function toISODateRangeForDay(dateStr) {
   const start = new Date(`${dateStr}T00:00:00`);
   const end = new Date(`${dateStr}T23:59:59`);
   return { startISO: start.toISOString(), endISO: end.toISOString() };
@@ -71,6 +71,25 @@ function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
 function normalizePhone(phone) {
   if (!phone) return "";
   return String(phone).trim();
+}
+
+function isTruthy(x) {
+  return (
+    x === true ||
+    String(x || "").toLowerCase() === "true" ||
+    String(x || "").toLowerCase() === "yes" ||
+    String(x || "").toLowerCase() === "y"
+  );
+}
+
+function extractMbErrorMessage(errMessage = "") {
+  // Your errors look like: Mindbody API error 400 Bad Request at /client/addclient: {"Error":{"Message":"...","Code":"..."}}
+  const codeMatch = errMessage.match(/"Code"\s*:\s*"([^"]+)"/);
+  const msgMatch = errMessage.match(/"Message"\s*:\s*"([^"]+)"/);
+  return {
+    code: codeMatch?.[1] || null,
+    message: msgMatch?.[1] || null,
+  };
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -120,14 +139,37 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   return json ?? { raw: text };
 }
 
+async function findClientId({ first, last, email, phone }) {
+  const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
+  if (!searchText) return null;
+
+  const clientResp = await mbFetch("/client/clients", {
+    method: "GET",
+    query: { SearchText: searchText },
+  });
+
+  const clients = normalizeArray(clientResp, ["Clients", "clients"]);
+  if (!clients.length) return null;
+
+  const firstLower = (first || "").toLowerCase();
+  const lastLower = (last || "").toLowerCase();
+
+  const best =
+    clients.find((c) => {
+      const fn = (c.FirstName ?? "").toString().toLowerCase();
+      const ln = (c.LastName ?? "").toString().toLowerCase();
+      return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
+    }) || clients[0];
+
+  return best?.Id ?? best?.ClientId ?? null;
+}
+
 /**
  * ============
- * HEALTH CHECKS
+ * HEALTH
  * ============
  */
-app.get("/", (req, res) => {
-  res.status(200).send("Flow AI Mindbody webhook is running");
-});
+app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -146,20 +188,11 @@ app.get("/health", (req, res) => {
  * ============
  * MAIN WEBHOOK
  * ============
- * Accepts either:
- * - Query:  /mindbody?action=get_today_schedule&date=YYYY-MM-DD
- * - JSON:   { "action": "get_today_schedule", "params": { ... } }
  */
 app.all("/mindbody", async (req, res) => {
   try {
-    // 1) Pull action from query OR body OR action_type
-    const action =
-      req.query?.action ||
-      req.body?.action ||
-      req.body?.action_type ||
-      "";
+    const action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
-    // 2) Pull params from body.params + extra top-level + query (query wins)
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
 
@@ -174,38 +207,26 @@ app.all("/mindbody", async (req, res) => {
 
     const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
 
-    console.log("WEBHOOK_HIT", {
-      method: req.method,
-      action,
-      params,
-    });
+    console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
     if (!action) {
       return res.status(400).json({
         success: false,
         message:
           "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
-        receivedQuery: req.query || {},
-        receivedBody: req.body || {},
       });
     }
 
-    /**
-     * =====================
-     * ACTION: get_today_schedule
-     * =====================
-     * Mindbody: GET /class/classes
-     */
+    // =====================
+    // get_today_schedule
+    // =====================
     if (action === "get_today_schedule") {
       const date = params.date || nowInTZDateString("America/Vancouver");
       const { startISO, endISO } = toISODateRangeForDay(date);
 
       const data = await mbFetch("/class/classes", {
         method: "GET",
-        query: {
-          StartDateTime: startISO,
-          EndDateTime: endISO,
-        },
+        query: { StartDateTime: startISO, EndDateTime: endISO },
       });
 
       const classesRaw = normalizeArray(data, ["Classes", "classes"]);
@@ -223,24 +244,14 @@ app.all("/mindbody", async (req, res) => {
         location: c.Location?.Name ?? c.LocationName ?? c.location ?? null,
       }));
 
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        date,
-        classes,
-      });
+      return res.status(200).json({ success: true, actionReceived: action, date, classes });
     }
 
-    /**
-     * =====================
-     * ACTION: get_pricing_offers
-     * =====================
-     * Uses:
-     * - GET /sale/services
-     * - GET /sale/packages
-     * - GET /sale/contracts
-     */
+    // =====================
+    // get_pricing_offers
+    // =====================
     if (action === "get_pricing_offers") {
+      // Keep as-is (you can refine later)
       const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
         mbFetch("/sale/services", { method: "GET" }),
         mbFetch("/sale/packages", { method: "GET" }),
@@ -270,147 +281,45 @@ app.all("/mindbody", async (req, res) => {
           class_pack_interest: params.class_pack_interest || null,
           notes: params.notes || null,
         },
-        offers: {
-          services,
-          packages,
-          contracts,
-        },
-        warnings: {
-          services:
-            servicesResp.status === "rejected"
-              ? String(servicesResp.reason?.message || servicesResp.reason)
-              : null,
-          packages:
-            packagesResp.status === "rejected"
-              ? String(packagesResp.reason?.message || packagesResp.reason)
-              : null,
-          contracts:
-            contractsResp.status === "rejected"
-              ? String(contractsResp.reason?.message || contractsResp.reason)
-              : null,
-        },
+        offers: { services, packages, contracts },
       });
     }
 
-    /**
-     * =====================
-     * ACTION: book_class
-     * =====================
-     * - POST /class/addclienttoclass
-     * - If NEW client (is_new_client=yes/true) and can't find them -> POST /client/addclient
-     *
-     * Expected params:
-     * - class_id OR class_name + date + time (class_id recommended)
-     * - client_id OR (client_first_name + client_last_name) and optionally email/phone
-     * - is_new_client (yes/true) for brand new clients
-     *
-     * NEW CLIENT required (Mindbody):
-     * - address_line1
-     * - city
-     * - state
-     * - postal_code
-     * - country (recommended; default CA)
-     */
+    // =====================
+    // book_class
+    // =====================
     if (action === "book_class") {
-      const isNewClient =
-        params.is_new_client === true ||
-        String(params.is_new_client || "").toLowerCase() === "true" ||
-        String(params.is_new_client || "").toLowerCase() === "yes";
+      const isNewClient = isTruthy(params.is_new_client);
 
-      // 1) Determine classId
-      let classId = params.class_id || params.classId || null;
-
-      if (!classId) {
-        const date = params.date || nowInTZDateString("America/Vancouver");
-        const { startISO, endISO } = toISODateRangeForDay(date);
-
-        const sched = await mbFetch("/class/classes", {
-          method: "GET",
-          query: { StartDateTime: startISO, EndDateTime: endISO },
-        });
-
-        const classes = normalizeArray(sched, ["Classes", "classes"]);
-
-        const desiredName = (params.class_name || "").toString().toLowerCase().trim();
-        const desiredTime = (params.time || "")
-          .toString()
-          .toLowerCase()
-          .replace(/\s+/g, " ")
-          .trim();
-
-        const match = classes.find((c) => {
-          const nm =
-            (c.ClassDescription?.Name ?? c.Name ?? "").toString().toLowerCase().trim();
-          const st = (c.StartDateTime ?? "").toString();
-
-          const stHuman = st
-            ? new Date(st).toLocaleTimeString("en-US", {
-                hour: "numeric",
-                minute: "2-digit",
-                hour12: true,
-              }).toLowerCase()
-            : "";
-
-          const nameOk = desiredName ? nm.includes(desiredName) : true;
-          const timeOk = desiredTime ? stHuman.includes(desiredTime) : true;
-
-          return nameOk && timeOk;
-        });
-
-        classId = match?.Id ?? match?.ClassId ?? null;
-      }
-
+      // --- classId ---
+      const classId = params.class_id || params.classId || null;
       if (!classId) {
         return res.status(400).json({
           success: false,
           actionReceived: action,
-          message:
-            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
+          message: "Missing class_id. Best practice: use get_today_schedule first and pass classId.",
           paramsReceived: params,
         });
       }
 
-      // 2) Determine clientId (find existing)
-      let clientId = params.client_id || params.clientId || null;
-
+      // --- client inputs ---
       const first = (params.client_first_name || "").toString().trim();
       const last = (params.client_last_name || "").toString().trim();
       const email = (params.email || "").toString().trim();
       const phone = normalizePhone(params.phone);
 
+      // 1) Always try find existing first (even if is_new_client=true)
+      let clientId = params.client_id || params.clientId || null;
       if (!clientId) {
-        const searchText = [email, phone, `${first} ${last}`].find(
-          (x) => x && x.length >= 3
-        );
-
-        if (searchText) {
-          const clientResp = await mbFetch("/client/clients", {
-            method: "GET",
-            query: { SearchText: searchText },
-          });
-
-          const clients = normalizeArray(clientResp, ["Clients", "clients"]);
-
-          const firstLower = first.toLowerCase();
-          const lastLower = last.toLowerCase();
-
-          const best =
-            clients.find((c) => {
-              const fn = (c.FirstName ?? "").toString().toLowerCase();
-              const ln = (c.LastName ?? "").toString().toLowerCase();
-              return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
-            }) || clients[0];
-
-          clientId = best?.Id ?? best?.ClientId ?? null;
-        }
+        clientId = await findClientId({ first, last, email, phone });
       }
 
-      // 2b) If still no client and is_new_client=true => create client (WITH REQUIRED ADDRESS FIELDS)
+      // 2) If still none and new client => create (Mindbody requires address fields)
       if (!clientId && isNewClient) {
-        const addressLine1 = (params.address_line1 || params.addressLine1 || "").toString().trim();
+        const address1 = (params.address_line1 || "").toString().trim();
         const city = (params.city || "").toString().trim();
         const state = (params.state || "").toString().trim();
-        const postalCode = (params.postal_code || params.postalCode || "").toString().trim();
+        const postal = (params.postal_code || "").toString().trim();
         const country = (params.country || "CA").toString().trim();
 
         if (!first || !last) {
@@ -418,44 +327,63 @@ app.all("/mindbody", async (req, res) => {
             success: false,
             actionReceived: action,
             message:
-              "New client booking needs client_first_name and client_last_name (and ideally email/phone).",
-            paramsReceived: params,
+              "New client booking needs client_first_name + client_last_name (and ideally email/phone).",
           });
         }
 
-        if (!addressLine1 || !city || !state || !postalCode) {
+        if (!address1 || !city || !state || !postal) {
           return res.status(400).json({
             success: false,
             actionReceived: action,
             message:
-              "New client requires address_line1, city, state, postal_code (and country recommended).",
-            paramsReceived: params,
+              "Mindbody requires address for new clients. Please collect: address_line1, city, state, postal_code (country optional).",
           });
         }
 
-        const createResp = await mbFetch("/client/addclient", {
-          method: "POST",
-          body: {
-            FirstName: first,
-            LastName: last,
-            Email: email || undefined,
-            MobilePhone: phone || undefined,
+        try {
+          const createResp = await mbFetch("/client/addclient", {
+            method: "POST",
+            body: {
+              FirstName: first,
+              LastName: last,
+              Email: email || undefined,
+              MobilePhone: phone || undefined,
+              AddressLine1: address1,
+              City: city,
+              State: state,
+              PostalCode: postal,
+              Country: country,
+            },
+          });
 
-            // REQUIRED BY MINDBODY (this is what your error was complaining about)
-            AddressLine1: addressLine1,
-            City: city,
-            State: state,
-            PostalCode: postalCode,
-            Country: country,
-          },
-        });
-
-        clientId =
-          createResp?.Client?.Id ||
-          createResp?.Client?.ClientId ||
-          createResp?.Id ||
-          createResp?.ClientId ||
-          null;
+          clientId =
+            createResp?.Client?.Id ||
+            createResp?.Client?.ClientId ||
+            createResp?.Id ||
+            createResp?.ClientId ||
+            null;
+        } catch (e) {
+          // 🔥 KEY FIX: if duplicate creation blocked, just search again and continue
+          const { code } = extractMbErrorMessage(String(e?.message || ""));
+          if (code === "InvalidClientCreation") {
+            clientId = await findClientId({ first, last, email, phone });
+            if (!clientId) {
+              return res.status(409).json({
+                success: false,
+                actionReceived: action,
+                message:
+                  "Client likely already exists, but could not be located via search. Try asking for the phone or email exactly as on file, or use client_id.",
+              });
+            }
+          } else {
+            // return a clean 400 instead of 500
+            return res.status(400).json({
+              success: false,
+              actionReceived: action,
+              message: String(e?.message || "Client create failed"),
+            });
+          }
+        }
       }
 
       if (!clientId) {
@@ -463,29 +391,33 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Could not find client. If this is a NEW client, set is_new_client=yes and provide first/last + address_line1/city/state/postal_code (+ email/phone). Otherwise provide client_id.",
-          paramsReceived: params,
+            "Could not find client. If new client: set is_new_client=true and provide full info. Otherwise provide client_id or email/phone that matches Mindbody.",
         });
       }
 
       // 3) Book into class
-      const bookResp = await mbFetch("/class/addclienttoclass", {
-        method: "POST",
-        body: {
-          ClientId: clientId,
-          ClassId: classId,
-          RequirePayment: false,
-        },
-      });
+      try {
+        const bookResp = await mbFetch("/class/addclienttoclass", {
+          method: "POST",
+          body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
+        });
 
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        booked: true,
-        clientId,
-        classId,
-        raw: bookResp,
-      });
+        return res.status(200).json({
+          success: true,
+          actionReceived: action,
+          booked: true,
+          clientId,
+          classId,
+          raw: bookResp,
+        });
+      } catch (e) {
+        // clean status
+        return res.status(400).json({
+          success: false,
+          actionReceived: action,
+          message: String(e?.message || "Booking failed"),
+        });
+      }
     }
 
     return res.status(400).json({
@@ -503,9 +435,9 @@ app.all("/mindbody", async (req, res) => {
   }
 });
 
-// IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
