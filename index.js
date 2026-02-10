@@ -1,4 +1,5 @@
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -30,7 +31,6 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
-  // returns YYYY-MM-DD for the given TZ
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
     year: "numeric",
@@ -62,7 +62,7 @@ function normalizeArray(payload, keys = []) {
   return [];
 }
 
-function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
+function toISODateRangeForDay(dateStr) {
   const start = new Date(`${dateStr}T00:00:00`);
   const end = new Date(`${dateStr}T23:59:59`);
   return { startISO: start.toISOString(), endISO: end.toISOString() };
@@ -146,20 +146,15 @@ app.get("/health", (req, res) => {
  * ============
  * MAIN WEBHOOK
  * ============
- * Accepts either:
- * - Query:  /mindbody?action=get_today_schedule&date=YYYY-MM-DD
- * - JSON:   { "action": "get_today_schedule", "params": { ... } }
  */
 app.all("/mindbody", async (req, res) => {
   try {
-    // 1) Pull action from query OR body OR action_type
     const action =
       req.query?.action ||
       req.body?.action ||
       req.body?.action_type ||
       "";
 
-    // 2) Pull params from body.params + extra top-level + query (query wins)
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
 
@@ -174,11 +169,7 @@ app.all("/mindbody", async (req, res) => {
 
     const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
 
-    console.log("WEBHOOK_HIT", {
-      method: req.method,
-      action,
-      params,
-    });
+    console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
     if (!action) {
       return res.status(400).json({
@@ -190,12 +181,9 @@ app.all("/mindbody", async (req, res) => {
       });
     }
 
-    /**
-     * =====================
-     * ACTION: get_today_schedule
-     * =====================
-     * Mindbody: GET /class/classes :contentReference[oaicite:2]{index=2}
-     */
+    // ---------------------------
+    // ACTION: get_today_schedule
+    // ---------------------------
     if (action === "get_today_schedule") {
       const date = params.date || nowInTZDateString("America/Vancouver");
       const { startISO, endISO } = toISODateRangeForDay(date);
@@ -231,15 +219,9 @@ app.all("/mindbody", async (req, res) => {
       });
     }
 
-    /**
-     * =====================
-     * ACTION: get_pricing_offers
-     * =====================
-     * Public v6 Sale endpoints:
-     * - GET /sale/services
-     * - GET /sale/packages
-     * - GET /sale/contracts :contentReference[oaicite:3]{index=3}
-     */
+    // ---------------------------
+    // ACTION: get_pricing_offers
+    // ---------------------------
     if (action === "get_pricing_offers") {
       const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
         mbFetch("/sale/services", { method: "GET" }),
@@ -270,27 +252,27 @@ app.all("/mindbody", async (req, res) => {
           class_pack_interest: params.class_pack_interest || null,
           notes: params.notes || null,
         },
-        offers: {
-          services,
-          packages,
-          contracts,
-        },
+        offers: { services, packages, contracts },
         warnings: {
-          services: servicesResp.status === "rejected" ? String(servicesResp.reason?.message || servicesResp.reason) : null,
-          packages: packagesResp.status === "rejected" ? String(packagesResp.reason?.message || packagesResp.reason) : null,
-          contracts: contractsResp.status === "rejected" ? String(contractsResp.reason?.message || contractsResp.reason) : null,
+          services:
+            servicesResp.status === "rejected"
+              ? String(servicesResp.reason?.message || servicesResp.reason)
+              : null,
+          packages:
+            packagesResp.status === "rejected"
+              ? String(packagesResp.reason?.message || packagesResp.reason)
+              : null,
+          contracts:
+            contractsResp.status === "rejected"
+              ? String(contractsResp.reason?.message || contractsResp.reason)
+              : null,
         },
       });
     }
 
-    /**
-     * =====================
-     * ACTION: book_class
-     * =====================
-     * - Books a client into a class: POST /class/addclienttoclass :contentReference[oaicite:4]{index=4}
-     * - If is_new_client=true and we can't find them, we create them:
-     *   POST /client/addclient :contentReference[oaicite:5]{index=5}
-     */
+    // ---------------------------
+    // ACTION: book_class
+    // ---------------------------
     if (action === "book_class") {
       const isNewClient =
         params.is_new_client === true ||
@@ -310,7 +292,6 @@ app.all("/mindbody", async (req, res) => {
         });
 
         const classes = normalizeArray(sched, ["Classes", "classes"]);
-
         const desiredName = (params.class_name || "").toString().toLowerCase().trim();
         const desiredTime = (params.time || "")
           .toString()
@@ -324,11 +305,13 @@ app.all("/mindbody", async (req, res) => {
           const st = (c.StartDateTime ?? "").toString();
 
           const stHuman = st
-            ? new Date(st).toLocaleTimeString("en-US", {
-                hour: "numeric",
-                minute: "2-digit",
-                hour12: true,
-              }).toLowerCase()
+            ? new Date(st)
+                .toLocaleTimeString("en-US", {
+                  hour: "numeric",
+                  minute: "2-digit",
+                  hour12: true,
+                })
+                .toLowerCase()
             : "";
 
           const nameOk = desiredName ? nm.includes(desiredName) : true;
@@ -345,12 +328,12 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
+            "Missing class_id and could not match a class. Best practice: call get_today_schedule first and pass class_id.",
           paramsReceived: params,
         });
       }
 
-      // 2) Determine clientId (find existing)
+      // 2) Determine clientId
       let clientId = params.client_id || params.clientId || null;
 
       const first = (params.client_first_name || "").toString().trim();
@@ -359,7 +342,9 @@ app.all("/mindbody", async (req, res) => {
       const phone = normalizePhone(params.phone);
 
       if (!clientId) {
-        const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
+        const searchText = [email, phone, `${first} ${last}`].find(
+          (x) => x && x.length >= 3
+        );
 
         if (searchText) {
           const clientResp = await mbFetch("/client/clients", {
@@ -383,7 +368,7 @@ app.all("/mindbody", async (req, res) => {
         }
       }
 
-      // 2b) If still no client and is_new_client=true => create client
+      // 2b) If new client and not found, create client
       if (!clientId && isNewClient) {
         if (!first || !last) {
           return res.status(400).json({
@@ -405,7 +390,6 @@ app.all("/mindbody", async (req, res) => {
           },
         });
 
-        // Common response includes the created client object/id
         clientId =
           createResp?.Client?.Id ||
           createResp?.Client?.ClientId ||
@@ -419,7 +403,7 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Could not find client. If this is a NEW client, set is_new_client=true and provide first/last (+ email/phone). Otherwise provide client_id.",
+            "Could not find client. If NEW client: set is_new_client=yes and provide first/last (+ email/phone). Otherwise provide client_id.",
           paramsReceived: params,
         });
       }
@@ -444,6 +428,7 @@ app.all("/mindbody", async (req, res) => {
       });
     }
 
+    // Unknown action
     return res.status(400).json({
       success: false,
       actionReceived: action,
@@ -462,6 +447,7 @@ app.all("/mindbody", async (req, res) => {
 // IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
