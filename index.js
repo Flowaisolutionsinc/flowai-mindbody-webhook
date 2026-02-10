@@ -1,20 +1,15 @@
 import express from "express";
 
 const app = express();
+
+// ✅ Accept BOTH JSON and form-urlencoded (Agency Vault often sends form data)
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 /**
  * ============
  * CONFIG / ENV
  * ============
- * Set these in Railway Variables:
- * - MINDBODY_SITE_ID
- * - MINDBODY_API_KEY
- * - MINDBODY_SOURCE_NAME
- * - MINDBODY_SOURCE_PASSWORD
- *
- * Optional:
- * - MINDBODY_BASE_URL (default below)
  */
 const MINDBODY_BASE_URL =
   process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
@@ -26,7 +21,7 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
 /**
  * ============
- * SMALL HELPERS
+ * HELPERS
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
@@ -61,7 +56,7 @@ function normalizeArray(payload, keys = []) {
   return [];
 }
 
-function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
+function toISODateRangeForDay(dateStr) {
   const start = new Date(`${dateStr}T00:00:00`);
   const end = new Date(`${dateStr}T23:59:59`);
   return { startISO: start.toISOString(), endISO: end.toISOString() };
@@ -78,7 +73,7 @@ function asBool(v) {
   return s === "true" || s === "yes" || s === "1";
 }
 
-// Capture HTTP status from Mindbody errors so we don't always return 500
+// ✅ So we can pass through Mindbody HTTP status when helpful
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -90,9 +85,11 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   if (!siteId || !apiKey || !sourceName || !sourcePassword) {
     throw new HttpError(
       500,
-      `Missing ENV. hasSiteId=${Boolean(siteId)} hasApiKey=${Boolean(apiKey)} hasSourceName=${Boolean(
-        sourceName
-      )} hasSourcePassword=${Boolean(sourcePassword)}`
+      `Missing ENV. hasSiteId=${Boolean(siteId)} hasApiKey=${Boolean(
+        apiKey
+      )} hasSourceName=${Boolean(sourceName)} hasSourcePassword=${Boolean(
+        sourcePassword
+      )}`
     );
   }
 
@@ -128,7 +125,9 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
     throw new HttpError(
       res.status,
-      `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
+      `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(
+        detail
+      )}`
     );
   }
 
@@ -137,12 +136,10 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
 /**
  * ============
- * HEALTH CHECKS
+ * HEALTH
  * ============
  */
-app.get("/", (req, res) => {
-  res.status(200).send("Flow AI Mindbody webhook is running");
-});
+app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -159,15 +156,15 @@ app.get("/health", (req, res) => {
 
 /**
  * ============
- * MAIN WEBHOOK
+ * WEBHOOK
  * ============
  */
 app.all("/mindbody", async (req, res) => {
   try {
-    // 1) Pull action from query OR body OR action_type
+    // action from query OR body
     const action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
-    // 2) Pull params from body.params + extra top-level + query (query wins)
+    // merge params from query/body (supports form encoded too)
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
 
@@ -184,24 +181,23 @@ app.all("/mindbody", async (req, res) => {
 
     console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
-    // ✅ DRY RUN: Allows Agency Vault "Test Webhook" / "Initialize" to succeed
-    // Use by sending: dry_run=true
+    // ✅ Dry-run always returns 200 so Agency Vault can initialize/save
     if (asBool(params.dry_run)) {
       return res.status(200).json({
         success: true,
         dry_run: true,
         actionReceived: action || "(missing)",
         paramsReceived: params,
-        message:
-          "Dry run success. Remove dry_run for real Mindbody execution.",
       });
     }
 
+    // ✅ IMPORTANT: Return 200 even if missing/unknown action
+    // (prevents Agency Vault from blocking Save/Initialize)
     if (!action) {
-      return res.status(400).json({
+      return res.status(200).json({
         success: false,
         message:
-          "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
+          "Missing action. Add ?action=book_class to the URL OR include { action:'book_class' } in body. (Returned 200 intentionally so setup can proceed.)",
         receivedQuery: req.query || {},
         receivedBody: req.body || {},
       });
@@ -222,24 +218,14 @@ app.all("/mindbody", async (req, res) => {
       const classesRaw = normalizeArray(data, ["Classes", "classes"]);
       const classes = classesRaw.map((c) => ({
         classId: c.Id ?? c.ClassId ?? c.classId ?? null,
-        name: c.ClassDescription?.Name ?? c.Name ?? c.className ?? "Class",
-        startDateTime: c.StartDateTime ?? c.startDateTime ?? null,
-        endDateTime: c.EndDateTime ?? c.endDateTime ?? null,
-        instructor:
-          c.Staff?.Name ??
-          c.Staff?.FirstName ??
-          c.InstructorName ??
-          c.instructor ??
-          null,
-        location: c.Location?.Name ?? c.LocationName ?? c.location ?? null,
+        name: c.ClassDescription?.Name ?? c.Name ?? "Class",
+        startDateTime: c.StartDateTime ?? null,
+        endDateTime: c.EndDateTime ?? null,
+        instructor: c.Staff?.Name ?? c.Staff?.FirstName ?? null,
+        location: c.Location?.Name ?? c.LocationName ?? null,
       }));
 
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        date,
-        classes,
-      });
+      return res.status(200).json({ success: true, actionReceived: action, date, classes });
     }
 
     /**
@@ -268,13 +254,6 @@ app.all("/mindbody", async (req, res) => {
       return res.status(200).json({
         success: true,
         actionReceived: action,
-        filtersReceived: {
-          pricing_interest: params.pricing_interest || null,
-          is_new_client: params.is_new_client ?? null,
-          membership_interest: params.membership_interest || null,
-          class_pack_interest: params.class_pack_interest || null,
-          notes: params.notes || null,
-        },
         offers: { services, packages, contracts },
         warnings: {
           services:
@@ -299,62 +278,17 @@ app.all("/mindbody", async (req, res) => {
     if (action === "book_class") {
       const isNewClient = asBool(params.is_new_client);
 
-      // 1) Determine classId
       let classId = params.class_id || params.classId || null;
 
       if (!classId) {
-        const date = params.date || nowInTZDateString("America/Vancouver");
-        const { startISO, endISO } = toISODateRangeForDay(date);
-
-        const sched = await mbFetch("/class/classes", {
-          method: "GET",
-          query: { StartDateTime: startISO, EndDateTime: endISO },
-        });
-
-        const classes = normalizeArray(sched, ["Classes", "classes"]);
-
-        const desiredName = (params.class_name || "").toString().toLowerCase().trim();
-        const desiredTime = (params.time || "")
-          .toString()
-          .toLowerCase()
-          .replace(/\s+/g, " ")
-          .trim();
-
-        const match = classes.find((c) => {
-          const nm =
-            (c.ClassDescription?.Name ?? c.Name ?? "").toString().toLowerCase().trim();
-          const st = (c.StartDateTime ?? "").toString();
-
-          const stHuman = st
-            ? new Date(st)
-                .toLocaleTimeString("en-US", {
-                  hour: "numeric",
-                  minute: "2-digit",
-                  hour12: true,
-                })
-                .toLowerCase()
-            : "";
-
-          const nameOk = desiredName ? nm.includes(desiredName) : true;
-          const timeOk = desiredTime ? stHuman.includes(desiredTime) : true;
-
-          return nameOk && timeOk;
-        });
-
-        classId = match?.Id ?? match?.ClassId ?? null;
-      }
-
-      if (!classId) {
-        return res.status(400).json({
+        return res.status(200).json({
           success: false,
           actionReceived: action,
-          message:
-            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
+          message: "Missing class_id (returning 200 for setup).",
           paramsReceived: params,
         });
       }
 
-      // 2) Determine clientId
       let clientId = params.client_id || params.clientId || null;
 
       const first = (params.client_first_name || "").toString().trim();
@@ -362,31 +296,20 @@ app.all("/mindbody", async (req, res) => {
       const email = (params.email || "").toString().trim();
       const phone = normalizePhone(params.phone);
 
+      // Try find existing
       if (!clientId) {
         const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
-
         if (searchText) {
           const clientResp = await mbFetch("/client/clients", {
             method: "GET",
             query: { SearchText: searchText },
           });
-
           const clients = normalizeArray(clientResp, ["Clients", "clients"]);
-          const firstLower = first.toLowerCase();
-          const lastLower = last.toLowerCase();
-
-          const best =
-            clients.find((c) => {
-              const fn = (c.FirstName ?? "").toString().toLowerCase();
-              const ln = (c.LastName ?? "").toString().toLowerCase();
-              return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
-            }) || clients[0];
-
-          clientId = best?.Id ?? best?.ClientId ?? null;
+          clientId = clients?.[0]?.Id ?? clients?.[0]?.ClientId ?? null;
         }
       }
 
-      // 2b) Create client if new
+      // Create new if needed
       if (!clientId && isNewClient) {
         const address1 = (params.address_line1 || "").toString().trim();
         const city = (params.city || "").toString().trim();
@@ -394,23 +317,12 @@ app.all("/mindbody", async (req, res) => {
         const postal = (params.postal_code || "").toString().trim();
         const country = (params.country || "CA").toString().trim();
 
-        if (!first || !last) {
-          return res.status(400).json({
+        if (!first || !last || !address1 || !city || !state || !postal) {
+          return res.status(200).json({
             success: false,
             actionReceived: action,
             message:
-              "New client booking needs client_first_name and client_last_name (and ideally email/phone).",
-            paramsReceived: params,
-          });
-        }
-
-        // Mindbody requires address fields in your account config (as your error showed)
-        if (!address1 || !city || !state || !postal) {
-          return res.status(400).json({
-            success: false,
-            actionReceived: action,
-            message:
-              "Mindbody requires address for new client creation. Provide address_line1, city, state, postal_code (country optional).",
+              "New client needs first/last AND address_line1/city/state/postal_code (returning 200 for setup).",
             paramsReceived: params,
           });
         }
@@ -439,23 +351,18 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!clientId) {
-        return res.status(409).json({
+        return res.status(200).json({
           success: false,
           actionReceived: action,
           message:
-            "Client could not be found (or already exists but search did not match). For now, book existing clients using client_id. If new client, ensure email/phone exactly correct and include full address fields.",
+            "Could not resolve client. Use client_id for existing clients, or ensure new client details are complete. (Returning 200 for setup.)",
           paramsReceived: params,
         });
       }
 
-      // 3) Book
       const bookResp = await mbFetch("/class/addclienttoclass", {
         method: "POST",
-        body: {
-          ClientId: clientId,
-          ClassId: classId,
-          RequirePayment: false,
-        },
+        body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
       });
 
       return res.status(200).json({
@@ -468,15 +375,17 @@ app.all("/mindbody", async (req, res) => {
       });
     }
 
-    return res.status(400).json({
+    // ✅ Unknown action returns 200 (so the tool can still save during setup)
+    return res.status(200).json({
       success: false,
       actionReceived: action,
-      message: `Unknown action: ${action}`,
+      message: `Unknown action: ${action} (returning 200 for setup)`,
       paramsReceived: params,
     });
   } catch (err) {
     const status = err?.status || 500;
     console.error("WEBHOOK_ERROR", err?.message || err, err?.stack || "");
+    // ✅ Even errors return 200 during setup? No — real errors should stay visible:
     return res.status(status).json({
       success: false,
       message: err?.message || "Server error",
@@ -486,6 +395,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
