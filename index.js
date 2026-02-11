@@ -1,15 +1,20 @@
 import express from "express";
 
 const app = express();
-
-// ✅ Accept BOTH JSON and form-urlencoded (Agency Vault often sends form data)
 app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
 
 /**
  * ============
  * CONFIG / ENV
  * ============
+ * Set these in Railway Variables:
+ * - MINDBODY_SITE_ID
+ * - MINDBODY_API_KEY
+ * - MINDBODY_SOURCE_NAME
+ * - MINDBODY_SOURCE_PASSWORD
+ *
+ * Optional:
+ * - MINDBODY_BASE_URL (default below)
  */
 const MINDBODY_BASE_URL =
   process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
@@ -21,10 +26,11 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
 /**
  * ============
- * HELPERS
+ * SMALL HELPERS
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
+  // returns YYYY-MM-DD for the given TZ
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
     year: "numeric",
@@ -56,7 +62,7 @@ function normalizeArray(payload, keys = []) {
   return [];
 }
 
-function toISODateRangeForDay(dateStr) {
+function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
   const start = new Date(`${dateStr}T00:00:00`);
   const end = new Date(`${dateStr}T23:59:59`);
   return { startISO: start.toISOString(), endISO: end.toISOString() };
@@ -67,29 +73,79 @@ function normalizePhone(phone) {
   return String(phone).trim();
 }
 
-function asBool(v) {
-  if (v === true) return true;
-  const s = String(v || "").toLowerCase().trim();
-  return s === "true" || s === "yes" || s === "1";
+function toLowerClean(x) {
+  return (x ?? "").toString().toLowerCase().trim();
 }
 
-// ✅ So we can pass through Mindbody HTTP status when helpful
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
+function timeBucketFromISO(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  const hour = d.getHours();
+  if (hour < 12) return "morning";
+  if (hour < 17) return "afternoon";
+  return "evening";
+}
+
+function humanTime(iso) {
+  try {
+    return new Date(iso).toLocaleTimeString("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    });
+  } catch {
+    return null;
   }
+}
+
+/**
+ * Best-effort extraction of capacity & booked counts from Mindbody class object.
+ * Mindbody fields can vary by account/configuration.
+ */
+function extractCapacityInfo(c) {
+  const candidatesCapacity = [
+    c.MaxCapacity,
+    c.WebCapacity,
+    c.Capacity,
+    c.ClassCapacity,
+  ];
+  const candidatesBooked = [
+    c.TotalBooked,
+    c.Visits,
+    c.TotalBookedClients,
+    c.Booked,
+    c.NumBooked,
+  ];
+
+  const capacity = candidatesCapacity.find((v) => Number.isFinite(Number(v)));
+  const booked = candidatesBooked.find((v) => Number.isFinite(Number(v)));
+
+  const capNum = capacity !== undefined ? Number(capacity) : null;
+  const bookedNum = booked !== undefined ? Number(booked) : null;
+
+  const spotsAvailable =
+    capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
+
+  const isWaitlistAvailable =
+    c.IsWaitlistAvailable ??
+    c.WaitlistAvailable ??
+    c.AllowWaitlist ??
+    null;
+
+  return {
+    capacity: capNum,
+    booked: bookedNum,
+    spotsAvailable,
+    isWaitlistAvailable,
+  };
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
   if (!siteId || !apiKey || !sourceName || !sourcePassword) {
-    throw new HttpError(
-      500,
-      `Missing ENV. hasSiteId=${Boolean(siteId)} hasApiKey=${Boolean(
-        apiKey
-      )} hasSourceName=${Boolean(sourceName)} hasSourcePassword=${Boolean(
-        sourcePassword
-      )}`
+    throw new Error(
+      `Missing ENV. hasSiteId=${Boolean(siteId)} hasApiKey=${Boolean(apiKey)} hasSourceName=${Boolean(
+        sourceName
+      )} hasSourcePassword=${Boolean(sourcePassword)}`
     );
   }
 
@@ -121,13 +177,10 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
   if (!res.ok) {
     const detail =
-      json || (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
-
-    throw new HttpError(
-      res.status,
-      `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(
-        detail
-      )}`
+      json ||
+      (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
+    throw new Error(
+      `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
     );
   }
 
@@ -136,10 +189,12 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
 /**
  * ============
- * HEALTH
+ * HEALTH CHECKS
  * ============
  */
-app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
+app.get("/", (req, res) => {
+  res.status(200).send("Flow AI Mindbody webhook is running");
+});
 
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -156,15 +211,16 @@ app.get("/health", (req, res) => {
 
 /**
  * ============
- * WEBHOOK
+ * MAIN WEBHOOK
  * ============
+ * Accepts either:
+ * - Query:  /mindbody?action=get_today_schedule&date=YYYY-MM-DD
+ * - JSON:   { "action": "get_today_schedule", "params": { ... } }
  */
 app.all("/mindbody", async (req, res) => {
   try {
-    // action from query OR body
     const action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
-    // merge params from query/body (supports form encoded too)
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
 
@@ -181,30 +237,25 @@ app.all("/mindbody", async (req, res) => {
 
     console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
-    // ✅ Dry-run always returns 200 so Agency Vault can initialize/save
-    if (asBool(params.dry_run)) {
-      return res.status(200).json({
-        success: true,
-        dry_run: true,
-        actionReceived: action || "(missing)",
-        paramsReceived: params,
-      });
-    }
-
-    // ✅ IMPORTANT: Return 200 even if missing/unknown action
-    // (prevents Agency Vault from blocking Save/Initialize)
     if (!action) {
-      return res.status(200).json({
+      return res.status(400).json({
         success: false,
         message:
-          "Missing action. Add ?action=book_class to the URL OR include { action:'book_class' } in body. (Returned 200 intentionally so setup can proceed.)",
+          "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
         receivedQuery: req.query || {},
         receivedBody: req.body || {},
       });
     }
 
     /**
+     * =====================
      * ACTION: get_today_schedule
+     * =====================
+     * Optional filters supported:
+     * - date (YYYY-MM-DD)
+     * - class_type OR class_name (substring match)
+     * - instructor_name (substring match)
+     * - time_range (morning/afternoon/evening) OR time (like "6pm")
      */
     if (action === "get_today_schedule") {
       const date = params.date || nowInTZDateString("America/Vancouver");
@@ -212,24 +263,85 @@ app.all("/mindbody", async (req, res) => {
 
       const data = await mbFetch("/class/classes", {
         method: "GET",
-        query: { StartDateTime: startISO, EndDateTime: endISO },
+        query: {
+          StartDateTime: startISO,
+          EndDateTime: endISO,
+        },
       });
 
       const classesRaw = normalizeArray(data, ["Classes", "classes"]);
-      const classes = classesRaw.map((c) => ({
-        classId: c.Id ?? c.ClassId ?? c.classId ?? null,
-        name: c.ClassDescription?.Name ?? c.Name ?? "Class",
-        startDateTime: c.StartDateTime ?? null,
-        endDateTime: c.EndDateTime ?? null,
-        instructor: c.Staff?.Name ?? c.Staff?.FirstName ?? null,
-        location: c.Location?.Name ?? c.LocationName ?? null,
-      }));
 
-      return res.status(200).json({ success: true, actionReceived: action, date, classes });
+      const wantType = toLowerClean(params.class_type || params.class_name);
+      const wantInstructor = toLowerClean(params.instructor_name);
+      const wantTimeRange = toLowerClean(params.time_range); // morning/afternoon/evening
+      const wantTime = toLowerClean(params.time); // "6pm" etc
+
+      let classes = classesRaw.map((c) => {
+        const classId = c.Id ?? c.ClassId ?? c.classId ?? null;
+        const name = c.ClassDescription?.Name ?? c.Name ?? c.className ?? "Class";
+        const startDateTime = c.StartDateTime ?? c.startDateTime ?? null;
+        const endDateTime = c.EndDateTime ?? c.endDateTime ?? null;
+
+        const instructor =
+          c.Staff?.Name ??
+          c.Staff?.FirstName ??
+          c.InstructorName ??
+          c.instructor ??
+          null;
+
+        const location = c.Location?.Name ?? c.LocationName ?? c.location ?? null;
+
+        const cap = extractCapacityInfo(c);
+
+        return {
+          classId,
+          name,
+          startDateTime,
+          endDateTime,
+          startTimeLocal: startDateTime ? humanTime(startDateTime) : null,
+          instructor,
+          location,
+          capacity: cap.capacity,
+          booked: cap.booked,
+          spotsAvailable: cap.spotsAvailable,
+          isWaitlistAvailable: cap.isWaitlistAvailable,
+          _timeBucket: startDateTime ? timeBucketFromISO(startDateTime) : null,
+        };
+      });
+
+      // Optional filtering (safe to ignore if not provided)
+      if (wantType) {
+        classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
+      }
+      if (wantInstructor) {
+        classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+      }
+      if (wantTimeRange) {
+        classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
+      }
+      if (wantTime) {
+        classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
+      }
+
+      // strip private helper field
+      classes = classes.map(({ _timeBucket, ...rest }) => rest);
+
+      return res.status(200).json({
+        success: true,
+        actionReceived: action,
+        date,
+        classes,
+        notes: {
+          capacityLogic:
+            "spotsAvailable is best-effort: if Mindbody does not return capacity/booked fields for a class, spotsAvailable will be null.",
+        },
+      });
     }
 
     /**
+     * =====================
      * ACTION: get_pricing_offers
+     * =====================
      */
     if (action === "get_pricing_offers") {
       const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
@@ -254,6 +366,13 @@ app.all("/mindbody", async (req, res) => {
       return res.status(200).json({
         success: true,
         actionReceived: action,
+        filtersReceived: {
+          pricing_interest: params.pricing_interest || null,
+          is_new_client: params.is_new_client ?? null,
+          membership_interest: params.membership_interest || null,
+          class_pack_interest: params.class_pack_interest || null,
+          notes: params.notes || null,
+        },
         offers: { services, packages, contracts },
         warnings: {
           services:
@@ -273,18 +392,55 @@ app.all("/mindbody", async (req, res) => {
     }
 
     /**
+     * =====================
      * ACTION: book_class
+     * =====================
+     * NOTE: We can refine this later to handle:
+     * - duplicate client create -> fallback search
+     * - scheduling window -> offer alternatives
      */
     if (action === "book_class") {
-      const isNewClient = asBool(params.is_new_client);
+      const isNewClient =
+        params.is_new_client === true ||
+        String(params.is_new_client || "").toLowerCase() === "true" ||
+        String(params.is_new_client || "").toLowerCase() === "yes";
 
       let classId = params.class_id || params.classId || null;
 
       if (!classId) {
-        return res.status(200).json({
+        const date = params.date || nowInTZDateString("America/Vancouver");
+        const { startISO, endISO } = toISODateRangeForDay(date);
+
+        const sched = await mbFetch("/class/classes", {
+          method: "GET",
+          query: { StartDateTime: startISO, EndDateTime: endISO },
+        });
+
+        const classes = normalizeArray(sched, ["Classes", "classes"]);
+
+        const desiredName = toLowerClean(params.class_name || params.class_type);
+        const desiredTime = toLowerClean(params.time);
+
+        const match = classes.find((c) => {
+          const nm = toLowerClean(c.ClassDescription?.Name ?? c.Name ?? "");
+          const st = (c.StartDateTime ?? "").toString();
+
+          const stHuman = st ? humanTime(st)?.toLowerCase() : "";
+
+          const nameOk = desiredName ? nm.includes(desiredName) : true;
+          const timeOk = desiredTime ? (stHuman || "").includes(desiredTime) : true;
+          return nameOk && timeOk;
+        });
+
+        classId = match?.Id ?? match?.ClassId ?? null;
+      }
+
+      if (!classId) {
+        return res.status(400).json({
           success: false,
           actionReceived: action,
-          message: "Missing class_id (returning 200 for setup).",
+          message:
+            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
           paramsReceived: params,
         });
       }
@@ -296,33 +452,44 @@ app.all("/mindbody", async (req, res) => {
       const email = (params.email || "").toString().trim();
       const phone = normalizePhone(params.phone);
 
-      // Try find existing
       if (!clientId) {
         const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
+
         if (searchText) {
           const clientResp = await mbFetch("/client/clients", {
             method: "GET",
             query: { SearchText: searchText },
           });
+
           const clients = normalizeArray(clientResp, ["Clients", "clients"]);
-          clientId = clients?.[0]?.Id ?? clients?.[0]?.ClientId ?? null;
+
+          const firstLower = first.toLowerCase();
+          const lastLower = last.toLowerCase();
+
+          const best =
+            clients.find((c) => {
+              const fn = (c.FirstName ?? "").toString().toLowerCase();
+              const ln = (c.LastName ?? "").toString().toLowerCase();
+              return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
+            }) || clients[0];
+
+          clientId = best?.Id ?? best?.ClientId ?? null;
         }
       }
 
-      // Create new if needed
       if (!clientId && isNewClient) {
-        const address1 = (params.address_line1 || "").toString().trim();
+        // Mindbody often requires address fields for new client creation depending on studio settings
+        const addressLine1 = (params.address_line1 || "").toString().trim();
         const city = (params.city || "").toString().trim();
         const state = (params.state || "").toString().trim();
-        const postal = (params.postal_code || "").toString().trim();
-        const country = (params.country || "CA").toString().trim();
+        const postalCode = (params.postal_code || "").toString().trim();
 
-        if (!first || !last || !address1 || !city || !state || !postal) {
-          return res.status(200).json({
+        if (!first || !last) {
+          return res.status(400).json({
             success: false,
             actionReceived: action,
             message:
-              "New client needs first/last AND address_line1/city/state/postal_code (returning 200 for setup).",
+              "New client booking needs client_first_name and client_last_name (and ideally email/phone).",
             paramsReceived: params,
           });
         }
@@ -334,11 +501,10 @@ app.all("/mindbody", async (req, res) => {
             LastName: last,
             Email: email || undefined,
             MobilePhone: phone || undefined,
-            AddressLine1: address1,
-            City: city,
-            State: state,
-            PostalCode: postal,
-            Country: country,
+            AddressLine1: addressLine1 || undefined,
+            City: city || undefined,
+            State: state || undefined,
+            PostalCode: postalCode || undefined,
           },
         });
 
@@ -351,18 +517,22 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!clientId) {
-        return res.status(200).json({
+        return res.status(409).json({
           success: false,
           actionReceived: action,
           message:
-            "Could not resolve client. Use client_id for existing clients, or ensure new client details are complete. (Returning 200 for setup.)",
+            "Client likely already exists, but could not be located via search. Try asking for the phone or email exactly as on file, or use client_id.",
           paramsReceived: params,
         });
       }
 
       const bookResp = await mbFetch("/class/addclienttoclass", {
         method: "POST",
-        body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
+        body: {
+          ClientId: clientId,
+          ClassId: classId,
+          RequirePayment: false,
+        },
       });
 
       return res.status(200).json({
@@ -375,26 +545,25 @@ app.all("/mindbody", async (req, res) => {
       });
     }
 
-    // ✅ Unknown action returns 200 (so the tool can still save during setup)
-    return res.status(200).json({
+    return res.status(400).json({
       success: false,
       actionReceived: action,
-      message: `Unknown action: ${action} (returning 200 for setup)`,
+      message: `Unknown action: ${action}`,
       paramsReceived: params,
     });
   } catch (err) {
-    const status = err?.status || 500;
     console.error("WEBHOOK_ERROR", err?.message || err, err?.stack || "");
-    // ✅ Even errors return 200 during setup? No — real errors should stay visible:
-    return res.status(status).json({
+    return res.status(500).json({
       success: false,
       message: err?.message || "Server error",
     });
   }
 });
 
+// IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
