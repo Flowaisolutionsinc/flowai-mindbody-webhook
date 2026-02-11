@@ -1,5 +1,4 @@
 import express from "express";
-import { DateTime } from "luxon";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -16,12 +15,12 @@ app.use(express.json({ limit: "1mb" }));
  *
  * Optional:
  * - MINDBODY_BASE_URL (default below)
- * - STUDIO_TZ (default America/Vancouver)
+ * - STUDIO_TIMEZONE (default America/Vancouver)
  */
 const MINDBODY_BASE_URL =
   process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
 
-const STUDIO_TZ = process.env.STUDIO_TZ || "America/Vancouver";
+const TZ = process.env.STUDIO_TIMEZONE || "America/Vancouver";
 
 const siteId = process.env.MINDBODY_SITE_ID || "";
 const apiKey = process.env.MINDBODY_API_KEY || "";
@@ -33,10 +32,6 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
  * SMALL HELPERS
  * ============
  */
-function nowInTZDateString(tz = STUDIO_TZ) {
-  return DateTime.now().setZone(tz).toFormat("yyyy-LL-dd"); // YYYY-MM-DD
-}
-
 function safeJsonParse(x) {
   try {
     return typeof x === "string" ? JSON.parse(x) : x;
@@ -55,52 +50,142 @@ function normalizeArray(payload, keys = []) {
   return [];
 }
 
-/**
- * FIXED: Build the "day window" in STUDIO_TZ, then convert to UTC for Mindbody.
- */
-function toISODateRangeForDay(dateStr, tz = STUDIO_TZ) {
-  const startISO = DateTime.fromISO(dateStr, { zone: tz })
-    .startOf("day")
-    .toUTC()
-    .toISO();
-
-  const endISO = DateTime.fromISO(dateStr, { zone: tz })
-    .endOf("day")
-    .toUTC()
-    .toISO();
-
-  return { startISO, endISO };
-}
-
-function normalizePhone(phone) {
-  if (!phone) return "";
-  return String(phone).trim();
-}
-
 function toLowerClean(x) {
   return (x ?? "").toString().toLowerCase().trim();
 }
 
-function timeBucketFromISO(iso, tz = STUDIO_TZ) {
-  if (!iso) return null;
+function nowYYYYMMDD(tz = TZ) {
+  // returns YYYY-MM-DD in tz
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
 
-  const hour = DateTime.fromISO(iso, { zone: "utc" }).setZone(tz).hour;
-  if (hour < 12) return "morning";
-  if (hour < 17) return "afternoon";
-  return "evening";
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const d = parts.find((p) => p.type === "day")?.value;
+  return `${y}-${m}-${d}`;
 }
 
-function humanTime(iso, tz = STUDIO_TZ) {
+function humanTime(iso, tz = TZ) {
   try {
-    return DateTime.fromISO(iso, { zone: "utc" }).setZone(tz).toFormat("h:mm a");
+    return new Date(iso).toLocaleTimeString("en-US", {
+      timeZone: tz,
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    });
   } catch {
     return null;
   }
 }
 
+function timeBucketFromISO(iso, tz = TZ) {
+  if (!iso) return null;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(iso));
+  const hh = Number(parts.find((p) => p.type === "hour")?.value);
+  if (!Number.isFinite(hh)) return null;
+  if (hh < 12) return "morning";
+  if (hh < 17) return "afternoon";
+  return "evening";
+}
+
+/**
+ * Convert "today", "tomorrow", weekday names, or YYYY-MM-DD into YYYY-MM-DD (in studio tz).
+ * Examples:
+ * - "today" -> 2026-02-11
+ * - "tomorrow" -> 2026-02-12
+ * - "thursday" -> next Thursday from today (in tz)
+ * - "2026-02-12" -> same
+ */
+function resolveDateInput(inputRaw, tz = TZ) {
+  const s = toLowerClean(inputRaw);
+  const todayStr = nowYYYYMMDD(tz);
+
+  if (!s || s === "today") return todayStr;
+
+  // If already YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  const base = new Date(); // now
+  // Get "today" in tz at noon to avoid DST edge cases
+  const baseParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(base);
+  const y = Number(baseParts.find((p) => p.type === "year")?.value);
+  const m = Number(baseParts.find((p) => p.type === "month")?.value);
+  const d = Number(baseParts.find((p) => p.type === "day")?.value);
+  const noonUTC = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+
+  if (s === "tomorrow") {
+    const t = new Date(noonUTC);
+    t.setUTCDate(t.getUTCDate() + 1);
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(t);
+  }
+
+  // Weekday name -> next occurrence (including today if matches)
+  const weekdays = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+  const idx = weekdays.indexOf(s);
+  if (idx >= 0) {
+    // Determine today's weekday in tz
+    const wd = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" })
+      .format(noonUTC)
+      .toLowerCase();
+    const todayIdx = weekdays.indexOf(wd);
+    let add = idx - todayIdx;
+    if (add < 0) add += 7;
+    const t = new Date(noonUTC);
+    t.setUTCDate(t.getUTCDate() + add);
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(t);
+  }
+
+  // fallback: try Date parse (like "Feb 12 2026")
+  const parsed = new Date(inputRaw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(parsed);
+  }
+
+  return todayStr;
+}
+
+/**
+ * IMPORTANT:
+ * Mindbody endpoints behave best when StartDateTime/EndDateTime are passed as "local-like" timestamps.
+ * We build them WITHOUT "Z" so we don't shift days/time.
+ */
+function localRangeForDay(dateYYYYMMDD) {
+  const startLocal = `${dateYYYYMMDD}T00:00:00`;
+  const endLocal = `${dateYYYYMMDD}T23:59:59`;
+  return { startLocal, endLocal };
+}
+
 /**
  * Best-effort extraction of capacity & booked counts from Mindbody class object.
- * Mindbody fields can vary by account/configuration.
+ * NOTE: Many studios do NOT return capacity/booked in this endpoint, so spotsAvailable may be null.
  */
 function extractCapacityInfo(c) {
   const candidatesCapacity = [
@@ -127,14 +212,12 @@ function extractCapacityInfo(c) {
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
   const isWaitlistAvailable =
-    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+    c.IsWaitlistAvailable ??
+    c.WaitlistAvailable ??
+    c.AllowWaitlist ??
+    null;
 
-  return {
-    capacity: capNum,
-    booked: bookedNum,
-    spotsAvailable,
-    isWaitlistAvailable,
-  };
+  return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -159,8 +242,9 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     "Api-Key": apiKey,
     SiteId: siteId,
     "Source-Name": sourceName,
-    Password: sourcePassword,
+    // Mindbody v6 accepts SourcePassword; keeping both doesn’t hurt
     SourcePassword: sourcePassword,
+    Password: sourcePassword,
   };
 
   const res = await fetch(url.toString(), {
@@ -196,7 +280,7 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
-    tz: STUDIO_TZ,
+    timezone: TZ,
     envDetected: {
       hasSiteId: Boolean(siteId),
       hasApiKey: Boolean(apiKey),
@@ -211,9 +295,10 @@ app.get("/health", (req, res) => {
  * ============
  * MAIN WEBHOOK
  * ============
- * Accepts either:
+ * Supports:
  * - Query:  /mindbody?action=get_today_schedule&date=YYYY-MM-DD
- * - JSON:   { "action": "get_today_schedule", "params": { ... } }
+ * - Body:   { action: "get_today_schedule", date: "tomorrow" }
+ * - Body:   { action: "get_today_schedule", params: { date: "tomorrow" } }
  */
 app.all("/mindbody", async (req, res) => {
   try {
@@ -239,7 +324,7 @@ app.all("/mindbody", async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
+          "Missing action. Send action as param or JSON: { action:'your_action', params:{...} }",
         receivedQuery: req.query || {},
         receivedBody: req.body || {},
       });
@@ -247,23 +332,24 @@ app.all("/mindbody", async (req, res) => {
 
     /**
      * =====================
-     * ACTION: get_today_schedule
+     * ACTION: get_today_schedule (really: get_schedule_for_date)
      * =====================
-     * Optional filters supported:
-     * - date (YYYY-MM-DD)
-     * - class_type OR class_name (substring match)
-     * - instructor_name (substring match)
-     * - time_range (morning/afternoon/evening) OR time (like "6pm")
+     * Optional filters:
+     * - date: today/tomorrow/thursday/2026-02-12
+     * - class_type OR class_name (substring)
+     * - instructor_name (substring)
+     * - time_range: morning/afternoon/evening
+     * - time: "6pm"
      */
     if (action === "get_today_schedule") {
-      const date = params.date || nowInTZDateString(STUDIO_TZ);
-      const { startISO, endISO } = toISODateRangeForDay(date, STUDIO_TZ);
+      const resolvedDate = resolveDateInput(params.date, TZ);
+      const { startLocal, endLocal } = localRangeForDay(resolvedDate);
 
       const data = await mbFetch("/class/classes", {
         method: "GET",
         query: {
-          StartDateTime: startISO,
-          EndDateTime: endISO,
+          StartDateTime: startLocal,
+          EndDateTime: endLocal,
         },
       });
 
@@ -271,8 +357,8 @@ app.all("/mindbody", async (req, res) => {
 
       const wantType = toLowerClean(params.class_type || params.class_name);
       const wantInstructor = toLowerClean(params.instructor_name);
-      const wantTimeRange = toLowerClean(params.time_range); // morning/afternoon/evening
-      const wantTime = toLowerClean(params.time); // "6pm" etc
+      const wantTimeRange = toLowerClean(params.time_range);
+      const wantTime = toLowerClean(params.time);
 
       let classes = classesRaw.map((c) => {
         const classId = c.Id ?? c.ClassId ?? c.classId ?? null;
@@ -296,14 +382,14 @@ app.all("/mindbody", async (req, res) => {
           name,
           startDateTime,
           endDateTime,
-          startTimeLocal: startDateTime ? humanTime(startDateTime, STUDIO_TZ) : null,
+          startTimeLocal: startDateTime ? humanTime(startDateTime, TZ) : null,
           instructor,
           location,
           capacity: cap.capacity,
           booked: cap.booked,
           spotsAvailable: cap.spotsAvailable,
           isWaitlistAvailable: cap.isWaitlistAvailable,
-          _timeBucket: startDateTime ? timeBucketFromISO(startDateTime, STUDIO_TZ) : null,
+          _timeBucket: startDateTime ? timeBucketFromISO(startDateTime, TZ) : null,
         };
       });
 
@@ -325,12 +411,12 @@ app.all("/mindbody", async (req, res) => {
       return res.status(200).json({
         success: true,
         actionReceived: action,
-        date,
-        timezone: STUDIO_TZ,
+        date: resolvedDate,
+        timezone: TZ,
         classes,
         notes: {
           capacityLogic:
-            "spotsAvailable is best-effort: if Mindbody does not return capacity/booked fields for a class, spotsAvailable will be null.",
+            "spotsAvailable is best-effort. Many studios do not return capacity/booked fields from this endpoint, so spotsAvailable may be null even though the class is bookable.",
         },
       });
     }
@@ -392,6 +478,9 @@ app.all("/mindbody", async (req, res) => {
      * =====================
      * ACTION: book_class
      * =====================
+     * Notes:
+     * - Mindbody may block bookings outside scheduling window.
+     * - If spotsAvailable is null, booking still may succeed.
      */
     if (action === "book_class") {
       const isNewClient =
@@ -402,38 +491,11 @@ app.all("/mindbody", async (req, res) => {
       let classId = params.class_id || params.classId || null;
 
       if (!classId) {
-        const date = params.date || nowInTZDateString(STUDIO_TZ);
-        const { startISO, endISO } = toISODateRangeForDay(date, STUDIO_TZ);
-
-        const sched = await mbFetch("/class/classes", {
-          method: "GET",
-          query: { StartDateTime: startISO, EndDateTime: endISO },
-        });
-
-        const classes = normalizeArray(sched, ["Classes", "classes"]);
-
-        const desiredName = toLowerClean(params.class_name || params.class_type);
-        const desiredTime = toLowerClean(params.time);
-
-        const match = classes.find((c) => {
-          const nm = toLowerClean(c.ClassDescription?.Name ?? c.Name ?? "");
-          const st = (c.StartDateTime ?? "").toString();
-          const stHuman = st ? (humanTime(st, STUDIO_TZ) || "").toLowerCase() : "";
-
-          const nameOk = desiredName ? nm.includes(desiredName) : true;
-          const timeOk = desiredTime ? stHuman.includes(desiredTime) : true;
-          return nameOk && timeOk;
-        });
-
-        classId = match?.Id ?? match?.ClassId ?? null;
-      }
-
-      if (!classId) {
         return res.status(400).json({
           success: false,
           actionReceived: action,
           message:
-            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
+            "Missing class_id. Best practice: call get_today_schedule first, then pass back the classId you want to book.",
           paramsReceived: params,
         });
       }
@@ -443,13 +505,11 @@ app.all("/mindbody", async (req, res) => {
       const first = (params.client_first_name || "").toString().trim();
       const last = (params.client_last_name || "").toString().trim();
       const email = (params.email || "").toString().trim();
+      const phone = (params.mobilephone || params.mobile_phone || params.phone || "").toString().trim();
 
-      // accept phone OR mobilephone param names
-      const phone = normalizePhone(params.mobilephone || params.mobile_phone || params.phone);
-
+      // Try search if no clientId
       if (!clientId) {
         const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
-
         if (searchText) {
           const clientResp = await mbFetch("/client/clients", {
             method: "GET",
@@ -457,33 +517,27 @@ app.all("/mindbody", async (req, res) => {
           });
 
           const clients = normalizeArray(clientResp, ["Clients", "clients"]);
-
-          const firstLower = first.toLowerCase();
-          const lastLower = last.toLowerCase();
-
-          const best =
-            clients.find((c) => {
-              const fn = (c.FirstName ?? "").toString().toLowerCase();
-              const ln = (c.LastName ?? "").toString().toLowerCase();
-              return (firstLower ? fn === firstLower : true) && (lastLower ? ln === lastLower : true);
-            }) || clients[0];
-
+          const best = clients[0];
           clientId = best?.Id ?? best?.ClientId ?? null;
         }
       }
 
+      // Create new client if needed
       if (!clientId && isNewClient) {
-        const addressLine1 = (params.address_line1 || "").toString().trim();
-        const city = (params.city || "").toString().trim();
-        const state = (params.state || "").toString().trim();
-        const postalCode = (params.postal_code || "").toString().trim();
-
         if (!first || !last) {
           return res.status(400).json({
             success: false,
             actionReceived: action,
-            message:
-              "New client booking needs client_first_name and client_last_name (and ideally email/phone).",
+            message: "New client booking requires client_first_name and client_last_name.",
+            paramsReceived: params,
+          });
+        }
+
+        if (!phone) {
+          return res.status(400).json({
+            success: false,
+            actionReceived: action,
+            message: "Mindbody requires MobilePhone for new clients. Ask for a mobile number.",
             paramsReceived: params,
           });
         }
@@ -494,11 +548,7 @@ app.all("/mindbody", async (req, res) => {
             FirstName: first,
             LastName: last,
             Email: email || undefined,
-            MobilePhone: phone || undefined,
-            AddressLine1: addressLine1 || undefined,
-            City: city || undefined,
-            State: state || undefined,
-            PostalCode: postalCode || undefined,
+            MobilePhone: phone,
           },
         });
 
@@ -515,28 +565,47 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Client likely already exists, but could not be located via search. Try asking for the phone or email exactly as on file, or use client_id.",
+            "Could not locate/create client. Ask for the mobile number (exactly as on file) or email, or provide client_id.",
           paramsReceived: params,
         });
       }
 
-      const bookResp = await mbFetch("/class/addclienttoclass", {
-        method: "POST",
-        body: {
-          ClientId: clientId,
-          ClassId: classId,
-          RequirePayment: false,
-        },
-      });
+      try {
+        const bookResp = await mbFetch("/class/addclienttoclass", {
+          method: "POST",
+          body: {
+            ClientId: clientId,
+            ClassId: classId,
+            RequirePayment: false,
+          },
+        });
 
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        booked: true,
-        clientId,
-        classId,
-        raw: bookResp,
-      });
+        return res.status(200).json({
+          success: true,
+          actionReceived: action,
+          booked: true,
+          clientId,
+          classId,
+          raw: bookResp,
+        });
+      } catch (e) {
+        const msg = String(e?.message || e);
+
+        // Scheduling window / too late / too early
+        if (msg.includes("SchedulingWindowViolated") || msg.toLowerCase().includes("outside scheduling window")) {
+          return res.status(409).json({
+            success: false,
+            actionReceived: action,
+            booked: false,
+            message:
+              "Mindbody won’t allow booking this class right now due to the studio’s scheduling window. I can help you book a different class or a different day/time.",
+            clientId,
+            classId,
+          });
+        }
+
+        throw e;
+      }
     }
 
     return res.status(400).json({
@@ -554,9 +623,9 @@ app.all("/mindbody", async (req, res) => {
   }
 });
 
-// IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
