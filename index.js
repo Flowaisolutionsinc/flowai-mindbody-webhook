@@ -1,10 +1,7 @@
 import express from "express";
 
 const app = express();
-
-// IMPORTANT: support both JSON and form submissions (Agency Vault sometimes posts urlencoded)
 app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
 
 /**
  * ============
@@ -21,7 +18,7 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
 /**
  * ============
- * SMALL HELPERS
+ * HELPERS
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
@@ -56,20 +53,55 @@ function normalizeArray(payload, keys = []) {
   return [];
 }
 
+// Best-effort day window.
+// NOTE: MB often accepts UTC ISOs. This works for schedule listing,
+// but if you see off-by-one-day issues, we’ll adjust this next.
 function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
-  // NOTE: this matches what you've been using; keeps behavior consistent.
   const start = new Date(`${dateStr}T00:00:00`);
   const end = new Date(`${dateStr}T23:59:59`);
   return { startISO: start.toISOString(), endISO: end.toISOString() };
 }
 
-function normalizePhone(phone) {
-  if (!phone) return "";
-  return String(phone).trim();
+function decodeMaybe(x) {
+  if (x === undefined || x === null) return "";
+  const s = String(x);
+  try {
+    // if it contains % it might be url-encoded
+    return s.includes("%") ? decodeURIComponent(s) : s;
+  } catch {
+    return s;
+  }
+}
+
+function cleanStr(x) {
+  return decodeMaybe(x).trim();
 }
 
 function toLowerClean(x) {
-  return (x ?? "").toString().toLowerCase().trim();
+  return cleanStr(x).toLowerCase();
+}
+
+// Accepts Phone / phone / MobilePhone / mobilephone / mobile_phone etc.
+function getParam(params, ...names) {
+  for (const n of names) {
+    if (params[n] !== undefined && params[n] !== null && String(params[n]).trim() !== "") {
+      return params[n];
+    }
+    const lower = n.toLowerCase();
+    // scan keys case-insensitively
+    for (const k of Object.keys(params)) {
+      if (k.toLowerCase() === lower) {
+        const v = params[k];
+        if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+      }
+    }
+  }
+  return undefined;
+}
+
+function truthy(x) {
+  const v = toLowerClean(x);
+  return v === "true" || v === "yes" || v === "1";
 }
 
 function timeBucketFromISO(iso) {
@@ -94,20 +126,8 @@ function humanTime(iso) {
 }
 
 /**
- * Get a param value from many possible key spellings/cases.
- * This fixes your MobilePhone issue (you were receiving "Phone" not "phone").
- */
-function pick(params, keys = []) {
-  for (const k of keys) {
-    if (params?.[k] !== undefined && params?.[k] !== null && String(params[k]).trim() !== "") {
-      return params[k];
-    }
-  }
-  return "";
-}
-
-/**
  * Best-effort extraction of capacity & booked counts from Mindbody class object.
+ * If MB doesn’t return these fields for this endpoint/account, spotsAvailable will be null.
  */
 function extractCapacityInfo(c) {
   const candidatesCapacity = [
@@ -115,9 +135,7 @@ function extractCapacityInfo(c) {
     c.WebCapacity,
     c.Capacity,
     c.ClassCapacity,
-    c?.ClassDescription?.MaxCapacity,
   ];
-
   const candidatesBooked = [
     c.TotalBooked,
     c.Visits,
@@ -136,9 +154,17 @@ function extractCapacityInfo(c) {
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
   const isWaitlistAvailable =
-    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+    c.IsWaitlistAvailable ??
+    c.WaitlistAvailable ??
+    c.AllowWaitlist ??
+    null;
 
-  return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
+  return {
+    capacity: capNum,
+    booked: bookedNum,
+    spotsAvailable,
+    isWaitlistAvailable,
+  };
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -158,7 +184,6 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     });
   }
 
-  // Keep your existing header scheme (works for your account)
   const headers = {
     "Content-Type": "application/json",
     "Api-Key": apiKey,
@@ -179,7 +204,8 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
   if (!res.ok) {
     const detail =
-      json || (text ? { raw: text.slice(0, 900) } : { raw: "(no response body)" });
+      json ||
+      (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
     throw new Error(
       `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
     );
@@ -190,12 +216,10 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
 /**
  * ============
- * HEALTH CHECKS
+ * HEALTH
  * ============
  */
-app.get("/", (req, res) => {
-  res.status(200).send("Flow AI Mindbody webhook is running");
-});
+app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -218,10 +242,8 @@ app.get("/health", (req, res) => {
 app.all("/mindbody", async (req, res) => {
   try {
     const action =
-      req.query?.action ||
-      req.body?.action ||
-      req.body?.action_type ||
-      req.body?.Action ||
+      getParam(req.query || {}, "action") ||
+      getParam(req.body || {}, "action", "action_type") ||
       "";
 
     const paramsFromQuery = { ...(req.query || {}) };
@@ -234,23 +256,18 @@ app.all("/mindbody", async (req, res) => {
     const extraTopLevelBody = { ...bodyObj };
     delete extraTopLevelBody.action;
     delete extraTopLevelBody.action_type;
-    delete extraTopLevelBody.Action;
     delete extraTopLevelBody.params;
 
-    // Merge: body.params, then top-level body, then query
+    // merged params (body params + body top-level + query params)
     const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
 
-    console.log("WEBHOOK_HIT", {
-      method: req.method,
-      action,
-      params,
-    });
+    console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
     if (!action) {
       return res.status(400).json({
         success: false,
         message:
-          "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
+          "Missing action. Send JSON { action:'your_action', ... } or include action as a fixed parameter in the custom action.",
         receivedQuery: req.query || {},
         receivedBody: req.body || {},
       });
@@ -258,11 +275,11 @@ app.all("/mindbody", async (req, res) => {
 
     /**
      * =====================
-     * ACTION: get_today_schedule (supports any date via params.date)
+     * ACTION: get_today_schedule
      * =====================
      */
     if (action === "get_today_schedule") {
-      const date = pick(params, ["date", "Date", "schedule_date", "ScheduleDate"]) || nowInTZDateString("America/Vancouver");
+      const date = cleanStr(getParam(params, "date")) || nowInTZDateString("America/Vancouver");
       const { startISO, endISO } = toISODateRangeForDay(date);
 
       const data = await mbFetch("/class/classes", {
@@ -274,11 +291,6 @@ app.all("/mindbody", async (req, res) => {
       });
 
       const classesRaw = normalizeArray(data, ["Classes", "classes"]);
-
-      const wantType = toLowerClean(pick(params, ["class_type", "class_name", "ClassType", "ClassName"]));
-      const wantInstructor = toLowerClean(pick(params, ["instructor_name", "InstructorName"]));
-      const wantTimeRange = toLowerClean(pick(params, ["time_range", "TimeRange"]));
-      const wantTime = toLowerClean(pick(params, ["time", "Time"]));
 
       let classes = classesRaw.map((c) => {
         const classId = c.Id ?? c.ClassId ?? c.classId ?? null;
@@ -313,11 +325,6 @@ app.all("/mindbody", async (req, res) => {
         };
       });
 
-      if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-      if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-      if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
-      if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
-
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
       return res.status(200).json({
@@ -327,7 +334,7 @@ app.all("/mindbody", async (req, res) => {
         classes,
         notes: {
           capacityLogic:
-            "spotsAvailable is best-effort: if Mindbody does not return capacity/booked fields for a class, spotsAvailable will be null.",
+            "spotsAvailable is best-effort. If Mindbody does not return capacity/booked fields on /class/classes for this account, spotsAvailable will be null or 0. We may need a different endpoint for true remaining spots.",
         },
       });
     }
@@ -384,61 +391,34 @@ app.all("/mindbody", async (req, res) => {
      * =====================
      */
     if (action === "book_class") {
-      const isNewClient =
-        params.is_new_client === true ||
-        String(pick(params, ["is_new_client", "IsNewClient"]) || "").toLowerCase() === "true" ||
-        String(pick(params, ["is_new_client", "IsNewClient"]) || "").toLowerCase() === "yes";
+      const dryRun = truthy(getParam(params, "dry_run", "dryRun"));
 
-      let classId = pick(params, ["class_id", "classId", "ClassId", "ClassID"]);
+      const isNewClient = truthy(getParam(params, "is_new_client", "isNewClient"));
 
-      if (!classId) {
-        const date = pick(params, ["date", "Date"]) || nowInTZDateString("America/Vancouver");
-        const { startISO, endISO } = toISODateRangeForDay(date);
-
-        const sched = await mbFetch("/class/classes", {
-          method: "GET",
-          query: { StartDateTime: startISO, EndDateTime: endISO },
-        });
-
-        const classes = normalizeArray(sched, ["Classes", "classes"]);
-
-        const desiredName = toLowerClean(pick(params, ["class_name", "class_type", "ClassName", "ClassType"]));
-        const desiredTime = toLowerClean(pick(params, ["time", "Time"]));
-
-        const match = classes.find((c) => {
-          const nm = toLowerClean(c.ClassDescription?.Name ?? c.Name ?? "");
-          const st = (c.StartDateTime ?? "").toString();
-          const stHuman = st ? (humanTime(st)?.toLowerCase() || "") : "";
-
-          const nameOk = desiredName ? nm.includes(desiredName) : true;
-          const timeOk = desiredTime ? stHuman.includes(desiredTime) : true;
-          return nameOk && timeOk;
-        });
-
-        classId = match?.Id ?? match?.ClassId ?? null;
-      }
+      let classId = cleanStr(getParam(params, "class_id", "classId", "ClassId"));
 
       if (!classId) {
         return res.status(400).json({
           success: false,
           actionReceived: action,
           message:
-            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back classId.",
+            "Missing class_id. Best practice: call get_today_schedule for the target date, then pass its classId into book_class.",
           paramsReceived: params,
         });
       }
 
-      let clientId = pick(params, ["client_id", "clientId", "ClientId", "ClientID"]);
+      let clientId = cleanStr(getParam(params, "client_id", "clientId", "ClientId"));
 
-      // IMPORTANT: accept all possible key spellings from the agent/custom action UI
-      const first = String(pick(params, ["client_first_name", "clientFirstName", "ClientFirstName", "FirstName"])).trim();
-      const last = String(pick(params, ["client_last_name", "clientLastName", "ClientLastName", "LastName"])).trim();
-      const email = String(pick(params, ["email", "Email"])).trim();
-      const phoneRaw = pick(params, ["phone", "Phone", "mobilephone", "mobilePhone", "MobilePhone"]);
-      const phone = normalizePhone(phoneRaw);
+      const first = cleanStr(getParam(params, "client_first_name", "first_name", "FirstName"));
+      const last = cleanStr(getParam(params, "client_last_name", "last_name", "LastName"));
+      const email = cleanStr(getParam(params, "email", "Email"));
+      // accept phone/mobilephone in any casing; map to MobilePhone for MB
+      const phone = cleanStr(
+        getParam(params, "mobilephone", "MobilePhone", "mobile_phone", "phone", "Phone")
+      );
 
       if (!clientId) {
-        const searchText = [email, phone, `${first} ${last}`].find((x) => x && String(x).trim().length >= 3);
+        const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
 
         if (searchText) {
           const clientResp = await mbFetch("/client/clients", {
@@ -463,22 +443,31 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!clientId && isNewClient) {
-        const addressLine1 = String(pick(params, ["address_line1", "AddressLine1"])).trim();
-        const city = String(pick(params, ["city", "City"])).trim();
-        const state = String(pick(params, ["state", "State"])).trim();
-        const postalCode = String(pick(params, ["postal_code", "postalCode", "PostalCode"])).trim();
+        const addressLine1 = cleanStr(getParam(params, "address_line1", "AddressLine1"));
+        const city = cleanStr(getParam(params, "city", "City"));
+        const state = cleanStr(getParam(params, "state", "State"));
+        const postalCode = cleanStr(getParam(params, "postal_code", "PostalCode"));
 
         if (!first || !last) {
           return res.status(400).json({
             success: false,
             actionReceived: action,
-            message: "New client booking needs client_first_name and client_last_name.",
+            message: "New client booking requires first and last name.",
             paramsReceived: params,
           });
         }
 
-        // This is the critical fix: ALWAYS send MobilePhone if we have phone/Phone from AV
-        const createBody = {
+        if (!phone) {
+          return res.status(400).json({
+            success: false,
+            actionReceived: action,
+            message:
+              "Mindbody requires MobilePhone for this studio. Ask caller for a mobile number.",
+            paramsReceived: params,
+          });
+        }
+
+        const addBody = {
           FirstName: first,
           LastName: last,
           Email: email || undefined,
@@ -489,11 +478,11 @@ app.all("/mindbody", async (req, res) => {
           PostalCode: postalCode || undefined,
         };
 
-        console.log("ADDCLIENT_BODY", createBody);
+        console.log("ADDCLIENT_BODY", addBody);
 
         const createResp = await mbFetch("/client/addclient", {
           method: "POST",
-          body: createBody,
+          body: addBody,
         });
 
         clientId =
@@ -509,28 +498,56 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Client likely already exists, but could not be located via search. Ask for the email/phone exactly as on file or pass client_id.",
+            "Client likely exists but search didn’t find them. Ask for the exact phone/email on file or pass client_id.",
           paramsReceived: params,
         });
       }
 
-      const bookResp = await mbFetch("/class/addclienttoclass", {
-        method: "POST",
-        body: {
-          ClientId: clientId,
-          ClassId: classId,
-          RequirePayment: false,
-        },
-      });
+      if (dryRun) {
+        return res.status(200).json({
+          success: true,
+          actionReceived: action,
+          dryRun: true,
+          message: "Dry run enabled — not booking class.",
+          clientId,
+          classId,
+        });
+      }
 
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        booked: true,
-        clientId,
-        classId,
-        raw: bookResp,
-      });
+      try {
+        const bookResp = await mbFetch("/class/addclienttoclass", {
+          method: "POST",
+          body: {
+            ClientId: clientId,
+            ClassId: classId,
+            RequirePayment: false,
+          },
+        });
+
+        return res.status(200).json({
+          success: true,
+          actionReceived: action,
+          booked: true,
+          clientId,
+          classId,
+          raw: bookResp,
+        });
+      } catch (e) {
+        // Surface booking-window issues clearly to the AI
+        const msg = String(e?.message || e);
+        if (msg.includes("SchedulingWindowViolated")) {
+          return res.status(409).json({
+            success: false,
+            actionReceived: action,
+            message:
+              "Mindbody says this class is outside the booking window. Try a different class time, or the studio may only allow booking within a certain timeframe.",
+            clientId,
+            classId,
+            error: msg,
+          });
+        }
+        throw e;
+      }
     }
 
     return res.status(400).json({
@@ -550,7 +567,6 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
 
 
 
