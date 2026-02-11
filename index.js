@@ -1,20 +1,15 @@
 import express from "express";
 
 const app = express();
+
+// IMPORTANT: support both JSON and form submissions (Agency Vault sometimes posts urlencoded)
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 /**
  * ============
  * CONFIG / ENV
  * ============
- * Set these in Railway Variables:
- * - MINDBODY_SITE_ID
- * - MINDBODY_API_KEY
- * - MINDBODY_SOURCE_NAME
- * - MINDBODY_SOURCE_PASSWORD
- *
- * Optional:
- * - MINDBODY_BASE_URL (default below)
  */
 const MINDBODY_BASE_URL =
   process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
@@ -30,7 +25,6 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
-  // returns YYYY-MM-DD for the given TZ
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
     year: "numeric",
@@ -63,6 +57,7 @@ function normalizeArray(payload, keys = []) {
 }
 
 function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
+  // NOTE: this matches what you've been using; keeps behavior consistent.
   const start = new Date(`${dateStr}T00:00:00`);
   const end = new Date(`${dateStr}T23:59:59`);
   return { startISO: start.toISOString(), endISO: end.toISOString() };
@@ -99,8 +94,20 @@ function humanTime(iso) {
 }
 
 /**
+ * Get a param value from many possible key spellings/cases.
+ * This fixes your MobilePhone issue (you were receiving "Phone" not "phone").
+ */
+function pick(params, keys = []) {
+  for (const k of keys) {
+    if (params?.[k] !== undefined && params?.[k] !== null && String(params[k]).trim() !== "") {
+      return params[k];
+    }
+  }
+  return "";
+}
+
+/**
  * Best-effort extraction of capacity & booked counts from Mindbody class object.
- * Mindbody fields can vary by account/configuration.
  */
 function extractCapacityInfo(c) {
   const candidatesCapacity = [
@@ -108,7 +115,9 @@ function extractCapacityInfo(c) {
     c.WebCapacity,
     c.Capacity,
     c.ClassCapacity,
+    c?.ClassDescription?.MaxCapacity,
   ];
+
   const candidatesBooked = [
     c.TotalBooked,
     c.Visits,
@@ -127,17 +136,9 @@ function extractCapacityInfo(c) {
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
   const isWaitlistAvailable =
-    c.IsWaitlistAvailable ??
-    c.WaitlistAvailable ??
-    c.AllowWaitlist ??
-    null;
+    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
 
-  return {
-    capacity: capNum,
-    booked: bookedNum,
-    spotsAvailable,
-    isWaitlistAvailable,
-  };
+  return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -157,6 +158,7 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     });
   }
 
+  // Keep your existing header scheme (works for your account)
   const headers = {
     "Content-Type": "application/json",
     "Api-Key": apiKey,
@@ -177,8 +179,7 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
   if (!res.ok) {
     const detail =
-      json ||
-      (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
+      json || (text ? { raw: text.slice(0, 900) } : { raw: "(no response body)" });
     throw new Error(
       `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
     );
@@ -213,13 +214,15 @@ app.get("/health", (req, res) => {
  * ============
  * MAIN WEBHOOK
  * ============
- * Accepts either:
- * - Query:  /mindbody?action=get_today_schedule&date=YYYY-MM-DD
- * - JSON:   { "action": "get_today_schedule", "params": { ... } }
  */
 app.all("/mindbody", async (req, res) => {
   try {
-    const action = req.query?.action || req.body?.action || req.body?.action_type || "";
+    const action =
+      req.query?.action ||
+      req.body?.action ||
+      req.body?.action_type ||
+      req.body?.Action ||
+      "";
 
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
@@ -231,11 +234,17 @@ app.all("/mindbody", async (req, res) => {
     const extraTopLevelBody = { ...bodyObj };
     delete extraTopLevelBody.action;
     delete extraTopLevelBody.action_type;
+    delete extraTopLevelBody.Action;
     delete extraTopLevelBody.params;
 
+    // Merge: body.params, then top-level body, then query
     const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
 
-    console.log("WEBHOOK_HIT", { method: req.method, action, params });
+    console.log("WEBHOOK_HIT", {
+      method: req.method,
+      action,
+      params,
+    });
 
     if (!action) {
       return res.status(400).json({
@@ -249,16 +258,11 @@ app.all("/mindbody", async (req, res) => {
 
     /**
      * =====================
-     * ACTION: get_today_schedule
+     * ACTION: get_today_schedule (supports any date via params.date)
      * =====================
-     * Optional filters supported:
-     * - date (YYYY-MM-DD)
-     * - class_type OR class_name (substring match)
-     * - instructor_name (substring match)
-     * - time_range (morning/afternoon/evening) OR time (like "6pm")
      */
     if (action === "get_today_schedule") {
-      const date = params.date || nowInTZDateString("America/Vancouver");
+      const date = pick(params, ["date", "Date", "schedule_date", "ScheduleDate"]) || nowInTZDateString("America/Vancouver");
       const { startISO, endISO } = toISODateRangeForDay(date);
 
       const data = await mbFetch("/class/classes", {
@@ -271,10 +275,10 @@ app.all("/mindbody", async (req, res) => {
 
       const classesRaw = normalizeArray(data, ["Classes", "classes"]);
 
-      const wantType = toLowerClean(params.class_type || params.class_name);
-      const wantInstructor = toLowerClean(params.instructor_name);
-      const wantTimeRange = toLowerClean(params.time_range); // morning/afternoon/evening
-      const wantTime = toLowerClean(params.time); // "6pm" etc
+      const wantType = toLowerClean(pick(params, ["class_type", "class_name", "ClassType", "ClassName"]));
+      const wantInstructor = toLowerClean(pick(params, ["instructor_name", "InstructorName"]));
+      const wantTimeRange = toLowerClean(pick(params, ["time_range", "TimeRange"]));
+      const wantTime = toLowerClean(pick(params, ["time", "Time"]));
 
       let classes = classesRaw.map((c) => {
         const classId = c.Id ?? c.ClassId ?? c.classId ?? null;
@@ -309,21 +313,11 @@ app.all("/mindbody", async (req, res) => {
         };
       });
 
-      // Optional filtering (safe to ignore if not provided)
-      if (wantType) {
-        classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-      }
-      if (wantInstructor) {
-        classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-      }
-      if (wantTimeRange) {
-        classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
-      }
-      if (wantTime) {
-        classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
-      }
+      if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
+      if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+      if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
+      if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
-      // strip private helper field
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
       return res.status(200).json({
@@ -366,13 +360,6 @@ app.all("/mindbody", async (req, res) => {
       return res.status(200).json({
         success: true,
         actionReceived: action,
-        filtersReceived: {
-          pricing_interest: params.pricing_interest || null,
-          is_new_client: params.is_new_client ?? null,
-          membership_interest: params.membership_interest || null,
-          class_pack_interest: params.class_pack_interest || null,
-          notes: params.notes || null,
-        },
         offers: { services, packages, contracts },
         warnings: {
           services:
@@ -395,20 +382,17 @@ app.all("/mindbody", async (req, res) => {
      * =====================
      * ACTION: book_class
      * =====================
-     * NOTE: We can refine this later to handle:
-     * - duplicate client create -> fallback search
-     * - scheduling window -> offer alternatives
      */
     if (action === "book_class") {
       const isNewClient =
         params.is_new_client === true ||
-        String(params.is_new_client || "").toLowerCase() === "true" ||
-        String(params.is_new_client || "").toLowerCase() === "yes";
+        String(pick(params, ["is_new_client", "IsNewClient"]) || "").toLowerCase() === "true" ||
+        String(pick(params, ["is_new_client", "IsNewClient"]) || "").toLowerCase() === "yes";
 
-      let classId = params.class_id || params.classId || null;
+      let classId = pick(params, ["class_id", "classId", "ClassId", "ClassID"]);
 
       if (!classId) {
-        const date = params.date || nowInTZDateString("America/Vancouver");
+        const date = pick(params, ["date", "Date"]) || nowInTZDateString("America/Vancouver");
         const { startISO, endISO } = toISODateRangeForDay(date);
 
         const sched = await mbFetch("/class/classes", {
@@ -418,17 +402,16 @@ app.all("/mindbody", async (req, res) => {
 
         const classes = normalizeArray(sched, ["Classes", "classes"]);
 
-        const desiredName = toLowerClean(params.class_name || params.class_type);
-        const desiredTime = toLowerClean(params.time);
+        const desiredName = toLowerClean(pick(params, ["class_name", "class_type", "ClassName", "ClassType"]));
+        const desiredTime = toLowerClean(pick(params, ["time", "Time"]));
 
         const match = classes.find((c) => {
           const nm = toLowerClean(c.ClassDescription?.Name ?? c.Name ?? "");
           const st = (c.StartDateTime ?? "").toString();
-
-          const stHuman = st ? humanTime(st)?.toLowerCase() : "";
+          const stHuman = st ? (humanTime(st)?.toLowerCase() || "") : "";
 
           const nameOk = desiredName ? nm.includes(desiredName) : true;
-          const timeOk = desiredTime ? (stHuman || "").includes(desiredTime) : true;
+          const timeOk = desiredTime ? stHuman.includes(desiredTime) : true;
           return nameOk && timeOk;
         });
 
@@ -440,20 +423,22 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
+            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back classId.",
           paramsReceived: params,
         });
       }
 
-      let clientId = params.client_id || params.clientId || null;
+      let clientId = pick(params, ["client_id", "clientId", "ClientId", "ClientID"]);
 
-      const first = (params.client_first_name || "").toString().trim();
-      const last = (params.client_last_name || "").toString().trim();
-      const email = (params.email || "").toString().trim();
-      const phone = normalizePhone(params.phone);
+      // IMPORTANT: accept all possible key spellings from the agent/custom action UI
+      const first = String(pick(params, ["client_first_name", "clientFirstName", "ClientFirstName", "FirstName"])).trim();
+      const last = String(pick(params, ["client_last_name", "clientLastName", "ClientLastName", "LastName"])).trim();
+      const email = String(pick(params, ["email", "Email"])).trim();
+      const phoneRaw = pick(params, ["phone", "Phone", "mobilephone", "mobilePhone", "MobilePhone"]);
+      const phone = normalizePhone(phoneRaw);
 
       if (!clientId) {
-        const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
+        const searchText = [email, phone, `${first} ${last}`].find((x) => x && String(x).trim().length >= 3);
 
         if (searchText) {
           const clientResp = await mbFetch("/client/clients", {
@@ -478,34 +463,37 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!clientId && isNewClient) {
-        // Mindbody often requires address fields for new client creation depending on studio settings
-        const addressLine1 = (params.address_line1 || "").toString().trim();
-        const city = (params.city || "").toString().trim();
-        const state = (params.state || "").toString().trim();
-        const postalCode = (params.postal_code || "").toString().trim();
+        const addressLine1 = String(pick(params, ["address_line1", "AddressLine1"])).trim();
+        const city = String(pick(params, ["city", "City"])).trim();
+        const state = String(pick(params, ["state", "State"])).trim();
+        const postalCode = String(pick(params, ["postal_code", "postalCode", "PostalCode"])).trim();
 
         if (!first || !last) {
           return res.status(400).json({
             success: false,
             actionReceived: action,
-            message:
-              "New client booking needs client_first_name and client_last_name (and ideally email/phone).",
+            message: "New client booking needs client_first_name and client_last_name.",
             paramsReceived: params,
           });
         }
 
+        // This is the critical fix: ALWAYS send MobilePhone if we have phone/Phone from AV
+        const createBody = {
+          FirstName: first,
+          LastName: last,
+          Email: email || undefined,
+          MobilePhone: phone || undefined,
+          AddressLine1: addressLine1 || undefined,
+          City: city || undefined,
+          State: state || undefined,
+          PostalCode: postalCode || undefined,
+        };
+
+        console.log("ADDCLIENT_BODY", createBody);
+
         const createResp = await mbFetch("/client/addclient", {
           method: "POST",
-          body: {
-            FirstName: first,
-            LastName: last,
-            Email: email || undefined,
-            MobilePhone: phone || undefined,
-            AddressLine1: addressLine1 || undefined,
-            City: city || undefined,
-            State: state || undefined,
-            PostalCode: postalCode || undefined,
-          },
+          body: createBody,
         });
 
         clientId =
@@ -521,7 +509,7 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Client likely already exists, but could not be located via search. Try asking for the phone or email exactly as on file, or use client_id.",
+            "Client likely already exists, but could not be located via search. Ask for the email/phone exactly as on file or pass client_id.",
           paramsReceived: params,
         });
       }
@@ -560,9 +548,9 @@ app.all("/mindbody", async (req, res) => {
   }
 });
 
-// IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
