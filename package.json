@@ -7,11 +7,13 @@
     "start": "node index.js"
   },
   "engines": {
-    "node": "18.x"
+    "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "luxon": "^3.5.0"
   }
 }
+
 
 
