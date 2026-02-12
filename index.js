@@ -37,6 +37,7 @@ const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true"
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
+  // returns YYYY-MM-DD for the given TZ
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
     year: "numeric",
@@ -87,7 +88,7 @@ function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
   if (parts.length < 2) return null;
-  const timePart = parts[1];
+  const timePart = parts[1]; // "20:00:00"
   const hm = timePart.split(":");
   const hour = Number(hm[0]);
   const minute = Number(hm[1] || "0");
@@ -114,16 +115,33 @@ function timeBucketFromHour(hour) {
   return "evening";
 }
 
-function localDayRange(dateStr) {
+/**
+ * Build a “local day range” without Z (timezone) so Mindbody treats it as location-local time
+ */
+function localDayRange(dateStr /* YYYY-MM-DD */) {
   return {
     startLocal: `${dateStr}T00:00:00`,
     endLocal: `${dateStr}T23:59:59`,
   };
 }
 
+/**
+ * Best-effort extraction of capacity & booked counts from Mindbody class object.
+ */
 function extractCapacityInfo(c) {
-  const candidatesCapacity = [c.MaxCapacity, c.WebCapacity, c.Capacity, c.ClassCapacity];
-  const candidatesBooked = [c.TotalBooked, c.Visits, c.TotalBookedClients, c.Booked, c.NumBooked];
+  const candidatesCapacity = [
+    c.MaxCapacity,
+    c.WebCapacity,
+    c.Capacity,
+    c.ClassCapacity,
+  ];
+  const candidatesBooked = [
+    c.TotalBooked,
+    c.Visits,
+    c.TotalBookedClients,
+    c.Booked,
+    c.NumBooked,
+  ];
 
   const capacity = candidatesCapacity.find((v) => Number.isFinite(Number(v)));
   const booked = candidatesBooked.find((v) => Number.isFinite(Number(v)));
@@ -134,18 +152,25 @@ function extractCapacityInfo(c) {
   const spotsAvailable =
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
-  const isWaitlistAvailable = c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+  const isWaitlistAvailable =
+    c.IsWaitlistAvailable ??
+    c.WaitlistAvailable ??
+    c.AllowWaitlist ??
+    null;
 
-  return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
+  return {
+    capacity: capNum,
+    booked: bookedNum,
+    spotsAvailable,
+    isWaitlistAvailable,
+  };
 }
 
 /**
  * Location resolution:
- * Supports:
- * - location_id (snake)
- * - locationId (camel)
- * - location_ids (comma list)
- * - locationIds (camel list)
+ * - If request has location_id => use that
+ * - else if request has location_ids => use that
+ * - else use env default(s)
  */
 function resolveLocationQuery(params) {
   const locationId = (params.location_id || params.locationId || "").toString().trim();
@@ -157,7 +182,7 @@ function resolveLocationQuery(params) {
   if (DEFAULT_LOCATION_IDS) return { LocationIds: DEFAULT_LOCATION_IDS };
   if (DEFAULT_LOCATION_ID) return { LocationIds: DEFAULT_LOCATION_ID };
 
-  return {};
+  return {}; // no location filter
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -182,6 +207,7 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     "Api-Key": apiKey,
     SiteId: siteId,
     "Source-Name": sourceName,
+    // keep both variants (different accounts expect different header names)
     Password: sourcePassword,
     SourcePassword: sourcePassword,
   };
@@ -196,7 +222,9 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   const json = safeJsonParse(text);
 
   if (!res.ok) {
-    const detail = json || (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
+    const detail =
+      json ||
+      (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
     throw new Error(
       `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
     );
@@ -210,11 +238,11 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
  * HEALTH CHECKS
  * ============
  */
-app.get("/", (_req, res) => {
+app.get("/", (req, res) => {
   res.status(200).send("Flow AI Mindbody webhook is running");
 });
 
-app.get("/health", (_req, res) => {
+app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
     envDetected: {
@@ -231,39 +259,27 @@ app.get("/health", (_req, res) => {
 });
 
 /**
- * Debug endpoint (non-secret)
- */
-app.get("/debug", (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    env: {
-      MINDBODY_BASE_URL,
-      hasSiteId: Boolean(siteId),
-      hasApiKey: Boolean(apiKey),
-      hasSourceName: Boolean(sourceName),
-      hasSourcePassword: Boolean(sourcePassword),
-      MINDBODY_DEFAULT_LOCATION_ID: DEFAULT_LOCATION_ID || null,
-      MINDBODY_DEFAULT_LOCATION_IDS: DEFAULT_LOCATION_IDS || null,
-      DEBUG_MODE,
-    },
-    note: "Non-secret env only.",
-  });
-});
-
-/**
  * ============
  * MAIN WEBHOOK
  * ============
+ * Accepts either:
+ * - Query:  /mindbody?action=get_today_schedule&date=YYYY-MM-DD
+ * - JSON:   { "action": "get_today_schedule", "params": { ... } }
  */
 app.all("/mindbody", async (req, res) => {
   try {
-    const action = req.query?.action || req.body?.action || req.body?.action_type || "";
+    let action =
+      req.query?.action ||
+      req.body?.action ||
+      req.body?.action_type ||
+      "";
 
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
 
     const bodyObj = req.body && typeof req.body === "object" ? req.body : {};
-    const paramsFromBody = bodyObj.params && typeof bodyObj.params === "object" ? bodyObj.params : {};
+    const paramsFromBody =
+      bodyObj.params && typeof bodyObj.params === "object" ? bodyObj.params : {};
 
     const extraTopLevelBody = { ...bodyObj };
     delete extraTopLevelBody.action;
@@ -271,6 +287,13 @@ app.all("/mindbody", async (req, res) => {
     delete extraTopLevelBody.params;
 
     const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
+
+    // ✅ VAPI SAFETY FALLBACK
+    // Some tools send only {date, location_id} without "action" even if you configured it.
+    // If "action" is missing but a date exists, assume schedule request.
+    if (!action && params.date) {
+      action = "get_today_schedule";
+    }
 
     console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
@@ -284,18 +307,17 @@ app.all("/mindbody", async (req, res) => {
       });
     }
 
-    // Alias support
-    const normalizedAction = String(action).trim();
-
     /**
+     * =====================
      * ACTION: get_locations
+     * =====================
      */
-    if (normalizedAction === "get_locations") {
+    if (action === "get_locations") {
       const data = await mbFetch("/site/locations", { method: "GET" });
       const locations = normalizeArray(data, ["Locations", "locations"]);
       return res.status(200).json({
         success: true,
-        actionReceived: normalizedAction,
+        actionReceived: action,
         count: locations.length,
         locations: locations.map((l) => ({
           id: l.Id ?? l.LocationId ?? null,
@@ -308,16 +330,23 @@ app.all("/mindbody", async (req, res) => {
     }
 
     /**
-     * ACTION: get_today_schedule (and alias get_schedule)
+     * =====================
+     * ACTION: get_today_schedule
+     * =====================
      */
-    if (normalizedAction === "get_today_schedule" || normalizedAction === "get_schedule") {
+    if (action === "get_today_schedule") {
       const date = params.date || nowInTZDateString("America/Vancouver");
       const { startLocal, endLocal } = localDayRange(date);
+
       const locationQuery = resolveLocationQuery(params);
 
       const data = await mbFetch("/class/classes", {
         method: "GET",
-        query: { StartDateTime: startLocal, EndDateTime: endLocal, ...locationQuery },
+        query: {
+          StartDateTime: startLocal,
+          EndDateTime: endLocal,
+          ...locationQuery,
+        },
       });
 
       const classesRaw = normalizeArray(data, ["Classes", "classes"]);
@@ -334,7 +363,12 @@ app.all("/mindbody", async (req, res) => {
         const startDateTime = c.StartDateTime ?? c.startDateTime ?? null;
         const endDateTime = c.EndDateTime ?? c.endDateTime ?? null;
 
-        let instructor = c.Staff?.Name ?? c.InstructorName ?? c.instructor ?? null;
+        let instructor =
+          c.Staff?.Name ??
+          c.InstructorName ??
+          c.instructor ??
+          null;
+
         if (!instructor && c.Staff) {
           const first = c.Staff.FirstName || "";
           const last = c.Staff.LastName || "";
@@ -343,6 +377,7 @@ app.all("/mindbody", async (req, res) => {
         }
 
         const location = c.Location?.Name ?? c.LocationName ?? c.location ?? null;
+
         const cap = extractCapacityInfo(c);
 
         const st = parseNaiveISO(startDateTime);
@@ -365,18 +400,24 @@ app.all("/mindbody", async (req, res) => {
         };
       });
 
-      if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-      if (wantInstructor)
+      if (wantType) {
+        classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
+      }
+      if (wantInstructor) {
         classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-      if (wantTimeRange)
+      }
+      if (wantTimeRange) {
         classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
-      if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
+      }
+      if (wantTime) {
+        classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
+      }
 
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
       return res.status(200).json({
         success: true,
-        actionReceived: normalizedAction === "get_schedule" ? "get_today_schedule" : normalizedAction,
+        actionReceived: action,
         date,
         timezone: "America/Vancouver",
         appliedLocationFilter: resolveLocationQuery(params),
@@ -385,16 +426,18 @@ app.all("/mindbody", async (req, res) => {
           whyTimesMatchWebsite:
             "We format Mindbody times as naive-local (no Date() parsing) because Mindbody often returns times without timezone offsets.",
           capacityLogic:
-            "spotsAvailable is best-effort. Many studios do not return capacity/booked fields, so spotsAvailable may be null even though the class is bookable.",
+            "spotsAvailable is best-effort. Many studios do not return capacity/booked fields from this endpoint, so spotsAvailable may be null even though the class is bookable.",
         },
         debug: DEBUG_MODE ? { rawCount: classesRaw.length } : undefined,
       });
     }
 
     /**
+     * =====================
      * ACTION: get_pricing_offers
+     * =====================
      */
-    if (normalizedAction === "get_pricing_offers") {
+    if (action === "get_pricing_offers") {
       const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
         mbFetch("/sale/services", { method: "GET" }),
         mbFetch("/sale/packages", { method: "GET" }),
@@ -416,20 +459,31 @@ app.all("/mindbody", async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        actionReceived: normalizedAction,
+        actionReceived: action,
         offers: { services, packages, contracts },
         warnings: {
-          services: servicesResp.status === "rejected" ? String(servicesResp.reason?.message || servicesResp.reason) : null,
-          packages: packagesResp.status === "rejected" ? String(packagesResp.reason?.message || packagesResp.reason) : null,
-          contracts: contractsResp.status === "rejected" ? String(contractsResp.reason?.message || contractsResp.reason) : null,
+          services:
+            servicesResp.status === "rejected"
+              ? String(servicesResp.reason?.message || servicesResp.reason)
+              : null,
+          packages:
+            packagesResp.status === "rejected"
+              ? String(packagesResp.reason?.message || packagesResp.reason)
+              : null,
+          contracts:
+            contractsResp.status === "rejected"
+              ? String(contractsResp.reason?.message || contractsResp.reason)
+              : null,
         },
       });
     }
 
     /**
+     * =====================
      * ACTION: book_class
+     * =====================
      */
-    if (normalizedAction === "book_class") {
+    if (action === "book_class") {
       const isNewClient =
         params.is_new_client === true ||
         String(params.is_new_client || "").toLowerCase() === "true" ||
@@ -469,7 +523,7 @@ app.all("/mindbody", async (req, res) => {
       if (!classId) {
         return res.status(400).json({
           success: false,
-          actionReceived: normalizedAction,
+          actionReceived: action,
           message:
             "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
           paramsReceived: params,
@@ -517,7 +571,7 @@ app.all("/mindbody", async (req, res) => {
         if (!first || !last) {
           return res.status(400).json({
             success: false,
-            actionReceived: normalizedAction,
+            actionReceived: action,
             message:
               "New client booking needs client_first_name and client_last_name (and ideally email/mobilephone).",
             paramsReceived: params,
@@ -553,7 +607,7 @@ app.all("/mindbody", async (req, res) => {
       if (!clientId) {
         return res.status(409).json({
           success: false,
-          actionReceived: normalizedAction,
+          actionReceived: action,
           message:
             "Client likely already exists, but could not be located via search. Ask for the exact email/phone on file or pass client_id.",
           paramsReceived: params,
@@ -571,7 +625,7 @@ app.all("/mindbody", async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        actionReceived: normalizedAction,
+        actionReceived: action,
         booked: true,
         clientId,
         classId,
@@ -581,8 +635,8 @@ app.all("/mindbody", async (req, res) => {
 
     return res.status(400).json({
       success: false,
-      actionReceived: normalizedAction,
-      message: `Unknown action: ${normalizedAction}`,
+      actionReceived: action,
+      message: `Unknown action: ${action}`,
       paramsReceived: params,
     });
   } catch (err) {
@@ -594,8 +648,11 @@ app.all("/mindbody", async (req, res) => {
   }
 });
 
+// IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
+
 
 
 
