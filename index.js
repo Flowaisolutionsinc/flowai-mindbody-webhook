@@ -37,7 +37,6 @@ const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true"
  * ============
  */
 function nowInTZDateString(tz = "America/Vancouver") {
-  // returns YYYY-MM-DD for the given TZ
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
     year: "numeric",
@@ -81,7 +80,6 @@ function normalizePhone(phone) {
 /**
  * IMPORTANT: Mindbody often returns date-times WITHOUT timezone offset (ex: "2026-02-12T20:00:00")
  * If we use new Date() on that in a server running UTC, times shift and won't match the website.
- *
  * So we parse the time as "naive local" (HH:MM) and format it ourselves.
  */
 function parseNaiveISO(iso) {
@@ -115,9 +113,7 @@ function timeBucketFromHour(hour) {
   return "evening";
 }
 
-/**
- * Build a “local day range” without Z (timezone) so Mindbody treats it as location-local time
- */
+/** Build a “local day range” without Z (timezone) so Mindbody treats it as location-local time */
 function localDayRange(dateStr /* YYYY-MM-DD */) {
   return {
     startLocal: `${dateStr}T00:00:00`,
@@ -125,23 +121,10 @@ function localDayRange(dateStr /* YYYY-MM-DD */) {
   };
 }
 
-/**
- * Best-effort extraction of capacity & booked counts from Mindbody class object.
- */
+/** Best-effort extraction of capacity & booked counts from Mindbody class object. */
 function extractCapacityInfo(c) {
-  const candidatesCapacity = [
-    c.MaxCapacity,
-    c.WebCapacity,
-    c.Capacity,
-    c.ClassCapacity,
-  ];
-  const candidatesBooked = [
-    c.TotalBooked,
-    c.Visits,
-    c.TotalBookedClients,
-    c.Booked,
-    c.NumBooked,
-  ];
+  const candidatesCapacity = [c.MaxCapacity, c.WebCapacity, c.Capacity, c.ClassCapacity];
+  const candidatesBooked = [c.TotalBooked, c.Visits, c.TotalBookedClients, c.Booked, c.NumBooked];
 
   const capacity = candidatesCapacity.find((v) => Number.isFinite(Number(v)));
   const booked = candidatesBooked.find((v) => Number.isFinite(Number(v)));
@@ -152,18 +135,9 @@ function extractCapacityInfo(c) {
   const spotsAvailable =
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
-  const isWaitlistAvailable =
-    c.IsWaitlistAvailable ??
-    c.WaitlistAvailable ??
-    c.AllowWaitlist ??
-    null;
+  const isWaitlistAvailable = c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
 
-  return {
-    capacity: capNum,
-    booked: bookedNum,
-    spotsAvailable,
-    isWaitlistAvailable,
-  };
+  return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
 
 /**
@@ -182,7 +156,7 @@ function resolveLocationQuery(params) {
   if (DEFAULT_LOCATION_IDS) return { LocationIds: DEFAULT_LOCATION_IDS };
   if (DEFAULT_LOCATION_ID) return { LocationIds: DEFAULT_LOCATION_ID };
 
-  return {}; // no location filter
+  return {};
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -207,7 +181,6 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     "Api-Key": apiKey,
     SiteId: siteId,
     "Source-Name": sourceName,
-    // keep both variants (different accounts expect different header names)
     Password: sourcePassword,
     SourcePassword: sourcePassword,
   };
@@ -222,9 +195,7 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   const json = safeJsonParse(text);
 
   if (!res.ok) {
-    const detail =
-      json ||
-      (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
+    const detail = json || (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
     throw new Error(
       `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
     );
@@ -267,19 +238,22 @@ app.get("/health", (req, res) => {
  * - JSON:   { "action": "get_today_schedule", "params": { ... } }
  */
 app.all("/mindbody", async (req, res) => {
+  // ✅ VAPI SAFE RESPONDER: Always return HTTP 200, put real status in JSON
+  const reply = (payload, httpStatus = 200) => {
+    return res.status(200).json({
+      httpStatus,
+      ...payload,
+    });
+  };
+
   try {
-    let action =
-      req.query?.action ||
-      req.body?.action ||
-      req.body?.action_type ||
-      "";
+    let action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
     const paramsFromQuery = { ...(req.query || {}) };
     delete paramsFromQuery.action;
 
     const bodyObj = req.body && typeof req.body === "object" ? req.body : {};
-    const paramsFromBody =
-      bodyObj.params && typeof bodyObj.params === "object" ? bodyObj.params : {};
+    const paramsFromBody = bodyObj.params && typeof bodyObj.params === "object" ? bodyObj.params : {};
 
     const extraTopLevelBody = { ...bodyObj };
     delete extraTopLevelBody.action;
@@ -289,8 +263,6 @@ app.all("/mindbody", async (req, res) => {
     const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
 
     // ✅ VAPI SAFETY FALLBACK
-    // Some tools send only {date, location_id} without "action" even if you configured it.
-    // If "action" is missing but a date exists, assume schedule request.
     if (!action && params.date) {
       action = "get_today_schedule";
     }
@@ -298,15 +270,16 @@ app.all("/mindbody", async (req, res) => {
     console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
     if (!action) {
-      // ✅ VAPI: always 200
-      return res.status(200).json({
-        success: false,
-        actionReceived: action || null,
-        message:
-          "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
-        receivedQuery: req.query || {},
-        receivedBody: req.body || {},
-      });
+      return reply(
+        {
+          success: false,
+          message:
+            "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
+          receivedQuery: req.query || {},
+          receivedBody: req.body || {},
+        },
+        400
+      );
     }
 
     /**
@@ -317,18 +290,21 @@ app.all("/mindbody", async (req, res) => {
     if (action === "get_locations") {
       const data = await mbFetch("/site/locations", { method: "GET" });
       const locations = normalizeArray(data, ["Locations", "locations"]);
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        count: locations.length,
-        locations: locations.map((l) => ({
-          id: l.Id ?? l.LocationId ?? null,
-          name: l.Name ?? l.LocationName ?? null,
-          address: l.Address ?? null,
-          city: l.City ?? null,
-          stateProv: l.StateProvCode ?? l.State ?? null,
-        })),
-      });
+      return reply(
+        {
+          success: true,
+          actionReceived: action,
+          count: locations.length,
+          locations: locations.map((l) => ({
+            id: l.Id ?? l.LocationId ?? null,
+            name: l.Name ?? l.LocationName ?? null,
+            address: l.Address ?? null,
+            city: l.City ?? null,
+            stateProv: l.StateProvCode ?? l.State ?? null,
+          })),
+        },
+        200
+      );
     }
 
     /**
@@ -365,11 +341,7 @@ app.all("/mindbody", async (req, res) => {
         const startDateTime = c.StartDateTime ?? c.startDateTime ?? null;
         const endDateTime = c.EndDateTime ?? c.endDateTime ?? null;
 
-        let instructor =
-          c.Staff?.Name ??
-          c.InstructorName ??
-          c.instructor ??
-          null;
+        let instructor = c.Staff?.Name ?? c.InstructorName ?? c.instructor ?? null;
 
         if (!instructor && c.Staff) {
           const first = c.Staff.FirstName || "";
@@ -402,36 +374,33 @@ app.all("/mindbody", async (req, res) => {
         };
       });
 
-      if (wantType) {
-        classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-      }
-      if (wantInstructor) {
+      if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
+      if (wantInstructor)
         classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-      }
-      if (wantTimeRange) {
+      if (wantTimeRange)
         classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
-      }
-      if (wantTime) {
-        classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
-      }
+      if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        date,
-        timezone: "America/Vancouver",
-        appliedLocationFilter: resolveLocationQuery(params),
-        classes,
-        notes: {
-          whyTimesMatchWebsite:
-            "We format Mindbody times as naive-local (no Date() parsing) because Mindbody often returns times without timezone offsets.",
-          capacityLogic:
-            "spotsAvailable is best-effort. Many studios do not return capacity/booked fields from this endpoint, so spotsAvailable may be null even though the class is bookable.",
+      return reply(
+        {
+          success: true,
+          actionReceived: action,
+          date,
+          timezone: "America/Vancouver",
+          appliedLocationFilter: resolveLocationQuery(params),
+          classes,
+          notes: {
+            whyTimesMatchWebsite:
+              "We format Mindbody times as naive-local (no Date() parsing) because Mindbody often returns times without timezone offsets.",
+            capacityLogic:
+              "spotsAvailable is best-effort. Many studios do not return capacity/booked fields from this endpoint, so spotsAvailable may be null even though the class is bookable.",
+          },
+          debug: DEBUG_MODE ? { rawCount: classesRaw.length } : undefined,
         },
-        debug: DEBUG_MODE ? { rawCount: classesRaw.length } : undefined,
-      });
+        200
+      );
     }
 
     /**
@@ -459,25 +428,28 @@ app.all("/mindbody", async (req, res) => {
           ? normalizeArray(contractsResp.value, ["Contracts", "contracts"])
           : [];
 
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        offers: { services, packages, contracts },
-        warnings: {
-          services:
-            servicesResp.status === "rejected"
-              ? String(servicesResp.reason?.message || servicesResp.reason)
-              : null,
-          packages:
-            packagesResp.status === "rejected"
-              ? String(packagesResp.reason?.message || packagesResp.reason)
-              : null,
-          contracts:
-            contractsResp.status === "rejected"
-              ? String(contractsResp.reason?.message || contractsResp.reason)
-              : null,
+      return reply(
+        {
+          success: true,
+          actionReceived: action,
+          offers: { services, packages, contracts },
+          warnings: {
+            services:
+              servicesResp.status === "rejected"
+                ? String(servicesResp.reason?.message || servicesResp.reason)
+                : null,
+            packages:
+              packagesResp.status === "rejected"
+                ? String(packagesResp.reason?.message || packagesResp.reason)
+                : null,
+            contracts:
+              contractsResp.status === "rejected"
+                ? String(contractsResp.reason?.message || contractsResp.reason)
+                : null,
+          },
         },
-      });
+        200
+      );
     }
 
     /**
@@ -523,14 +495,16 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!classId) {
-        // ✅ VAPI: always 200
-        return res.status(200).json({
-          success: false,
-          actionReceived: action,
-          message:
-            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
-          paramsReceived: params,
-        });
+        return reply(
+          {
+            success: false,
+            actionReceived: action,
+            message:
+              "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
+            paramsReceived: params,
+          },
+          400
+        );
       }
 
       let clientId = params.client_id || params.clientId || null;
@@ -572,14 +546,16 @@ app.all("/mindbody", async (req, res) => {
         const postalCode = (params.postal_code || "").toString().trim();
 
         if (!first || !last) {
-          // ✅ VAPI: always 200
-          return res.status(200).json({
-            success: false,
-            actionReceived: action,
-            message:
-              "New client booking needs client_first_name and client_last_name (and ideally email/mobilephone).",
-            paramsReceived: params,
-          });
+          return reply(
+            {
+              success: false,
+              actionReceived: action,
+              message:
+                "New client booking needs client_first_name and client_last_name (and ideally email/mobilephone).",
+              paramsReceived: params,
+            },
+            400
+          );
         }
 
         const addClientBody = {
@@ -609,14 +585,16 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!clientId) {
-        // ✅ VAPI: always 200
-        return res.status(200).json({
-          success: false,
-          actionReceived: action,
-          message:
-            "Client likely already exists, but could not be located via search. Ask for the exact email/phone on file or pass client_id.",
-          paramsReceived: params,
-        });
+        return reply(
+          {
+            success: false,
+            actionReceived: action,
+            message:
+              "Client likely already exists, but could not be located via search. Ask for the exact email/phone on file or pass client_id.",
+            paramsReceived: params,
+          },
+          409
+        );
       }
 
       const bookResp = await mbFetch("/class/addclienttoclass", {
@@ -628,29 +606,33 @@ app.all("/mindbody", async (req, res) => {
         },
       });
 
-      return res.status(200).json({
-        success: true,
-        actionReceived: action,
-        booked: true,
-        clientId,
-        classId,
-        raw: DEBUG_MODE ? bookResp : undefined,
-      });
+      return reply(
+        {
+          success: true,
+          actionReceived: action,
+          booked: true,
+          clientId,
+          classId,
+          raw: DEBUG_MODE ? bookResp : undefined,
+        },
+        200
+      );
     }
 
-    // ✅ VAPI: always 200
-    return res.status(200).json({
-      success: false,
-      actionReceived: action,
-      message: `Unknown action: ${action}`,
-      paramsReceived: params,
-    });
+    return reply(
+      {
+        success: false,
+        actionReceived: action,
+        message: `Unknown action: ${action}`,
+        paramsReceived: params,
+      },
+      400
+    );
   } catch (err) {
     console.error("WEBHOOK_ERROR", err?.message || err, err?.stack || "");
-    // ✅ VAPI: always 200
     return res.status(200).json({
+      httpStatus: 500,
       success: false,
-      error: true,
       message: err?.message || "Server error",
     });
   }
@@ -659,7 +641,6 @@ app.all("/mindbody", async (req, res) => {
 // IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
 
 
 
