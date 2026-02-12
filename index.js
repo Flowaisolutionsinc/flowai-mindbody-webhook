@@ -8,18 +8,11 @@ const PORT = process.env.PORT || 3000;
 
 /**
  * ====== CONFIG ======
- * For your Roundhouse pilot:
- * - DEFAULT_LOCATION_ID should be "1" (from your get_locations response)
- *
- * NOTE:
- * "LocationId" is NOT the "Site ID".
- * - Site ID = the overall Mindbody site/account
- * - LocationId = a specific studio/location within that site (Roundhouse, etc.)
+ * DEFAULT_LOCATION_ID should be "1" for Roundhouse (from your get_locations response)
  */
 const DEFAULT_LOCATION_ID = String(process.env.DEFAULT_LOCATION_ID || "1");
 
-// If you are calling Mindbody Public API v6 for booking, you need these.
-// If you don't have them yet, book_class can still work in dry_run mode.
+// Mindbody Public API v6 booking creds (optional until you go live booking)
 const MINDBODY_API_KEY = process.env.MINDBODY_API_KEY || "";
 const MINDBODY_SITE_ID = process.env.MINDBODY_SITE_ID || ""; // sometimes called SiteID
 const MB_USERNAME = process.env.MINDBODY_USERNAME || "";
@@ -28,82 +21,77 @@ const MB_PASSWORD = process.env.MINDBODY_PASSWORD || "";
 /**
  * ====== HELPERS ======
  */
+function isTrue(v) {
+  return String(v).toLowerCase() === "true";
+}
+
 function toISODate(dateLike) {
-  // Accepts:
-  // - "today" / "tomorrow"
-  // - "YYYY-MM-DD"
-  // - anything JS Date can parse (best effort)
+  // Accepts: "today" / "tomorrow" / "YYYY-MM-DD" / best-effort parse
   const raw = String(dateLike || "").trim().toLowerCase();
   const now = new Date();
 
-  if (!raw || raw === "today") {
-    return now.toISOString().slice(0, 10);
-  }
+  if (!raw || raw === "today") return now.toISOString().slice(0, 10);
+
   if (raw === "tomorrow") {
     const t = new Date(now);
     t.setDate(t.getDate() + 1);
     return t.toISOString().slice(0, 10);
   }
 
-  // If already YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
 
-  // Try parse
   const d = new Date(dateLike);
   if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
 
-  // Fallback: just return the original (but this may fail upstream)
   return String(dateLike || "");
 }
 
 function pickLocationId(input) {
-  // Accept either:
-  // - locationId (camel)
-  // - location_id (snake)
-  // - LocationIds (array-ish)
-  if (input?.location_id != null) return String(input.location_id);
-  if (input?.locationId != null) return String(input.locationId);
-  if (input?.LocationId != null) return String(input.LocationId);
+  // Accept common variants
+  if (input?.location_id != null) return String(input.location_id).trim();
+  if (input?.locationId != null) return String(input.locationId).trim();
+  if (input?.LocationId != null) return String(input.LocationId).trim();
 
-  // sometimes people pass LocationIds: ["1"]
+  // Accept LocationIds: ["1"] or "1"
   if (Array.isArray(input?.LocationIds) && input.LocationIds.length > 0) {
-    return String(input.LocationIds[0]);
+    return String(input.LocationIds[0]).trim();
   }
-  return DEFAULT_LOCATION_ID;
+  if (input?.LocationIds != null) return String(input.LocationIds).trim();
+
+  // Fallback env default
+  return DEFAULT_LOCATION_ID || null;
 }
 
 /**
- * ====== MINDBODY CALLS ======
- * You currently have endpoints that already return the schedule + locations.
- * Your screenshot shows these working:
- * - /mindbody?action=get_locations
- * - /mindbody?action=get_today_schedule&date=2026-02-12
- *
- * So below, "get_locations" and "get_today_schedule" call YOUR EXISTING LOGIC:
- * - If you already call the Mindbody widget/partner endpoints internally, keep that.
- * - If you want this file to be self-contained, you must implement the upstream call(s).
+ * ====== YOUR EXISTING (ALREADY WORKING) UPSTREAM CALLS ======
  *
  * IMPORTANT:
- * Because your current deployed endpoint already works, the main change here is:
- * - always apply LocationId filter using the provided locationId/location_id
+ * In the code you pasted as "currently deployed", these two functions are placeholders.
+ * But your screenshots show you ALREADY have working logic somewhere that returns:
+ * - get_locations
+ * - get_today_schedule (with classes array)
+ *
+ * So:
+ * 1) If your real code is already inside these functions in your repo, keep it.
+ * 2) If your real code is somewhere else, move it into these two functions.
+ *
+ * DO NOT leave them returning empty arrays if you want the AI to read schedules.
  */
-
-// --- Replace these with your real upstream calls if needed ---
 async function upstreamGetLocations() {
-  // If you already have working code that returns locations, use it here.
-  // For now, this placeholder returns the same shape you showed.
-  // In production, this function should call your upstream Mindbody integration.
+  // <-- PUT YOUR WORKING LOCATIONS LOGIC HERE
   return {
     success: true,
     actionReceived: "get_locations",
     count: 0,
     locations: [],
-    notes: "upstreamGetLocations() is a placeholder. Replace with your working upstream call.",
+    notes:
+      "upstreamGetLocations() is still a placeholder. Paste your existing working logic here.",
   };
 }
 
 async function upstreamGetSchedule({ dateISO, locationId }) {
-  // This should call your upstream schedule source and apply LocationIds=[locationId]
+  // <-- PUT YOUR WORKING SCHEDULE LOGIC HERE
+  // MUST apply the filter LocationIds = locationId (like your screenshot shows)
   return {
     success: true,
     actionReceived: "get_today_schedule",
@@ -112,24 +100,21 @@ async function upstreamGetSchedule({ dateISO, locationId }) {
     appliedLocationFilter: { LocationIds: String(locationId) },
     classes: [],
     notes:
-      "upstreamGetSchedule() is a placeholder. Replace with your working upstream call that returns classes.",
+      "upstreamGetSchedule() is still a placeholder. Paste your existing working logic here.",
   };
 }
 
 /**
  * ====== OPTIONAL: REAL BOOKING VIA MINDBODY PUBLIC API v6 ======
- * If you have the API key + login + site id set, this will:
- * - issue a staff token
- * - add a client to class
- *
- * If you do NOT have creds set, book_class will require dry_run=true to succeed.
  */
 let cachedToken = null;
 let cachedTokenExpiryMs = 0;
 
 async function issueMindbodyToken() {
   if (!MINDBODY_API_KEY || !MB_USERNAME || !MB_PASSWORD) {
-    throw new Error("Missing MINDBODY_API_KEY or MINDBODY_USERNAME or MINDBODY_PASSWORD");
+    throw new Error(
+      "Missing MINDBODY_API_KEY or MINDBODY_USERNAME or MINDBODY_PASSWORD"
+    );
   }
 
   const url = "https://api.mindbodyonline.com/public/v6/usertoken/issue";
@@ -147,15 +132,16 @@ async function issueMindbodyToken() {
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(`Token issue failed (${res.status}): ${JSON.stringify(data)}`);
+    throw new Error(
+      `Token issue failed (${res.status}): ${JSON.stringify(data)}`
+    );
   }
 
-  // token lasts a while; we’ll cache for ~25 minutes to be safe
   const token = data?.AccessToken;
   if (!token) throw new Error("No AccessToken returned from Mindbody");
 
   cachedToken = token;
-  cachedTokenExpiryMs = Date.now() + 25 * 60 * 1000;
+  cachedTokenExpiryMs = Date.now() + 25 * 60 * 1000; // cache ~25 min
   return token;
 }
 
@@ -175,20 +161,15 @@ async function mindbodyAddClientToClass({
   if (!MINDBODY_API_KEY) throw new Error("Missing MINDBODY_API_KEY");
   const token = await getMindbodyToken();
 
-  // NOTE: Mindbody expects an existing ClientId in many flows.
-  // Some studios allow creating a client first, then booking.
-  // This is a simplified example; your production flow may need:
-  // 1) find/create client
-  // 2) add to class
-  const url = "https://api.mindbodyonline.com/public/v6/class/addclienttoclass";
+  const url =
+    "https://api.mindbodyonline.com/public/v6/class/addclienttoclass";
 
+  // NOTE: Many Mindbody setups REQUIRE ClientId.
+  // If your studio requires it, you must implement:
+  // 1) find/create client -> get ClientId
+  // 2) add client to class using ClientId
   const payload = {
     ClassId: Number(classId),
-    // Many Mindbody setups require ClientId; if you have it, use it.
-    // ClientId: "123",
-    // If not, you generally must create/find the client first.
-    // So this function may need to be expanded for real production booking.
-    // Leaving fields here so you see the structure:
     FirstName: firstName,
     LastName: lastName,
     Email: email,
@@ -196,79 +177,103 @@ async function mindbodyAddClientToClass({
     LocationId: Number(locationId),
   };
 
+  const headers = {
+    "Content-Type": "application/json",
+    "Api-Key": MINDBODY_API_KEY,
+    Authorization: `Bearer ${token}`,
+  };
+
+  // Only include SiteId header if set (Mindbody differs by account setup)
+  if (MINDBODY_SITE_ID) headers.SiteId = MINDBODY_SITE_ID;
+
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Api-Key": MINDBODY_API_KEY,
-      Authorization: `Bearer ${token}`,
-      ...(MINDBODY_SITE_ID ? { SiteId: MINDBODY_SITE_ID } : {}),
-    },
+    headers,
     body: JSON.stringify(payload),
   });
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(`AddClientToClass failed (${res.status}): ${JSON.stringify(data)}`);
+    throw new Error(
+      `AddClientToClass failed (${res.status}): ${JSON.stringify(data)}`
+    );
   }
   return data;
 }
 
 /**
- * ====== ACTION ROUTER ======
+ * ====== ACTION HANDLER ======
  */
 async function handleAction(input) {
   const action = String(input?.action || "").trim();
-
-  if (!action) {
-    return { success: false, error: "Missing 'action'." };
-  }
+  if (!action) return { success: false, error: "Missing 'action'." };
 
   if (action === "get_locations") {
     return await upstreamGetLocations();
   }
 
-  if (action === "get_today_schedule") {
+  if (action === "get_today_schedule" || action === "get_schedule") {
     const locationId = pickLocationId(input);
     const dateISO = toISODate(input?.date);
+
+    if (!dateISO) {
+      return { success: false, actionReceived: action, error: "Missing 'date'." };
+    }
+    if (!locationId) {
+      return {
+        success: false,
+        actionReceived: action,
+        error: "Missing locationId and DEFAULT_LOCATION_ID not set.",
+      };
+    }
+
     return await upstreamGetSchedule({ dateISO, locationId });
   }
 
   if (action === "book_class") {
     const locationId = pickLocationId(input);
 
-    const dryRun =
-      String(input?.dry_run || "").toLowerCase() === "true" ||
-      input?.dry_run === true;
+    // dry_run is OPTIONAL. If not sent, it’s false.
+    const dryRun = isTrue(input?.dry_run);
 
-    // Required booking fields (minimum)
     const classId = input?.class_id || input?.classId;
     const firstName = input?.client_first_name || input?.first_name || "";
     const lastName = input?.client_last_name || input?.last_name || "";
     const email = input?.email || "";
     const phone = input?.phone || "";
 
-    if (!classId) {
-      return { success: false, error: "Missing class_id (or classId) for booking." };
+    if (!locationId) {
+      return {
+        success: false,
+        actionReceived: "book_class",
+        error: "Missing locationId and DEFAULT_LOCATION_ID not set.",
+      };
     }
-
-    // If you want to allow bookings without these, adjust rules,
-    // but most studios will require them.
+    if (!classId) {
+      return {
+        success: false,
+        actionReceived: "book_class",
+        error: "Missing class_id (or classId) for booking.",
+      };
+    }
     if (!firstName || !lastName || !email) {
       return {
         success: false,
-        error: "Missing booking info. Need first name, last name, and email at minimum.",
+        actionReceived: "book_class",
+        error:
+          "Missing booking info. Need first name, last name, and email at minimum.",
         required: ["client_first_name", "client_last_name", "email"],
       };
     }
 
-    // If creds not set, only allow dry_run so nothing breaks.
     const hasCreds = Boolean(MINDBODY_API_KEY && MB_USERNAME && MB_PASSWORD);
 
+    // If creds aren’t configured, only allow dry_run so nothing breaks.
     if (!hasCreds) {
       if (!dryRun) {
         return {
           success: false,
+          actionReceived: "book_class",
           error:
             "Booking credentials not configured on server. Set MINDBODY_API_KEY / MINDBODY_USERNAME / MINDBODY_PASSWORD or use dry_run=true.",
         };
@@ -277,6 +282,7 @@ async function handleAction(input) {
         success: true,
         actionReceived: "book_class",
         dry_run: true,
+        booked: false,
         wouldBook: {
           classId: String(classId),
           locationId: String(locationId),
@@ -293,6 +299,7 @@ async function handleAction(input) {
         success: true,
         actionReceived: "book_class",
         dry_run: true,
+        booked: false,
         wouldBook: {
           classId: String(classId),
           locationId: String(locationId),
@@ -304,7 +311,6 @@ async function handleAction(input) {
       };
     }
 
-    // Real booking attempt:
     const booked = await mindbodyAddClientToClass({
       classId,
       firstName,
@@ -318,6 +324,7 @@ async function handleAction(input) {
       success: true,
       actionReceived: "book_class",
       dry_run: false,
+      booked: true,
       locationId: String(locationId),
       result: booked,
     };
@@ -328,40 +335,54 @@ async function handleAction(input) {
 
 /**
  * ====== ROUTES ======
- * - GET /mindbody?action=...&date=...&locationId=...
- * - POST /mindbody with JSON body
  */
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.get("/mindbody", async (req, res) => {
-  try {
-    const payload = {
-      action: req.query.action,
-      date: req.query.date,
-      locationId: req.query.locationId,
-      location_id: req.query.location_id,
-      class_id: req.query.class_id,
-      dry_run: req.query.dry_run,
-    };
-
-    const out = await handleAction(payload);
-    res.status(out?.success === false ? 400 : 200).json(out);
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err?.message || String(err),
-    });
-  }
+// Optional debug route (safe: shows non-secret env only)
+app.get("/debug", (_req, res) => {
+  res.json({
+    ok: true,
+    env: {
+      DEFAULT_LOCATION_ID: process.env.DEFAULT_LOCATION_ID || null,
+      TIMEZONE: process.env.TIMEZONE || null,
+      HAS_MINDBODY_BOOKING_CREDS: Boolean(
+        process.env.MINDBODY_API_KEY &&
+          process.env.MINDBODY_USERNAME &&
+          process.env.MINDBODY_PASSWORD
+      ),
+    },
+    note: "Shows NON-secret env only. Delete when finished.",
+  });
 });
 
-app.post("/mindbody", async (req, res) => {
+/**
+ * ONE endpoint for both:
+ * - Browser tests (GET ?action=...)
+ * - VAPI custom actions (POST JSON)
+ */
+app.all("/mindbody", async (req, res) => {
   try {
-    const out = await handleAction(req.body || {});
-    res.status(out?.success === false ? 400 : 200).json(out);
+    const action = String(req.query.action || req.body?.action || "").trim();
+    if (!action) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Missing 'action'. Provide ?action=... (GET) or {action:'...'} (POST).",
+      });
+    }
+
+    // Merge inputs from GET and POST (POST wins)
+    const merged = { ...req.query, ...(req.body || {}), action };
+
+    const out = await handleAction(merged);
+
+    // If handleAction says success:false => 400, else 200
+    return res.status(out?.success === false ? 400 : 200).json(out);
   } catch (err) {
-    res.status(500).json({
+    console.error("ERROR:", err);
+    return res.status(500).json({
       success: false,
-      error: err?.message || String(err),
+      error: err?.message || "Server error",
     });
   }
 });
