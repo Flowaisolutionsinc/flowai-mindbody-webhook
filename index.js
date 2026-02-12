@@ -298,8 +298,10 @@ app.all("/mindbody", async (req, res) => {
     console.log("WEBHOOK_HIT", { method: req.method, action, params });
 
     if (!action) {
-      return res.status(400).json({
+      // ✅ VAPI: always 200
+      return res.status(200).json({
         success: false,
+        actionReceived: action || null,
         message:
           "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
         receivedQuery: req.query || {},
@@ -521,7 +523,8 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!classId) {
-        return res.status(400).json({
+        // ✅ VAPI: always 200
+        return res.status(200).json({
           success: false,
           actionReceived: action,
           message:
@@ -569,7 +572,8 @@ app.all("/mindbody", async (req, res) => {
         const postalCode = (params.postal_code || "").toString().trim();
 
         if (!first || !last) {
-          return res.status(400).json({
+          // ✅ VAPI: always 200
+          return res.status(200).json({
             success: false,
             actionReceived: action,
             message:
@@ -605,7 +609,8 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!clientId) {
-        return res.status(409).json({
+        // ✅ VAPI: always 200
+        return res.status(200).json({
           success: false,
           actionReceived: action,
           message:
@@ -633,7 +638,8 @@ app.all("/mindbody", async (req, res) => {
       });
     }
 
-    return res.status(400).json({
+    // ✅ VAPI: always 200
+    return res.status(200).json({
       success: false,
       actionReceived: action,
       message: `Unknown action: ${action}`,
@@ -641,8 +647,10 @@ app.all("/mindbody", async (req, res) => {
     });
   } catch (err) {
     console.error("WEBHOOK_ERROR", err?.message || err, err?.stack || "");
-    return res.status(500).json({
+    // ✅ VAPI: always 200
+    return res.status(200).json({
       success: false,
+      error: true,
       message: err?.message || "Server error",
     });
   }
