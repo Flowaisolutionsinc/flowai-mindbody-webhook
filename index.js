@@ -1,13 +1,27 @@
 import express from "express";
-import { DateTime } from "luxon";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 /**
+ * Force server timezone (important for date window accuracy)
+ * Railway respects TZ, but we set a default to be safe.
+ */
+process.env.TZ = process.env.TZ || "America/Vancouver";
+
+/**
  * ============
  * CONFIG / ENV
  * ============
+ * Set these in Railway Variables:
+ * - MINDBODY_SITE_ID
+ * - MINDBODY_API_KEY
+ * - MINDBODY_SOURCE_NAME
+ * - MINDBODY_SOURCE_PASSWORD
+ *
+ * Optional:
+ * - MINDBODY_BASE_URL (default below)
+ * - MINDBODY_LOCATION_ID (IMPORTANT: Roundhouse location ID, NOT SiteId)
  */
 const MINDBODY_BASE_URL =
   process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
@@ -17,14 +31,32 @@ const apiKey = process.env.MINDBODY_API_KEY || "";
 const sourceName = process.env.MINDBODY_SOURCE_NAME || "";
 const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
-// IMPORTANT: set studio timezone here
-const STUDIO_TZ = "America/Vancouver";
+/**
+ * This MUST be a Mindbody LocationId (usually a number), not the SiteId.
+ * Example: "1" or "3" etc
+ */
+const locationId = process.env.MINDBODY_LOCATION_ID || "";
 
 /**
  * ============
  * SMALL HELPERS
  * ============
  */
+function nowInTZDateString(tz = "America/Vancouver") {
+  // returns YYYY-MM-DD for the given TZ
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const d = parts.find((p) => p.type === "day")?.value;
+  return `${y}-${m}-${d}`;
+}
+
 function safeJsonParse(x) {
   try {
     return typeof x === "string" ? JSON.parse(x) : x;
@@ -43,20 +75,11 @@ function normalizeArray(payload, keys = []) {
   return [];
 }
 
-// Returns YYYY-MM-DD in studio timezone
-function nowInTZDateString(tz = STUDIO_TZ) {
-  return DateTime.now().setZone(tz).toISODate(); // "2026-02-12"
-}
-
-// Build a FULL DAY window in studio timezone, then convert to UTC for Mindbody query
-function toISODateRangeForDay(dateStr /* YYYY-MM-DD */, tz = STUDIO_TZ) {
-  const startLocal = DateTime.fromISO(dateStr, { zone: tz }).startOf("day");
-  const endLocal = DateTime.fromISO(dateStr, { zone: tz }).endOf("day");
-
-  return {
-    startISO: startLocal.toUTC().toISO(),
-    endISO: endLocal.toUTC().toISO(),
-  };
+function toISODateRangeForDay(dateStr /* YYYY-MM-DD */) {
+  // Because TZ is set to America/Vancouver, this creates the correct local day window
+  const start = new Date(`${dateStr}T00:00:00`);
+  const end = new Date(`${dateStr}T23:59:59`);
+  return { startISO: start.toISOString(), endISO: end.toISOString() };
 }
 
 function normalizePhone(phone) {
@@ -68,19 +91,31 @@ function toLowerClean(x) {
   return (x ?? "").toString().toLowerCase().trim();
 }
 
-function timeBucketFromISO(iso, tz = STUDIO_TZ) {
+function timeBucketFromISO(iso, tz = "America/Vancouver") {
   if (!iso) return null;
-  const dt = DateTime.fromISO(iso, { setZone: true }).setZone(tz);
-  const hour = dt.hour;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    hour: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(iso));
+
+  const hourStr = parts.find((p) => p.type === "hour")?.value;
+  const hour = hourStr ? Number(hourStr) : null;
+
+  if (hour === null || Number.isNaN(hour)) return null;
   if (hour < 12) return "morning";
   if (hour < 17) return "afternoon";
   return "evening";
 }
 
-function humanTime(iso, tz = STUDIO_TZ) {
+function humanTime(iso, tz = "America/Vancouver") {
   try {
-    const dt = DateTime.fromISO(iso, { setZone: true }).setZone(tz);
-    return dt.toFormat("h:mm a"); // e.g. 7:15 AM
+    return new Date(iso).toLocaleTimeString("en-US", {
+      timeZone: tz,
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    });
   } catch {
     return null;
   }
@@ -88,7 +123,7 @@ function humanTime(iso, tz = STUDIO_TZ) {
 
 /**
  * Best-effort extraction of capacity & booked counts from Mindbody class object.
- * Many studios DO NOT return these fields from /class/classes.
+ * Mindbody often does NOT return these in /class/classes for many studios.
  */
 function extractCapacityInfo(c) {
   const candidatesCapacity = [
@@ -97,7 +132,6 @@ function extractCapacityInfo(c) {
     c.Capacity,
     c.ClassCapacity,
   ];
-
   const candidatesBooked = [
     c.TotalBooked,
     c.Visits,
@@ -106,26 +140,20 @@ function extractCapacityInfo(c) {
     c.NumBooked,
   ];
 
-  // Some accounts expose remaining directly
-  const candidatesRemaining = [c.Remaining, c.SpotsRemaining, c.Available];
-
   const capacity = candidatesCapacity.find((v) => Number.isFinite(Number(v)));
   const booked = candidatesBooked.find((v) => Number.isFinite(Number(v)));
-  const remaining = candidatesRemaining.find((v) => Number.isFinite(Number(v)));
 
   const capNum = capacity !== undefined ? Number(capacity) : null;
   const bookedNum = booked !== undefined ? Number(booked) : null;
-  const remainingNum = remaining !== undefined ? Number(remaining) : null;
 
   const spotsAvailable =
-    remainingNum !== null
-      ? Math.max(remainingNum, 0)
-      : capNum !== null && bookedNum !== null
-        ? Math.max(capNum - bookedNum, 0)
-        : null;
+    capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
   const isWaitlistAvailable =
-    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+    c.IsWaitlistAvailable ??
+    c.WaitlistAvailable ??
+    c.AllowWaitlist ??
+    null;
 
   return {
     capacity: capNum,
@@ -133,6 +161,34 @@ function extractCapacityInfo(c) {
     spotsAvailable,
     isWaitlistAvailable,
   };
+}
+
+/**
+ * Visibility/cancel filters — field names vary by studio.
+ * Website hides classes that are canceled or not web-visible.
+ */
+function isClassPubliclyVisible(c) {
+  const canceled =
+    c.IsCanceled ??
+    c.IsCancelled ??
+    c.isCanceled ??
+    c.isCancelled ??
+    false;
+
+  // Different studios use different flags — we treat missing flags as "visible"
+  const webVisible =
+    c.IsWebVisible ??
+    c.isWebVisible ??
+    c.WebVisible ??
+    c.IsVisibleOnWeb ??
+    c.IsWebEnabled ??
+    c.IsOnline ??
+    null;
+
+  // If webVisible is explicitly false, hide it. If null/undefined, allow.
+  const notWeb = webVisible === false;
+
+  return !canceled && !notWeb;
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -172,7 +228,8 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 
   if (!res.ok) {
     const detail =
-      json || (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
+      json ||
+      (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
     throw new Error(
       `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
     );
@@ -193,13 +250,15 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
-    studioTimezone: STUDIO_TZ,
     envDetected: {
       hasSiteId: Boolean(siteId),
       hasApiKey: Boolean(apiKey),
       hasSourceName: Boolean(sourceName),
       hasSourcePassword: Boolean(sourcePassword),
       baseUrl: MINDBODY_BASE_URL,
+      hasLocationId: Boolean(locationId),
+      locationId: locationId || null,
+      tz: process.env.TZ || null,
     },
   });
 });
@@ -244,29 +303,64 @@ app.all("/mindbody", async (req, res) => {
 
     /**
      * =====================
+     * ACTION: get_locations  (DEBUG/SETUP HELP)
+     * =====================
+     * Use this once to find the correct LocationId for Roundhouse.
+     * Then set MINDBODY_LOCATION_ID in Railway and you’re done.
+     */
+    if (action === "get_locations") {
+      const data = await mbFetch("/site/locations", { method: "GET" });
+      const locations = normalizeArray(data, ["Locations", "locations"]);
+      return res.status(200).json({
+        success: true,
+        actionReceived: action,
+        locations,
+        note: "Find the Roundhouse location here. Copy its Id into Railway as MINDBODY_LOCATION_ID.",
+      });
+    }
+
+    /**
+     * =====================
      * ACTION: get_today_schedule
      * =====================
+     * Optional filters supported:
+     * - date (YYYY-MM-DD)
+     * - class_type OR class_name (substring match)
+     * - instructor_name (substring match)
+     * - time_range (morning/afternoon/evening) OR time (like "6pm")
      */
     if (action === "get_today_schedule") {
-      const date = params.date || nowInTZDateString(STUDIO_TZ);
-      const { startISO, endISO } = toISODateRangeForDay(date, STUDIO_TZ);
+      const tz = "America/Vancouver";
+      const date = params.date || nowInTZDateString(tz);
+      const { startISO, endISO } = toISODateRangeForDay(date);
+
+      const query = {
+        StartDateTime: startISO,
+        EndDateTime: endISO,
+      };
+
+      // ✅ THIS is “add location id to query”
+      // It filters Mindbody results to Roundhouse only.
+      if (locationId) {
+        query.LocationIds = locationId;
+      }
 
       const data = await mbFetch("/class/classes", {
         method: "GET",
-        query: {
-          StartDateTime: startISO,
-          EndDateTime: endISO,
-        },
+        query,
       });
 
       const classesRaw = normalizeArray(data, ["Classes", "classes"]);
 
+      // ✅ Filter out hidden/canceled classes (best-effort)
+      const visibleRaw = classesRaw.filter(isClassPubliclyVisible);
+
       const wantType = toLowerClean(params.class_type || params.class_name);
       const wantInstructor = toLowerClean(params.instructor_name);
-      const wantTimeRange = toLowerClean(params.time_range);
-      const wantTime = toLowerClean(params.time);
+      const wantTimeRange = toLowerClean(params.time_range); // morning/afternoon/evening
+      const wantTime = toLowerClean(params.time); // "6pm" etc
 
-      let classes = classesRaw.map((c) => {
+      let classes = visibleRaw.map((c) => {
         const classId = c.Id ?? c.ClassId ?? c.classId ?? null;
         const name = c.ClassDescription?.Name ?? c.Name ?? c.className ?? "Class";
         const startDateTime = c.StartDateTime ?? c.startDateTime ?? null;
@@ -274,7 +368,7 @@ app.all("/mindbody", async (req, res) => {
 
         const instructor =
           c.Staff?.Name ??
-          [c.Staff?.FirstName, c.Staff?.LastName].filter(Boolean).join(" ") ??
+          [c.Staff?.FirstName, c.Staff?.LastName].filter(Boolean).join(" ") ||
           c.InstructorName ??
           c.instructor ??
           null;
@@ -288,24 +382,30 @@ app.all("/mindbody", async (req, res) => {
           name,
           startDateTime,
           endDateTime,
-          startTimeLocal: startDateTime ? humanTime(startDateTime, STUDIO_TZ) : null,
+          startTimeLocal: startDateTime ? humanTime(startDateTime, tz) : null,
           instructor,
           location,
           capacity: cap.capacity,
           booked: cap.booked,
           spotsAvailable: cap.spotsAvailable,
           isWaitlistAvailable: cap.isWaitlistAvailable,
-          _timeBucket: startDateTime ? timeBucketFromISO(startDateTime, STUDIO_TZ) : null,
+          _timeBucket: startDateTime ? timeBucketFromISO(startDateTime, tz) : null,
         };
       });
 
-      if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-      if (wantInstructor)
+      // Optional filtering (safe to ignore if not provided)
+      if (wantType) {
+        classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
+      }
+      if (wantInstructor) {
         classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-      if (wantTimeRange)
+      }
+      if (wantTimeRange) {
         classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
-      if (wantTime)
+      }
+      if (wantTime) {
         classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
+      }
 
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
@@ -313,11 +413,14 @@ app.all("/mindbody", async (req, res) => {
         success: true,
         actionReceived: action,
         date,
-        timezone: STUDIO_TZ,
+        timezone: tz,
+        locationFilterApplied: locationId ? locationId : null,
         classes,
         notes: {
+          visibilityLogic:
+            "We filter canceled/explicitly-non-web-visible classes best-effort. Website may still apply additional rules.",
           capacityLogic:
-            "spotsAvailable is best-effort. Many studios do not return capacity/booked fields from this endpoint, so spotsAvailable may be null even though the class is bookable.",
+            "spotsAvailable is best-effort: many studios do not return capacity/booked fields from /class/classes, so spotsAvailable may be null even though the class is bookable.",
         },
       });
     }
@@ -350,6 +453,13 @@ app.all("/mindbody", async (req, res) => {
       return res.status(200).json({
         success: true,
         actionReceived: action,
+        filtersReceived: {
+          pricing_interest: params.pricing_interest || null,
+          is_new_client: params.is_new_client ?? null,
+          membership_interest: params.membership_interest || null,
+          class_pack_interest: params.class_pack_interest || null,
+          notes: params.notes || null,
+        },
         offers: { services, packages, contracts },
         warnings: {
           services:
@@ -382,24 +492,27 @@ app.all("/mindbody", async (req, res) => {
       let classId = params.class_id || params.classId || null;
 
       if (!classId) {
-        const date = params.date || nowInTZDateString(STUDIO_TZ);
-        const { startISO, endISO } = toISODateRangeForDay(date, STUDIO_TZ);
+        const tz = "America/Vancouver";
+        const date = params.date || nowInTZDateString(tz);
+        const { startISO, endISO } = toISODateRangeForDay(date);
+
+        const query = { StartDateTime: startISO, EndDateTime: endISO };
+        if (locationId) query.LocationIds = locationId;
 
         const sched = await mbFetch("/class/classes", {
           method: "GET",
-          query: { StartDateTime: startISO, EndDateTime: endISO },
+          query,
         });
 
-        const classes = normalizeArray(sched, ["Classes", "classes"]);
+        const classes = normalizeArray(sched, ["Classes", "classes"]).filter(isClassPubliclyVisible);
 
         const desiredName = toLowerClean(params.class_name || params.class_type);
         const desiredTime = toLowerClean(params.time);
 
         const match = classes.find((c) => {
           const nm = toLowerClean(c.ClassDescription?.Name ?? c.Name ?? "");
-          const st = c.StartDateTime ?? "";
-
-          const stHuman = st ? humanTime(st, STUDIO_TZ)?.toLowerCase() : "";
+          const st = (c.StartDateTime ?? "").toString();
+          const stHuman = st ? humanTime(st, tz)?.toLowerCase() : "";
 
           const nameOk = desiredName ? nm.includes(desiredName) : true;
           const timeOk = desiredTime ? (stHuman || "").includes(desiredTime) : true;
@@ -414,7 +527,7 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Missing class_id and could not match a class. Best practice: call get_today_schedule first and pass back classId.",
+            "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
           paramsReceived: params,
         });
       }
@@ -424,10 +537,10 @@ app.all("/mindbody", async (req, res) => {
       const first = (params.client_first_name || "").toString().trim();
       const last = (params.client_last_name || "").toString().trim();
       const email = (params.email || "").toString().trim();
-      const mobilePhone = normalizePhone(params.mobilephone || params.mobile_phone || params.phone);
+      const phone = normalizePhone(params.mobilephone || params.MobilePhone || params.phone || "");
 
       if (!clientId) {
-        const searchText = [email, mobilePhone, `${first} ${last}`].find((x) => x && x.length >= 3);
+        const searchText = [email, phone, `${first} ${last}`].find((x) => x && x.length >= 3);
 
         if (searchText) {
           const clientResp = await mbFetch("/client/clients", {
@@ -467,23 +580,13 @@ app.all("/mindbody", async (req, res) => {
           });
         }
 
-        if (!mobilePhone) {
-          return res.status(400).json({
-            success: false,
-            actionReceived: action,
-            message:
-              "Mindbody requires MobilePhone for new clients in this studio. Please collect a mobile number.",
-            paramsReceived: params,
-          });
-        }
-
         const createResp = await mbFetch("/client/addclient", {
           method: "POST",
           body: {
             FirstName: first,
             LastName: last,
             Email: email || undefined,
-            MobilePhone: mobilePhone || undefined,
+            MobilePhone: phone || undefined,
             AddressLine1: addressLine1 || undefined,
             City: city || undefined,
             State: state || undefined,
@@ -504,7 +607,7 @@ app.all("/mindbody", async (req, res) => {
           success: false,
           actionReceived: action,
           message:
-            "Client likely already exists, but could not be located via search. Ask for the exact email or mobile on file, or use client_id.",
+            "Client likely already exists, but could not be located via search. Ask for the exact phone/email on file, or use client_id.",
           paramsReceived: params,
         });
       }
@@ -514,7 +617,7 @@ app.all("/mindbody", async (req, res) => {
         body: {
           ClientId: clientId,
           ClassId: classId,
-          RequirePayment: false
+          RequirePayment: false,
         },
       });
 
@@ -545,6 +648,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
