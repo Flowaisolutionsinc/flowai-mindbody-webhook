@@ -1,4 +1,5 @@
 import express from "express";
+import { DateTime } from "luxon";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -31,25 +32,66 @@ const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").tri
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
+const STUDIO_TZ = "America/Vancouver";
+
+/**
+ * ============
+ * VAPI RESPONSE HELPERS
+ * ============
+ * Vapi custom tools require:
+ * HTTP 200 AND JSON:
+ * { results: [ { toolCallId: "...", result: "single line string" } ] }
+ */
+function toSingleLine(str) {
+  return String(str ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractToolCallId(body) {
+  if (!body || typeof body !== "object") return null;
+
+  // Common shapes Vapi may send
+  if (typeof body.toolCallId === "string") return body.toolCallId;
+  if (typeof body.id === "string" && body.id.startsWith("call_")) return body.id;
+
+  if (body.toolCall && typeof body.toolCall.id === "string") return body.toolCall.id;
+  if (Array.isArray(body.toolCalls) && body.toolCalls[0]?.id) return body.toolCalls[0].id;
+
+  // Sometimes nested
+  if (body.message?.toolCallId) return body.message.toolCallId;
+
+  return null;
+}
+
+function vapiResult(res, toolCallId, resultString) {
+  // Always HTTP 200 for Vapi tools
+  return res.status(200).json({
+    results: [
+      {
+        toolCallId,
+        result: toSingleLine(resultString),
+      },
+    ],
+  });
+}
+
+function vapiError(res, toolCallId, errorString) {
+  return res.status(200).json({
+    results: [
+      {
+        toolCallId,
+        error: toSingleLine(errorString),
+      },
+    ],
+  });
+}
+
 /**
  * ============
  * SMALL HELPERS
  * ============
  */
-function nowInTZDateString(tz = "America/Vancouver") {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
-
-  const y = parts.find((p) => p.type === "year")?.value;
-  const m = parts.find((p) => p.type === "month")?.value;
-  const d = parts.find((p) => p.type === "day")?.value;
-  return `${y}-${m}-${d}`;
-}
-
 function safeJsonParse(x) {
   try {
     return typeof x === "string" ? JSON.parse(x) : x;
@@ -78,6 +120,33 @@ function normalizePhone(phone) {
 }
 
 /**
+ * Date handling:
+ * - Vapi sometimes sends params_date / params_location_id (you had this in logs)
+ * - Vapi may send ISO timestamps; we coerce to YYYY-MM-DD in Vancouver time
+ */
+function coerceYYYYMMDD(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+
+  // If already YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // If ISO like 2026-02-17T00:00:00.000Z
+  const dt = DateTime.fromISO(s, { setZone: true });
+  if (dt.isValid) return dt.setZone(STUDIO_TZ).toISODate();
+
+  // Fallback: grab first 10 chars if it looks like date
+  const first10 = s.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(first10)) return first10;
+
+  return null;
+}
+
+function todayInStudioTZ() {
+  return DateTime.now().setZone(STUDIO_TZ).toISODate(); // YYYY-MM-DD
+}
+
+/**
  * IMPORTANT: Mindbody often returns date-times WITHOUT timezone offset (ex: "2026-02-12T20:00:00")
  * If we use new Date() on that in a server running UTC, times shift and won't match the website.
  * So we parse the time as "naive local" (HH:MM) and format it ourselves.
@@ -86,7 +155,7 @@ function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
   if (parts.length < 2) return null;
-  const timePart = parts[1];
+  const timePart = parts[1]; // "20:00:00"
   const hm = timePart.split(":");
   const hour = Number(hm[0]);
   const minute = Number(hm[1] || "0");
@@ -113,13 +182,15 @@ function timeBucketFromHour(hour) {
   return "evening";
 }
 
-function localDayRange(dateStr) {
+/** Build a “local day range” without Z (timezone) so Mindbody treats it as location-local time */
+function localDayRange(dateStr /* YYYY-MM-DD */) {
   return {
     startLocal: `${dateStr}T00:00:00`,
     endLocal: `${dateStr}T23:59:59`,
   };
 }
 
+/** Best-effort extraction of capacity & booked counts from Mindbody class object. */
 function extractCapacityInfo(c) {
   const candidatesCapacity = [c.MaxCapacity, c.WebCapacity, c.Capacity, c.ClassCapacity];
   const candidatesBooked = [c.TotalBooked, c.Visits, c.TotalBookedClients, c.Booked, c.NumBooked];
@@ -139,41 +210,14 @@ function extractCapacityInfo(c) {
 }
 
 /**
- * ✅ PARAM NORMALIZER (THIS IS THE FIX)
- * Vapi may send: params_date / params_location_id
- * or nested: { params: { date, location_id } }
- * or querystring keys.
- */
-function normalizeIncomingParams(params) {
-  const p = { ...(params || {}) };
-
-  // If Vapi sends "params_date" / "params_location_id"
-  if (p.params_date && !p.date) p.date = p.params_date;
-  if (p.params_location_id && !p.location_id) p.location_id = p.params_location_id;
-  if (p.params_location_ids && !p.location_ids) p.location_ids = p.params_location_ids;
-
-  // Common alternates
-  if (p.locationId && !p.location_id) p.location_id = p.locationId;
-  if (p.locationIds && !p.location_ids) p.location_ids = p.locationIds;
-  if (p.classId && !p.class_id) p.class_id = p.classId;
-
-  // Trim strings
-  for (const k of Object.keys(p)) {
-    if (typeof p[k] === "string") p[k] = p[k].trim();
-  }
-
-  return p;
-}
-
-/**
  * Location resolution:
  * - If request has location_id => use that
  * - else if request has location_ids => use that
  * - else use env default(s)
  */
 function resolveLocationQuery(params) {
-  const locationId = (params.location_id || "").toString().trim();
-  const locationIds = (params.location_ids || "").toString().trim();
+  const locationId = (params.location_id || params.locationId || "").toString().trim();
+  const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
   if (locationIds) return { LocationIds: locationIds };
   if (locationId) return { LocationIds: locationId };
@@ -234,7 +278,9 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
  * HEALTH CHECKS
  * ============
  */
-app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
+app.get("/", (req, res) => {
+  res.status(200).send("Flow AI Mindbody webhook is running");
+});
 
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -248,6 +294,7 @@ app.get("/health", (req, res) => {
       hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
       hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
       debugMode: DEBUG_MODE,
+      studioTimezone: STUDIO_TZ,
     },
   });
 });
@@ -256,11 +303,16 @@ app.get("/health", (req, res) => {
  * ============
  * MAIN WEBHOOK
  * ============
+ * Accepts either:
+ * - Query:  /mindbody?action=get_today_schedule&date=YYYY-MM-DD
+ * - JSON:   { "action": "get_today_schedule", "params": { ... } }
+ *
+ * ALSO supports Vapi custom tool requests:
+ * - It will detect toolCallId and respond in Vapi-required results[] format.
  */
 app.all("/mindbody", async (req, res) => {
-  // ✅ Always return HTTP 200 to keep Vapi happy; real status inside JSON
-  const reply = (payload, httpStatus = 200) =>
-    res.status(200).json({ httpStatus, ...payload });
+  const toolCallId = extractToolCallId(req.body);
+  const isVapi = Boolean(toolCallId);
 
   try {
     let action = req.query?.action || req.body?.action || req.body?.action_type || "";
@@ -276,52 +328,65 @@ app.all("/mindbody", async (req, res) => {
     delete extraTopLevelBody.action_type;
     delete extraTopLevelBody.params;
 
-    // Merge EVERYTHING then normalize shapes (THIS MATTERS)
-    let params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
-    params = normalizeIncomingParams(params);
+    // Merge params
+    const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
 
-    // Vapi fallback: if action missing but date exists
-    if (!action && (params.date || params.params_date)) action = "get_today_schedule";
+    // Fix Vapi-style param names you showed in logs: params_date, params_location_id
+    if (!params.date && params.params_date) params.date = params.params_date;
+    if (!params.location_id && params.params_location_id) params.location_id = params.params_location_id;
 
-    console.log("WEBHOOK_HIT", { method: req.method, action, params });
+    // Coerce date correctly (prevents “wrong schedule today” issues)
+    const coerced = coerceYYYYMMDD(params.date);
+    if (coerced) params.date = coerced;
+
+    // Safety fallback
+    if (!action && params.date) action = "get_today_schedule";
+
+    console.log("WEBHOOK_HIT", { method: req.method, action, params, isVapi });
 
     if (!action) {
-      return reply(
-        {
-          success: false,
-          message:
-            "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }",
-          receivedQuery: req.query || {},
-          receivedBody: req.body || {},
-        },
-        400
-      );
+      const msg =
+        "Missing action. Send ?action=your_action OR JSON { action:'your_action', params:{...} }";
+      return isVapi
+        ? vapiError(res, toolCallId, msg)
+        : res.status(200).json({ httpStatus: 400, success: false, message: msg });
     }
 
+    /**
+     * =====================
+     * ACTION: get_locations
+     * =====================
+     */
     if (action === "get_locations") {
       const data = await mbFetch("/site/locations", { method: "GET" });
       const locations = normalizeArray(data, ["Locations", "locations"]);
-      return reply(
-        {
-          success: true,
-          actionReceived: action,
-          count: locations.length,
-          locations: locations.map((l) => ({
-            id: l.Id ?? l.LocationId ?? null,
-            name: l.Name ?? l.LocationName ?? null,
-            address: l.Address ?? null,
-            city: l.City ?? null,
-            stateProv: l.StateProvCode ?? l.State ?? null,
-          })),
-          // ✅ A single string the agent can speak
-          say: `I found ${locations.length} locations.`,
-        },
-        200
-      );
+
+      const resultText = `Found ${locations.length} locations.`;
+
+      return isVapi
+        ? vapiResult(res, toolCallId, resultText)
+        : res.status(200).json({
+            httpStatus: 200,
+            success: true,
+            actionReceived: action,
+            count: locations.length,
+            locations: locations.map((l) => ({
+              id: l.Id ?? l.LocationId ?? null,
+              name: l.Name ?? l.LocationName ?? null,
+              address: l.Address ?? null,
+              city: l.City ?? null,
+              stateProv: l.StateProvCode ?? l.State ?? null,
+            })),
+          });
     }
 
+    /**
+     * =====================
+     * ACTION: get_today_schedule
+     * =====================
+     */
     if (action === "get_today_schedule") {
-      const date = (params.date || "").trim() || nowInTZDateString("America/Vancouver");
+      const date = params.date || todayInStudioTZ();
       const { startLocal, endLocal } = localDayRange(date);
 
       const locationQuery = resolveLocationQuery(params);
@@ -350,13 +415,16 @@ app.all("/mindbody", async (req, res) => {
         const endDateTime = c.EndDateTime ?? c.endDateTime ?? null;
 
         let instructor = c.Staff?.Name ?? c.InstructorName ?? c.instructor ?? null;
+
         if (!instructor && c.Staff) {
           const first = c.Staff.FirstName || "";
           const last = c.Staff.LastName || "";
-          instructor = [first, last].filter(Boolean).join(" ").trim() || null;
+          const combined = [first, last].filter(Boolean).join(" ").trim();
+          instructor = combined || null;
         }
 
         const location = c.Location?.Name ?? c.LocationName ?? c.location ?? null;
+
         const cap = extractCapacityInfo(c);
 
         const st = parseNaiveISO(startDateTime);
@@ -380,58 +448,54 @@ app.all("/mindbody", async (req, res) => {
       });
 
       if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-      if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-      if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
+      if (wantInstructor)
+        classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+      if (wantTimeRange)
+        classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
       if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
-      classes.sort((a, b) => {
-        const ah = parseNaiveISO(a.startDateTime)?.hour ?? 999;
-        const am = parseNaiveISO(a.startDateTime)?.minute ?? 999;
-        const bh = parseNaiveISO(b.startDateTime)?.hour ?? 999;
-        const bm = parseNaiveISO(b.startDateTime)?.minute ?? 999;
-        return ah !== bh ? ah - bh : am - bm;
-      });
-
-      const speakList =
-        classes.length === 0
-          ? `I’m not seeing any classes posted for ${date} at this location. Want a different day?`
-          : `Here are the classes for ${date}: ` +
-            classes
-              .map((c, i) => {
-                const teacher = c.instructor ? ` with ${c.instructor}` : "";
-                return `${i + 1}) ${c.startTimeLocal || "Time TBA"} — ${c.name}${teacher}`;
-              })
-              .join(". ");
-
-      // Remove internal field
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
-      return reply(
-        {
-          success: true,
-          actionReceived: action,
-          date,
-          timezone: "America/Vancouver",
-          appliedLocationFilter: locationQuery,
-          classes,
-          // ✅ THIS is what the agent should read verbatim (no guessing)
-          say: speakList,
-          debug: DEBUG_MODE
-            ? {
-                receivedParams: params,
-                rawCount: classesRaw.length,
-                querySentToMindbody: {
-                  StartDateTime: startLocal,
-                  EndDateTime: endLocal,
-                  ...locationQuery,
-                },
-              }
-            : undefined,
-        },
-        200
-      );
+      // Build a clean single-line sentence for Vapi (prevents token truncation + formatting issues)
+      let say;
+      if (!classes.length) {
+        say = `I couldn't find any classes for ${date}. Want me to check a different day?`;
+      } else {
+        const parts = classes.map((c, idx) => {
+          const t = c.startTimeLocal || "";
+          const n = c.name || "Class";
+          const ins = c.instructor ? ` with ${c.instructor}` : "";
+          return `${idx + 1}) ${t} - ${n}${ins}`.trim();
+        });
+        say = `Here are the classes for ${date}: ${parts.join(" ")}`;
+      }
+
+      return isVapi
+        ? vapiResult(res, toolCallId, say)
+        : res.status(200).json({
+            httpStatus: 200,
+            success: true,
+            actionReceived: action,
+            date,
+            timezone: STUDIO_TZ,
+            appliedLocationFilter: resolveLocationQuery(params),
+            classes,
+            say,
+            notes: {
+              whyTimesMatchWebsite:
+                "We format Mindbody times as naive-local (no Date() parsing) because Mindbody often returns times without timezone offsets.",
+              capacityLogic:
+                "spotsAvailable is best-effort. Many studios do not return capacity/booked fields from this endpoint, so spotsAvailable may be null even though the class is bookable.",
+            },
+            debug: DEBUG_MODE ? { rawCount: classesRaw.length } : undefined,
+          });
     }
 
+    /**
+     * =====================
+     * ACTION: get_pricing_offers
+     * =====================
+     */
     if (action === "get_pricing_offers") {
       const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
         mbFetch("/sale/services", { method: "GET" }),
@@ -452,31 +516,38 @@ app.all("/mindbody", async (req, res) => {
           ? normalizeArray(contractsResp.value, ["Contracts", "contracts"])
           : [];
 
-      return reply(
-        {
-          success: true,
-          actionReceived: action,
-          offers: { services, packages, contracts },
-          say: "I pulled the pricing offers.",
-          warnings: {
-            services:
-              servicesResp.status === "rejected"
-                ? String(servicesResp.reason?.message || servicesResp.reason)
-                : null,
-            packages:
-              packagesResp.status === "rejected"
-                ? String(packagesResp.reason?.message || packagesResp.reason)
-                : null,
-            contracts:
-              contractsResp.status === "rejected"
-                ? String(contractsResp.reason?.message || contractsResp.reason)
-                : null,
-          },
-        },
-        200
-      );
+      const say = `I pulled pricing offers. Services: ${services.length}, Packages: ${packages.length}, Contracts: ${contracts.length}.`;
+
+      return isVapi
+        ? vapiResult(res, toolCallId, say)
+        : res.status(200).json({
+            httpStatus: 200,
+            success: true,
+            actionReceived: action,
+            offers: { services, packages, contracts },
+            warnings: {
+              services:
+                servicesResp.status === "rejected"
+                  ? String(servicesResp.reason?.message || servicesResp.reason)
+                  : null,
+              packages:
+                packagesResp.status === "rejected"
+                  ? String(packagesResp.reason?.message || packagesResp.reason)
+                  : null,
+              contracts:
+                contractsResp.status === "rejected"
+                  ? String(contractsResp.reason?.message || contractsResp.reason)
+                  : null,
+            },
+          });
     }
 
+    /**
+     * =====================
+     * ACTION: book_class
+     * =====================
+     * NOTE: For Vapi we return a short string result, not raw JSON.
+     */
     if (action === "book_class") {
       const isNewClient =
         params.is_new_client === true ||
@@ -486,7 +557,7 @@ app.all("/mindbody", async (req, res) => {
       let classId = params.class_id || params.classId || null;
 
       if (!classId) {
-        const date = params.date || nowInTZDateString("America/Vancouver");
+        const date = params.date || todayInStudioTZ();
         const { startLocal, endLocal } = localDayRange(date);
         const locationQuery = resolveLocationQuery(params);
 
@@ -515,17 +586,11 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!classId) {
-        return reply(
-          {
-            success: false,
-            actionReceived: action,
-            message:
-              "Missing class_id and could not match a class. BEST PRACTICE: call get_today_schedule first and pass back class_id.",
-            say: "I couldn’t find that class to book. Which class time are you looking at?",
-            paramsReceived: params,
-          },
-          400
-        );
+        const msg =
+          "Missing class_id and could not match a class. Best practice: call get_today_schedule first and pass back class_id.";
+        return isVapi
+          ? vapiError(res, toolCallId, msg)
+          : res.status(200).json({ httpStatus: 400, success: false, actionReceived: action, message: msg });
       }
 
       let clientId = params.client_id || params.clientId || null;
@@ -562,17 +627,11 @@ app.all("/mindbody", async (req, res) => {
 
       if (!clientId && isNewClient) {
         if (!first || !last) {
-          return reply(
-            {
-              success: false,
-              actionReceived: action,
-              message:
-                "New client booking needs client_first_name and client_last_name (and ideally email/mobilephone).",
-              say: "What’s your first and last name?",
-              paramsReceived: params,
-            },
-            400
-          );
+          const msg =
+            "New client booking needs client_first_name and client_last_name (and ideally email/mobilephone).";
+          return isVapi
+            ? vapiError(res, toolCallId, msg)
+            : res.status(200).json({ httpStatus: 400, success: false, actionReceived: action, message: msg });
         }
 
         const addClientBody = {
@@ -580,10 +639,6 @@ app.all("/mindbody", async (req, res) => {
           LastName: last,
           Email: email || undefined,
           MobilePhone: phone || undefined,
-          AddressLine1: (params.address_line1 || "").toString().trim() || undefined,
-          City: (params.city || "").toString().trim() || undefined,
-          State: (params.state || "").toString().trim() || undefined,
-          PostalCode: (params.postal_code || "").toString().trim() || undefined,
         };
 
         const createResp = await mbFetch("/client/addclient", {
@@ -600,20 +655,14 @@ app.all("/mindbody", async (req, res) => {
       }
 
       if (!clientId) {
-        return reply(
-          {
-            success: false,
-            actionReceived: action,
-            message:
-              "Client likely already exists, but could not be located via search. Ask for the exact email/phone on file or pass client_id.",
-            say: "I couldn’t find your profile. What email or phone number is on your account?",
-            paramsReceived: params,
-          },
-          409
-        );
+        const msg =
+          "Client likely already exists, but could not be located via search. Ask for the exact email/phone on file or pass client_id.";
+        return isVapi
+          ? vapiError(res, toolCallId, msg)
+          : res.status(200).json({ httpStatus: 409, success: false, actionReceived: action, message: msg });
       }
 
-      const bookResp = await mbFetch("/class/addclienttoclass", {
+      await mbFetch("/class/addclienttoclass", {
         method: "POST",
         body: {
           ClientId: clientId,
@@ -622,44 +671,37 @@ app.all("/mindbody", async (req, res) => {
         },
       });
 
-      return reply(
-        {
-          success: true,
-          actionReceived: action,
-          booked: true,
-          clientId,
-          classId,
-          say: "Perfect — you’re booked.",
-          raw: DEBUG_MODE ? bookResp : undefined,
-        },
-        200
-      );
+      const say = `Booked successfully. Client ID ${clientId}, Class ID ${classId}.`;
+
+      return isVapi
+        ? vapiResult(res, toolCallId, say)
+        : res.status(200).json({
+            httpStatus: 200,
+            success: true,
+            actionReceived: action,
+            booked: true,
+            clientId,
+            classId,
+          });
     }
 
-    return reply(
-      {
-        success: false,
-        actionReceived: action,
-        message: `Unknown action: ${action}`,
-        say: "I hit an unknown action on the server.",
-        paramsReceived: params,
-      },
-      400
-    );
+    const unknownMsg = `Unknown action: ${action}`;
+    return isVapi
+      ? vapiError(res, toolCallId, unknownMsg)
+      : res.status(200).json({ httpStatus: 400, success: false, actionReceived: action, message: unknownMsg });
   } catch (err) {
     console.error("WEBHOOK_ERROR", err?.message || err, err?.stack || "");
-    return res.status(200).json({
-      httpStatus: 500,
-      success: false,
-      message: err?.message || "Server error",
-      say: "Sorry — I hit an error pulling the schedule. Try again in a moment.",
-    });
+    const msg = err?.message || "Server error";
+    return isVapi
+      ? vapiError(res, toolCallId, msg)
+      : res.status(200).json({ httpStatus: 500, success: false, message: msg });
   }
 });
 
-// IMPORTANT: only declare PORT once
+// IMPORTANT: Railway supplies PORT automatically
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
