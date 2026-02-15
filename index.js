@@ -159,6 +159,53 @@ function resolveLocationQuery(params) {
   return {};
 }
 
+/**
+ * IMPORTANT FIX:
+ * Some platforms send params as flattened keys like:
+ *   params_date, params_location_id
+ * This normalizes them so our code always sees:
+ *   params.date, params.location_id
+ */
+function normalizeIncomingParams(params) {
+  const p = { ...(params || {}) };
+
+  if (!p.date && p.params_date) p.date = p.params_date;
+  if (!p.location_id && p.params_location_id) p.location_id = p.params_location_id;
+
+  if (!p.location_ids && p.params_location_ids) p.location_ids = p.params_location_ids;
+
+  // If someone sends LocationIds directly
+  if (!p.location_id && p.LocationIds) p.location_id = p.LocationIds;
+  if (!p.location_ids && p.LocationIds) p.location_ids = p.LocationIds;
+
+  return p;
+}
+
+/**
+ * Build a guaranteed “say” string the voice agent can speak.
+ * Even if the AI fails to interpret JSON, this gives it a clean output.
+ */
+function buildScheduleSay({ date, classes, locationName }) {
+  const prettyDate = date;
+  const loc = locationName ? ` at ${locationName}` : "";
+
+  if (!classes || classes.length === 0) {
+    return `I checked the schedule for ${prettyDate}${loc}, and I don't see any classes listed. Want me to check a different day?`;
+  }
+
+  // Keep it short-ish for phone calls
+  const maxItems = 10;
+  const list = classes.slice(0, maxItems).map((c) => {
+    const t = c.startTimeLocal || "Time TBA";
+    const n = c.name || "Class";
+    const inst = c.instructor ? ` with ${c.instructor}` : "";
+    return `${t} ${n}${inst}`;
+  });
+
+  const more = classes.length > maxItems ? ` And there are ${classes.length - maxItems} more.` : "";
+  return `Here are the classes for ${prettyDate}${loc}: ${list.join(", ")}.${more}`;
+}
+
 async function mbFetch(path, { method = "GET", query, body } = {}) {
   if (!siteId || !apiKey || !sourceName || !sourcePassword) {
     throw new Error(
@@ -260,7 +307,11 @@ app.all("/mindbody", async (req, res) => {
     delete extraTopLevelBody.action_type;
     delete extraTopLevelBody.params;
 
-    const params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
+    // Merge params from all places
+    let params = { ...paramsFromBody, ...extraTopLevelBody, ...paramsFromQuery };
+
+    // Normalize weird flattened param keys
+    params = normalizeIncomingParams(params);
 
     // ✅ VAPI SAFETY FALLBACK
     if (!action && params.date) {
@@ -383,6 +434,9 @@ app.all("/mindbody", async (req, res) => {
 
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
+      const locationName = classes[0]?.location || "Oxygen Yoga & Fitness - Roundhouse";
+      const say = buildScheduleSay({ date, classes, locationName });
+
       return reply(
         {
           success: true,
@@ -390,14 +444,20 @@ app.all("/mindbody", async (req, res) => {
           date,
           timezone: "America/Vancouver",
           appliedLocationFilter: resolveLocationQuery(params),
+
+          // ✅ IMPORTANT: This is what the voice agent can speak directly
+          say,
+
+          // ✅ Still return structured data for the AI (booking, etc.)
           classes,
+
           notes: {
             whyTimesMatchWebsite:
               "We format Mindbody times as naive-local (no Date() parsing) because Mindbody often returns times without timezone offsets.",
             capacityLogic:
               "spotsAvailable is best-effort. Many studios do not return capacity/booked fields from this endpoint, so spotsAvailable may be null even though the class is bookable.",
           },
-          debug: DEBUG_MODE ? { rawCount: classesRaw.length } : undefined,
+          debug: DEBUG_MODE ? { rawCount: classesRaw.length, normalizedParams: params } : undefined,
         },
         200
       );
@@ -613,6 +673,7 @@ app.all("/mindbody", async (req, res) => {
           booked: true,
           clientId,
           classId,
+          say: `Perfect — you’re booked in. Anything else I can help with?`,
           raw: DEBUG_MODE ? bookResp : undefined,
         },
         200
@@ -634,6 +695,7 @@ app.all("/mindbody", async (req, res) => {
       httpStatus: 500,
       success: false,
       message: err?.message || "Server error",
+      say: "Sorry — something went wrong while checking the schedule. Can I try again?",
     });
   }
 });
@@ -641,6 +703,7 @@ app.all("/mindbody", async (req, res) => {
 // IMPORTANT: only declare PORT once
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
