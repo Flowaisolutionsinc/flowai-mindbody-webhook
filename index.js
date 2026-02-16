@@ -248,6 +248,26 @@ app.all("/mindbody", async (req, res) => {
   };
 
   try {
+    /**
+     * ✅✅✅ VAPI BODY UNWRAP FIX (THIS IS THE MISSING STEP)
+     * Vapi sends args nested like:
+     * req.body.message.toolCallList[0].function.arguments
+     * We pull that up so req.body.action exists.
+     */
+    const vapiArgs =
+      req.body?.message?.toolCallList?.[0]?.function?.arguments ??
+      req.body?.message?.toolCalls?.[0]?.function?.arguments ??
+      req.body?.message?.toolCallList?.[0]?.arguments ??
+      null;
+
+    if (vapiArgs) {
+      const parsed = typeof vapiArgs === "string" ? safeJsonParse(vapiArgs) : vapiArgs;
+      if (parsed && typeof parsed === "object") {
+        req.body = parsed; // <-- makes the rest of your existing code work unchanged
+      }
+    }
+
+    // ✅ now this will work whether it came from Vapi or a normal POST
     let action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
     const paramsFromQuery = { ...(req.query || {}) };
@@ -366,7 +386,6 @@ app.all("/mindbody", async (req, res) => {
 
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
-      // Helpful spoken summary for the assistant (optional)
       const say =
         classes.length === 0
           ? `I couldn’t find any classes for ${date}.`
@@ -506,6 +525,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
