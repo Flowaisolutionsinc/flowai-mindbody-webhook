@@ -27,7 +27,7 @@ app.use((req, res, next) => {
  *
  * Optional:
  * - MINDBODY_BASE_URL (default below)
- * - MINDBODY_DEFAULT_LOCATION_ID (single numeric id)
+ * - MINDBODY_DEFAULT_LOCATION_ID (single numeric id)   <-- set this to 1 for Roundhouse
  * - MINDBODY_DEFAULT_LOCATION_IDS (comma-separated ids like "1,2,3")
  * - DEBUG_MODE ("true" to enable extra debug responses)
  */
@@ -145,7 +145,8 @@ function extractCapacityInfo(c) {
   const spotsAvailable =
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
-  const isWaitlistAvailable = c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+  const isWaitlistAvailable =
+    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
 
   return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
@@ -249,7 +250,13 @@ app.all("/mindbody", async (req, res) => {
 
   try {
     /**
-     * ✅ 1) UNWRAP VAPI TOOLCALL FORMAT (message.toolCallList[0].function.arguments)
+     * ✅✅✅ ACCEPT ALL VAPI SHAPES (THIS IS THE FIX)
+     *
+     * We support:
+     * 1) Normal: { action, date, ... }
+     * 2) Payload-wrapped: { payload: { action, ... } }
+     * 3) Vapi wrapper:
+     *    { message: { toolCallList: [ { function: { arguments: { action, ... }}}]}}
      */
     const vapiArgs =
       req.body?.message?.toolCallList?.[0]?.function?.arguments ??
@@ -262,20 +269,12 @@ app.all("/mindbody", async (req, res) => {
       if (parsed && typeof parsed === "object") {
         req.body = parsed;
       }
+    } else if (req.body?.payload && typeof req.body.payload === "object") {
+      // If Vapi sends { payload: {...} }
+      req.body = req.body.payload;
     }
 
-    /**
-     * ✅ 2) UNWRAP VAPI "payload" WRAPPER (THIS IS WHY YOU SEE MISSING ACTION)
-     * If Vapi tool schema is { payload: { action, date, ... } }
-     * then action lives at req.body.payload.action, not req.body.action.
-     */
-    if (req.body?.payload && typeof req.body.payload === "object") {
-      // merge payload up, but keep any top-level fields if they exist
-      req.body = { ...req.body.payload, ...req.body };
-      delete req.body.payload;
-    }
-
-    // ✅ now action works from query OR body OR action_type
+    // ✅ now this works for query OR body OR body.action_type
     let action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
     const paramsFromQuery = { ...(req.query || {}) };
@@ -388,8 +387,10 @@ app.all("/mindbody", async (req, res) => {
       });
 
       if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-      if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-      if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
+      if (wantInstructor)
+        classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+      if (wantTimeRange)
+        classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
       if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
@@ -400,7 +401,12 @@ app.all("/mindbody", async (req, res) => {
           : `Here are the classes for ${date}: ` +
             classes
               .slice(0, 10)
-              .map((c, i) => `${i + 1}) ${c.startTimeLocal || ""} — ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
+              .map(
+                (c, i) =>
+                  `${i + 1}) ${c.startTimeLocal || ""} — ${c.name}${
+                    c.instructor ? ` with ${c.instructor}` : ""
+                  }`
+              )
               .join(" ");
 
       return reply(
@@ -527,6 +533,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
