@@ -1,5 +1,4 @@
 import express from "express";
-import { DateTime } from "luxon";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -40,138 +39,158 @@ const STUDIO_TZ = "America/Vancouver";
  * ============
  */
 function nowInTZDateString(tz = STUDIO_TZ) {
-  return DateTime.now().setZone(tz).toFormat("yyyy-LL-dd");
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const d = parts.find((p) => p.type === "day")?.value;
+  return `${y}-${m}-${d}`;
 }
 
 function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
-  return DateTime.fromISO(yyyyMmDd, { zone: STUDIO_TZ })
-    .plus({ days: daysToAdd })
-    .toFormat("yyyy-LL-dd");
+  // Safe add days using UTC date math on the YYYY-MM-DD components
+  const [y, m, d] = yyyyMmDd.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + daysToAdd);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
 }
 
 const WEEKDAY_MAP = {
-  sunday: 0,
-  sun: 0,
-  monday: 1,
-  mon: 1,
-  tuesday: 2,
-  tue: 2,
-  tues: 2,
-  wednesday: 3,
-  wed: 3,
-  thursday: 4,
-  thu: 4,
-  thur: 4,
-  thurs: 4,
-  friday: 5,
-  fri: 5,
-  saturday: 6,
-  sat: 6,
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3,
+  thursday: 4, thu: 4, thur: 4, thurs: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
+};
+
+const MONTH_MAP = {
+  jan: 1, january: 1,
+  feb: 2, february: 2,
+  mar: 3, march: 3,
+  apr: 4, april: 4,
+  may: 5,
+  jun: 6, june: 6,
+  jul: 7, july: 7,
+  aug: 8, august: 8,
+  sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10,
+  nov: 11, november: 11,
+  dec: 12, december: 12,
 };
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
-  // Luxon: weekday is 1..7 (Mon..Sun). Convert to 0..6 (Sun..Sat)
-  const wd = DateTime.now().setZone(tz).weekday; // 1..7
-  return wd % 7; // Sun -> 0, Mon -> 1, ... Sat -> 6
+  // returns 0..6 Sun..Sat in studio timezone
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    weekday: "long",
+  }).formatToParts(new Date());
+  const wd = parts.find((p) => p.type === "weekday")?.value?.toLowerCase();
+  return WEEKDAY_MAP[wd] ?? null;
 }
 
 function looksLikeYYYYMMDD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-/**
- * NEW: Parse human dates like:
- * - "February 20th, 2026"
- * - "Feb 20, 2026"
- * - "February 20 2026"
- * - "Feb 20"
- * - "2/20/2026"
- */
-function parseHumanDateToYYYYMMDD(raw, tz = STUDIO_TZ) {
-  if (!raw) return null;
-
-  const cleaned = String(raw)
-    .trim()
-    .replace(/(\d)(st|nd|rd|th)\b/gi, "$1") // remove ordinal suffix
-    .replace(/,/g, " ")                    // remove commas
-    .replace(/\s+/g, " ");                 // normalize whitespace
-
-  const formats = [
-    "LLLL d yyyy", // February 20 2026
-    "LLL d yyyy",  // Feb 20 2026
-    "LLLL d",      // February 20   (assume current year)
-    "LLL d",       // Feb 20        (assume current year)
-    "M/d/yyyy",    // 2/20/2026
-    "M/d/yy",      // 2/20/26
-  ];
-
-  const nowYear = DateTime.now().setZone(tz).year;
-
-  for (const fmt of formats) {
-    let dt = DateTime.fromFormat(cleaned, fmt, { zone: tz });
-    if (dt.isValid) {
-      if (!fmt.includes("y")) dt = dt.set({ year: nowYear });
-      return dt.toFormat("yyyy-LL-dd");
-    }
-  }
-
-  return null;
+function pad2(n) {
+  return String(Number(n)).padStart(2, "0");
 }
 
 /**
  * Accepts:
  * - "today", "tomorrow"
- * - "friday", "next friday"
+ * - "friday", "this friday", "next friday", "following friday"
  * - "2026-02-17"
- * - "February 20th, 2026" (NOW SUPPORTED)
+ * - "February 20th, 2026" / "Feb 20, 2026" / "Feb 20 2026"
+ * - "the 17th" / "17th" (assumes current month/year)
  * Returns: YYYY-MM-DD in studio TZ, or null if cannot parse
  */
 function resolveDateInput(raw, tz = STUDIO_TZ) {
-  if (!raw) return nowInTZDateString(tz);
+  const todayStr = nowInTZDateString(tz);
+  if (!raw) return todayStr;
 
-  const original = String(raw).trim();
-  const s = original.toLowerCase();
-  if (!s) return nowInTZDateString(tz);
+  let s = String(raw).trim().toLowerCase();
+  if (!s) return todayStr;
+
+  // normalize punctuation/spacing
+  s = s.replace(/\u00a0/g, " "); // non-breaking spaces
+  s = s.replace(/\s+/g, " ").trim();
 
   // direct YYYY-MM-DD
   if (looksLikeYYYYMMDD(s)) return s;
 
   // today / tomorrow
-  if (s === "today") return nowInTZDateString(tz);
-  if (s === "tomorrow") return addDaysYYYYMMDD(nowInTZDateString(tz), 1);
+  if (s === "today") return todayStr;
+  if (s === "tomorrow") return addDaysYYYYMMDD(todayStr, 1);
 
-  // next friday / friday etc.
+  // handle prefixes: "this friday", "following tuesday"
+  const thisPrefix = s.startsWith("this ");
+  const followingPrefix = s.startsWith("following ");
   const nextPrefix = s.startsWith("next ");
-  const weekdayToken = nextPrefix ? s.slice(5).trim() : s;
+  if (thisPrefix) s = s.slice(5).trim();
+  if (followingPrefix) s = `next ${s.slice(10).trim()}`; // treat "following X" as next X
 
-  if (WEEKDAY_MAP[weekdayToken] !== undefined) {
-    const todayIdx = tzWeekdayIndex(tz);
-    if (todayIdx === null) return null;
-
-    const targetIdx = WEEKDAY_MAP[weekdayToken];
-    let delta = (targetIdx - todayIdx + 7) % 7;
-
-    // If they say "Friday" and today is Friday, assume TODAY.
-    // If they say "next Friday", force next week's occurrence.
-    if (nextPrefix) {
-      delta = delta === 0 ? 7 : delta + 7;
+  // month name formats: "February 20th, 2026" / "Feb 20 2026"
+  // allow optional comma, optional year
+  {
+    const m = s.match(
+      /^(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?$/
+    );
+    if (m) {
+      const monToken = m[1];
+      const day = Number(m[2]);
+      const year = m[3] ? Number(m[3]) : Number(todayStr.split("-")[0]);
+      const mon = MONTH_MAP[monToken] ?? null;
+      if (mon && Number.isFinite(day) && day >= 1 && day <= 31 && Number.isFinite(year)) {
+        return `${year}-${pad2(mon)}-${pad2(day)}`;
+      }
     }
-
-    return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
-  // If caller says "the 17th" (basic support)
-  const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
-  if (m) {
-    const today = nowInTZDateString(tz);
-    const [yy, mm] = today.split("-");
-    const dd = String(Number(m[1])).padStart(2, "0");
-    return `${yy}-${mm}-${dd}`;
+  // weekday: "friday" or "next friday"
+  {
+    const next = nextPrefix || s.startsWith("next ");
+    const weekdayToken = next ? s.replace(/^next\s+/, "").trim() : s;
+
+    if (WEEKDAY_MAP[weekdayToken] !== undefined) {
+      const todayIdx = tzWeekdayIndex(tz);
+      if (todayIdx === null) return null;
+
+      const targetIdx = WEEKDAY_MAP[weekdayToken];
+      let delta = (targetIdx - todayIdx + 7) % 7;
+
+      // If they say "Friday" and today is Friday, assume they mean TODAY.
+      // If they say "next Friday", force next week's occurrence.
+      if (next) {
+        if (delta === 0) delta = 7;
+        else delta += 7;
+      }
+
+      return addDaysYYYYMMDD(todayStr, delta);
+    }
   }
 
-  // NEW: month-name / human date parsing
-  const human = parseHumanDateToYYYYMMDD(original, tz);
-  if (human) return human;
+  // "the 17th" / "17th" (only if the entire string is just that)
+  {
+    const m = s.match(/^(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
+    if (m) {
+      const ddNum = Number(m[1]);
+      if (ddNum >= 1 && ddNum <= 31) {
+        const [yy, mm] = todayStr.split("-");
+        return `${yy}-${mm}-${pad2(ddNum)}`;
+      }
+    }
+  }
 
   return null;
 }
@@ -290,7 +309,6 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     "Source-Name": sourceName,
     Password: sourcePassword,
     SourcePassword: sourcePassword,
-    SourcePassword: sourcePassword,
   };
 
   const res = await fetch(url.toString(), {
@@ -394,7 +412,7 @@ app.all("/mb/locations", async (req, res) => {
   }
 });
 
-// 2) SCHEDULE
+// 2) SCHEDULE (date can be "Friday", "next Friday", "today", "February 20th, 2026", etc.)
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/schedule", { url: req.originalUrl, params });
@@ -407,7 +425,7 @@ app.all("/mb/schedule", async (req, res) => {
       return res.status(200).json({
         success: false,
         message:
-          "Could not understand the requested date. Please send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 20th, 2026.",
+          "Could not understand the requested date. Please send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or formats like Feb 20, 2026.",
         received: { date: rawDateInput },
       });
     }
@@ -463,6 +481,13 @@ app.all("/mb/schedule", async (req, res) => {
       };
     });
 
+    // sort by time for consistent voice output
+    classes.sort((a, b) => {
+      const pa = parseNaiveISO(a.startDateTime) || { hour: 99, minute: 99 };
+      const pb = parseNaiveISO(b.startDateTime) || { hour: 99, minute: 99 };
+      return pa.hour !== pb.hour ? pa.hour - pb.hour : pa.minute - pb.minute;
+    });
+
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
     if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
@@ -475,10 +500,11 @@ app.all("/mb/schedule", async (req, res) => {
         ? `No classes found for ${date}.`
         : `Classes for ${date}: ` +
           classes
-            .slice(0, 20)
+            .slice(0, 25)
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
+    // If voice only needs a quick string, allow onlySay=1
     const onlySay = String(params.onlySay || params.only_say || "").trim();
     if (onlySay === "1" || onlySay.toLowerCase() === "true") {
       return res.status(200).json({ success: true, date, timezone: STUDIO_TZ, say });
@@ -586,6 +612,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
