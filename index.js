@@ -249,10 +249,7 @@ app.all("/mindbody", async (req, res) => {
 
   try {
     /**
-     * ✅✅✅ VAPI BODY UNWRAP FIX (THIS IS THE MISSING STEP)
-     * Vapi sends args nested like:
-     * req.body.message.toolCallList[0].function.arguments
-     * We pull that up so req.body.action exists.
+     * ✅ 1) UNWRAP VAPI TOOLCALL FORMAT (message.toolCallList[0].function.arguments)
      */
     const vapiArgs =
       req.body?.message?.toolCallList?.[0]?.function?.arguments ??
@@ -263,11 +260,22 @@ app.all("/mindbody", async (req, res) => {
     if (vapiArgs) {
       const parsed = typeof vapiArgs === "string" ? safeJsonParse(vapiArgs) : vapiArgs;
       if (parsed && typeof parsed === "object") {
-        req.body = parsed; // <-- makes the rest of your existing code work unchanged
+        req.body = parsed;
       }
     }
 
-    // ✅ now this will work whether it came from Vapi or a normal POST
+    /**
+     * ✅ 2) UNWRAP VAPI "payload" WRAPPER (THIS IS WHY YOU SEE MISSING ACTION)
+     * If Vapi tool schema is { payload: { action, date, ... } }
+     * then action lives at req.body.payload.action, not req.body.action.
+     */
+    if (req.body?.payload && typeof req.body.payload === "object") {
+      // merge payload up, but keep any top-level fields if they exist
+      req.body = { ...req.body.payload, ...req.body };
+      delete req.body.payload;
+    }
+
+    // ✅ now action works from query OR body OR action_type
     let action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
     const paramsFromQuery = { ...(req.query || {}) };
@@ -441,11 +449,6 @@ app.all("/mindbody", async (req, res) => {
     }
 
     if (action === "book_class") {
-      const isNewClient =
-        params.is_new_client === true ||
-        String(params.is_new_client || "").toLowerCase() === "true" ||
-        String(params.is_new_client || "").toLowerCase() === "yes";
-
       let classId = params.class_id || params.classId || null;
 
       if (!classId) {
@@ -468,7 +471,6 @@ app.all("/mindbody", async (req, res) => {
       const email = (params.email || "").toString().trim();
       const phone = normalizePhone(params.mobilephone || params.MobilePhone || params.phone);
 
-      // TODO: (keeping your original search/create logic would go here)
       if (!clientId) {
         return reply(
           {
@@ -525,6 +527,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
