@@ -333,7 +333,9 @@ app.all("/mb/schedule", async (req, res) => {
     });
 
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+    if (wantInstructor) classes = classes.filter((x) =>
+      toLowerClean(x.instructor).includes(wantInstructor)
+    );
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
@@ -348,17 +350,40 @@ app.all("/mb/schedule", async (req, res) => {
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
+    // ✅ NEW: Voice-friendly mode to keep responses tiny (prevents “hang” in Voice AI)
+    // Call with: /mb/schedule?onlySay=1&action=...&date=...&location_id=...
+    const onlySay = String(params.onlySay || "").trim() === "1";
+    if (onlySay) {
+      return res.status(200).json({
+        results: {
+          success: true,
+          date,
+          timezone: "America/Vancouver",
+          say,
+        },
+      });
+    }
+
+    // ✅ NEW: Wrap everything in "results" so GHL can read results.say
     return res.status(200).json({
-      success: true,
-      date,
-      timezone: "America/Vancouver",
-      appliedLocationFilter: resolveLocationQuery(params),
-      classes,
-      say,
-      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params } : undefined,
+      results: {
+        success: true,
+        date,
+        timezone: "America/Vancouver",
+        appliedLocationFilter: resolveLocationQuery(params),
+        classes,
+        say,
+        debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params } : undefined,
+      },
     });
   } catch (e) {
-    return res.status(200).json({ success: false, message: e?.message || "Server error" });
+    // ✅ NEW: Wrap errors in "results" as well
+    return res.status(200).json({
+      results: {
+        success: false,
+        message: e?.message || "Server error",
+      },
+    });
   }
 });
 
@@ -409,7 +434,9 @@ app.all("/mb/book", async (req, res) => {
       body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
     });
 
-    return res.status(200).json({ success: true, booked: true, clientId, classId, raw: DEBUG_MODE ? bookResp : undefined });
+    return res
+      .status(200)
+      .json({ success: true, booked: true, clientId, classId, raw: DEBUG_MODE ? bookResp : undefined });
   } catch (e) {
     return res.status(200).json({ success: false, message: e?.message || "Server error" });
   }
