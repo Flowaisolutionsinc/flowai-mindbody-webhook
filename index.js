@@ -1,5 +1,4 @@
 import express from "express";
-import { DateTime } from "luxon";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -36,17 +35,50 @@ const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * TIME / DATE HELPERS (Luxon-based, reliable)
+ * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
  * ============
+ * ALWAYS return:
+ * {
+ *   success: true/false,
+ *   results: { ... }
+ * }
+ * so Agency Vault can reliably map fields like: results.say
  */
-function todayYYYYMMDD(tz = STUDIO_TZ) {
-  return DateTime.now().setZone(tz).toFormat("yyyy-LL-dd");
+function sendSuccess(res, resultsObj = {}) {
+  return res.status(200).json({ success: true, results: resultsObj });
 }
 
-function addDaysYYYYMMDD(yyyyMmDd, daysToAdd, tz = STUDIO_TZ) {
-  const dt = DateTime.fromFormat(yyyyMmDd, "yyyy-LL-dd", { zone: tz });
-  if (!dt.isValid) return null;
-  return dt.plus({ days: Number(daysToAdd) || 0 }).toFormat("yyyy-LL-dd");
+function sendFail(res, message, extra = {}) {
+  return res.status(200).json({ success: false, results: { message, ...extra } });
+}
+
+/**
+ * ============
+ * TIME / DATE HELPERS
+ * ============
+ */
+function nowInTZDateString(tz = STUDIO_TZ) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const d = parts.find((p) => p.type === "day")?.value;
+  return `${y}-${m}-${d}`;
+}
+
+function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
+  const [y, m, d] = yyyyMmDd.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + daysToAdd);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
 }
 
 const WEEKDAY_MAP = {
@@ -70,94 +102,87 @@ const WEEKDAY_MAP = {
 };
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
-  // 0..6 Sun..Sat
-  const dt = DateTime.now().setZone(tz);
-  // Luxon weekday: 1=Mon..7=Sun -> convert to 0=Sun..6=Sat
-  const lux = dt.weekday; // 1..7
-  return lux === 7 ? 0 : lux; // Mon->1 .. Sat->6, Sun->0
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    weekday: "long",
+  }).formatToParts(new Date());
+  const wd = parts.find((p) => p.type === "weekday")?.value?.toLowerCase();
+  return WEEKDAY_MAP[wd] ?? null;
 }
 
 function looksLikeYYYYMMDD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-function stripOrdinals(s) {
-  return s.replace(/(\d{1,2})(st|nd|rd|th)\b/gi, "$1");
-}
-
 /**
  * Accepts:
  * - "today", "tomorrow"
- * - "friday", "next friday"
+ * - "friday", "next friday", "this friday"
  * - "2026-02-17"
- * - "Feb 21, 2026", "February 21st, 2026", "February 21 2026"
+ * - "February 21st, 2026"
  * Returns: YYYY-MM-DD in studio TZ, or null if cannot parse
  */
 function resolveDateInput(raw, tz = STUDIO_TZ) {
-  if (!raw) return todayYYYYMMDD(tz);
+  if (!raw) return nowInTZDateString(tz);
 
-  let s = String(raw).trim();
-  if (!s) return todayYYYYMMDD(tz);
-
-  const lower = s.toLowerCase();
+  const s0 = String(raw).trim();
+  const s = s0.toLowerCase().trim();
+  if (!s) return nowInTZDateString(tz);
 
   // direct YYYY-MM-DD
-  if (looksLikeYYYYMMDD(lower)) return lower;
+  if (looksLikeYYYYMMDD(s)) return s;
 
   // today / tomorrow
-  if (lower === "today") return todayYYYYMMDD(tz);
-  if (lower === "tomorrow") return addDaysYYYYMMDD(todayYYYYMMDD(tz), 1, tz);
+  if (s === "today") return nowInTZDateString(tz);
+  if (s === "tomorrow") return addDaysYYYYMMDD(nowInTZDateString(tz), 1);
 
-  // Normalize ordinals + commas for month-name parsing
-  const cleaned = stripOrdinals(lower).replace(/,/g, "").replace(/\s+/g, " ").trim();
-
-  // Month-name formats (try a few)
-  // Examples:
-  // "february 21 2026"
-  // "feb 21 2026"
-  const monthNameCandidates = [
-    DateTime.fromFormat(cleaned, "LLLL d yyyy", { zone: tz }), // February 21 2026
-    DateTime.fromFormat(cleaned, "LLL d yyyy", { zone: tz }),  // Feb 21 2026
-    DateTime.fromFormat(cleaned, "LLLL d", { zone: tz }),      // February 21 (assume current year)
-    DateTime.fromFormat(cleaned, "LLL d", { zone: tz }),       // Feb 21 (assume current year)
-  ];
-
-  for (const dt of monthNameCandidates) {
-    if (dt.isValid) {
-      const withYear = dt.year ? dt : dt.set({ year: DateTime.now().setZone(tz).year });
-      return withYear.toFormat("yyyy-LL-dd");
-    }
-  }
-
-  // next friday / friday etc.
-  const nextPrefix = lower.startsWith("next ");
-  const weekdayToken = nextPrefix ? lower.slice(5).trim() : lower;
+  // "this friday" -> treat as friday (same-week)
+  const thisPrefix = s.startsWith("this ");
+  const nextPrefix = s.startsWith("next ");
+  const weekdayToken = nextPrefix ? s.slice(5).trim() : thisPrefix ? s.slice(5).trim() : s;
 
   if (WEEKDAY_MAP[weekdayToken] !== undefined) {
     const todayIdx = tzWeekdayIndex(tz);
-    const targetIdx = WEEKDAY_MAP[weekdayToken];
+    if (todayIdx === null) return null;
 
+    const targetIdx = WEEKDAY_MAP[weekdayToken];
     let delta = (targetIdx - todayIdx + 7) % 7;
 
-    // If they say "Friday" and today is Friday, assume TODAY.
-    // If they say "next Friday", force next week.
     if (nextPrefix) {
       if (delta === 0) delta = 7;
       else delta += 7;
     }
+    // "this friday" behaves like regular "friday" (delta 0..6)
 
-    return addDaysYYYYMMDD(todayYYYYMMDD(tz), delta, tz);
+    return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
-  // "the 17th" (basic support)
-  const m = lower.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
+  // Parse long-form date like "February 21st, 2026"
+  // Remove ordinal suffixes: 1st/2nd/3rd/4th etc.
+  const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
+  const parsed = new Date(cleaned);
+  if (!Number.isNaN(parsed.getTime())) {
+    // Convert parsed date into YYYY-MM-DD in studio tz by formatting parts
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(parsed);
+
+    const y = parts.find((p) => p.type === "year")?.value;
+    const m = parts.find((p) => p.type === "month")?.value;
+    const d = parts.find((p) => p.type === "day")?.value;
+    if (y && m && d) return `${y}-${m}-${d}`;
+  }
+
+  // If caller says "the 17th"
+  const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
-    const day = Number(m[1]);
-    if (day >= 1 && day <= 31) {
-      const now = DateTime.now().setZone(tz);
-      const dt = DateTime.fromObject({ year: now.year, month: now.month, day }, { zone: tz });
-      if (dt.isValid) return dt.toFormat("yyyy-LL-dd");
-    }
+    const today = nowInTZDateString(tz);
+    const [yy, mm] = today.split("-");
+    const dd = String(Number(m[1])).padStart(2, "0");
+    return `${yy}-${mm}-${dd}`;
   }
 
   return null;
@@ -244,7 +269,6 @@ function resolveLocationQuery(params) {
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
-  // Support "LocationIds" Mindbody query key
   if (locationIds) return { LocationIds: locationIds };
   if (locationId) return { LocationIds: locationId };
 
@@ -335,7 +359,7 @@ function getIncomingParams(req) {
  */
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 app.get("/health", (req, res) => {
-  res.status(200).json({
+  return sendSuccess(res, {
     ok: true,
     envDetected: {
       hasSiteId: Boolean(siteId),
@@ -365,18 +389,9 @@ app.all("/mb/locations", async (req, res) => {
   try {
     const data = await mbFetch("/site/locations", { method: "GET" });
     const locations = normalizeArray(data, ["Locations", "locations"]);
-    return res.status(200).json({
-      success: true,
+
+    return sendSuccess(res, {
       count: locations.length,
-      results: {
-        locations: locations.map((l) => ({
-          id: l.Id ?? l.LocationId ?? null,
-          name: l.Name ?? l.LocationName ?? null,
-          address: l.Address ?? null,
-          city: l.City ?? null,
-          stateProv: l.StateProvCode ?? l.State ?? null,
-        })),
-      },
       locations: locations.map((l) => ({
         id: l.Id ?? l.LocationId ?? null,
         name: l.Name ?? l.LocationName ?? null,
@@ -386,11 +401,11 @@ app.all("/mb/locations", async (req, res) => {
       })),
     });
   } catch (e) {
-    return res.status(200).json({ success: false, results: { say: e?.message || "Server error" }, message: e?.message || "Server error" });
+    return sendFail(res, e?.message || "Server error");
   }
 });
 
-// 2) SCHEDULE
+// 2) SCHEDULE (date can be "Friday", "next Friday", "today", etc.)
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/schedule", { url: req.originalUrl, params });
@@ -400,13 +415,10 @@ app.all("/mb/schedule", async (req, res) => {
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
 
     if (!date) {
-      const msg =
-        "Could not understand the requested date. Please say a weekday (Friday), 'next Friday', 'today', 'tomorrow', or a date like 2026-02-21.";
-      return res.status(200).json({
-        success: false,
-        message: msg,
-        results: { say: msg },
+      return sendFail(res, "Could not understand the requested date.", {
         received: { date: rawDateInput },
+        hint:
+          "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
       });
     }
 
@@ -477,40 +489,25 @@ app.all("/mb/schedule", async (req, res) => {
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    const onlySay = String(params.onlySay || params.only_say || "").trim();
-    const payload = {
-      success: true,
+    // Always return results.say so Agency Vault mapping works
+    const resultPayload = {
       date,
       timezone: STUDIO_TZ,
       appliedLocationFilter: resolveLocationQuery(params),
-      classes,
       say,
-      // IMPORTANT: Always provide results.say for AgencyVault mapping
-      results: {
-        date,
-        timezone: STUDIO_TZ,
-        say,
-        classes,
-      },
-      debug: DEBUG_MODE
-        ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput }
-        : undefined,
+      classes,
+      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
     };
 
-    if (onlySay === "1" || onlySay.toLowerCase() === "true") {
-      return res.status(200).json({
-        success: true,
-        date,
-        timezone: STUDIO_TZ,
-        say,
-        results: { say, date, timezone: STUDIO_TZ },
-      });
+    // If onlySay=1 -> still keep results.say (optionally skip classes for speed)
+    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
+    if (onlySay === "1" || onlySay === "true") {
+      return sendSuccess(res, { date, timezone: STUDIO_TZ, say });
     }
 
-    return res.status(200).json(payload);
+    return sendSuccess(res, resultPayload);
   } catch (e) {
-    const msg = e?.message || "Server error";
-    return res.status(200).json({ success: false, message: msg, results: { say: msg } });
+    return sendFail(res, e?.message || "Server error");
   }
 });
 
@@ -533,14 +530,9 @@ app.all("/mb/pricing", async (req, res) => {
     const contracts =
       contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    return res.status(200).json({
-      success: true,
-      offers: { services, packages, contracts },
-      results: { offers: { services, packages, contracts } },
-    });
+    return sendSuccess(res, { offers: { services, packages, contracts } });
   } catch (e) {
-    const msg = e?.message || "Server error";
-    return res.status(200).json({ success: false, message: msg, results: { say: msg } });
+    return sendFail(res, e?.message || "Server error");
   }
 });
 
@@ -551,39 +543,30 @@ app.all("/mb/book", async (req, res) => {
 
   try {
     const classId = params.class_id || params.classId;
-    if (!classId) {
-      return res.status(200).json({ success: false, message: "Missing class_id", results: { say: "Missing class_id" } });
-    }
+    if (!classId) return sendFail(res, "Missing class_id");
 
     const clientId = params.client_id || params.clientId;
-    if (!clientId) {
-      return res
-        .status(200)
-        .json({ success: false, message: "Missing client_id (existing client required)", results: { say: "Missing client_id (existing client required)" } });
-    }
+    if (!clientId) return sendFail(res, "Missing client_id (existing client required)");
 
     const bookResp = await mbFetch("/class/addclienttoclass", {
       method: "POST",
       body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
     });
 
-    return res.status(200).json({
-      success: true,
+    return sendSuccess(res, {
       booked: true,
       clientId,
       classId,
-      results: { booked: true, clientId, classId },
       raw: DEBUG_MODE ? bookResp : undefined,
     });
   } catch (e) {
-    const msg = e?.message || "Server error";
-    return res.status(200).json({ success: false, message: msg, results: { say: msg } });
+    return sendFail(res, e?.message || "Server error");
   }
 });
 
 /**
  * ============
- * LEGACY ENDPOINT (optional)
+ * LEGACY ENDPOINT
  * ============
  */
 app.all("/mindbody", async (req, res) => {
@@ -592,31 +575,35 @@ app.all("/mindbody", async (req, res) => {
   console.log("HIT /mindbody", { url: req.originalUrl, params, action });
 
   if (!action) {
-    return res.status(200).json({
-      success: false,
-      message: "Missing action.",
-      results: { say: "Missing action." },
+    return sendFail(res, "Missing action.", {
       receivedQuery: req.query || {},
       receivedBody: req.body || {},
       receivedParams: params,
     });
   }
 
-  if (action === "get_locations") return res.redirect(307, "/mb/locations");
-  if (action === "get_today_schedule") return res.redirect(307, "/mb/schedule");
-  if (action === "get_pricing_offers") return res.redirect(307, "/mb/pricing");
-  if (action === "book_class") return res.redirect(307, "/mb/book");
+  if (action === "get_locations") {
+    req.url = "/mb/locations";
+    return app._router.handle(req, res);
+  }
+  if (action === "get_today_schedule") {
+    req.url = "/mb/schedule";
+    return app._router.handle(req, res);
+  }
+  if (action === "get_pricing_offers") {
+    req.url = "/mb/pricing";
+    return app._router.handle(req, res);
+  }
+  if (action === "book_class") {
+    req.url = "/mb/book";
+    return app._router.handle(req, res);
+  }
 
-  return res.status(200).json({ success: false, message: `Unknown action: ${action}`, results: { say: `Unknown action: ${action}` }, receivedParams: params });
+  return sendFail(res, `Unknown action: ${action}`, { receivedParams: params });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
-
-
-
-
 
 
 
