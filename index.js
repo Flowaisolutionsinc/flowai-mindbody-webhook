@@ -27,7 +27,7 @@ app.use((req, res, next) => {
  *
  * Optional:
  * - MINDBODY_BASE_URL (default below)
- * - MINDBODY_DEFAULT_LOCATION_ID (single numeric id)   <-- set this to 1 for Roundhouse
+ * - MINDBODY_DEFAULT_LOCATION_ID (single numeric id)
  * - MINDBODY_DEFAULT_LOCATION_IDS (comma-separated ids like "1,2,3")
  * - DEBUG_MODE ("true" to enable extra debug responses)
  */
@@ -89,6 +89,11 @@ function normalizePhone(phone) {
   return String(phone).trim();
 }
 
+function digitsOnly(phone) {
+  if (!phone) return "";
+  return String(phone).replace(/[^\d]/g, "");
+}
+
 /**
  * IMPORTANT: Mindbody often returns date-times WITHOUT timezone offset (ex: "2026-02-12T20:00:00")
  * If we use new Date() on that in a server running UTC, times shift and won't match the website.
@@ -145,8 +150,7 @@ function extractCapacityInfo(c) {
   const spotsAvailable =
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
-  const isWaitlistAvailable =
-    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+  const isWaitlistAvailable = c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
 
   return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
@@ -210,6 +214,138 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 }
 
 /**
+ * =========================
+ * CLIENT FIND/CREATE HELPERS
+ * =========================
+ * Goal: if client_id not provided, locate by email (preferred) then phone, else create client.
+ */
+async function mbFindClientBySearchText(searchText) {
+  if (!searchText) return null;
+  const resp = await mbFetch("/client/clients", {
+    method: "GET",
+    query: {
+      SearchText: searchText,
+      PageSize: 10,
+      CurrentPageIndex: 0,
+    },
+  });
+
+  const clients = normalizeArray(resp, ["Clients", "clients"]);
+  if (!clients.length) return null;
+
+  // pick the best-looking id field
+  const first = clients[0];
+  const id =
+    first.Id ??
+    first.ClientId ??
+    first.UniqueId ??
+    first?.Client?.Id ??
+    first?.Client?.ClientId ??
+    null;
+
+  return id ? String(id) : null;
+}
+
+async function mbCreateClient({ firstName, lastName, email, phone }) {
+  // Mindbody may accept either flat fields OR a nested Client object depending on account/config.
+  // We'll try flat first, then fallback to nested.
+  const flatBody = {
+    FirstName: firstName,
+    LastName: lastName,
+    Email: email || undefined,
+    MobilePhone: phone || undefined,
+  };
+
+  try {
+    const created = await mbFetch("/client/addclient", {
+      method: "POST",
+      body: flatBody,
+    });
+
+    // try common return shapes
+    const id =
+      created?.Client?.Id ??
+      created?.Client?.ClientId ??
+      created?.ClientId ??
+      created?.Id ??
+      created?.UniqueId ??
+      null;
+
+    if (!id) throw new Error(`Client created but no id returned: ${JSON.stringify(created).slice(0, 600)}`);
+    return String(id);
+  } catch (e1) {
+    // fallback attempt: nested shape
+    const nestedBody = {
+      Client: {
+        FirstName: firstName,
+        LastName: lastName,
+        Email: email || undefined,
+        MobilePhone: phone || undefined,
+      },
+    };
+
+    const created2 = await mbFetch("/client/addclient", {
+      method: "POST",
+      body: nestedBody,
+    });
+
+    const id2 =
+      created2?.Client?.Id ??
+      created2?.Client?.ClientId ??
+      created2?.ClientId ??
+      created2?.Id ??
+      created2?.UniqueId ??
+      null;
+
+    if (!id2) {
+      throw new Error(
+        `Client create failed. First error: ${e1?.message || e1}. Second response: ${JSON.stringify(created2).slice(0, 600)}`
+      );
+    }
+    return String(id2);
+  }
+}
+
+async function mbFindOrCreateClient({ firstName, lastName, email, phone }) {
+  const cleanEmail = (email || "").toString().trim();
+  const cleanPhone = normalizePhone(phone);
+  const phoneDigits = digitsOnly(cleanPhone);
+
+  // 1) email search (preferred)
+  if (cleanEmail) {
+    const foundByEmail = await mbFindClientBySearchText(cleanEmail);
+    if (foundByEmail) return { clientId: foundByEmail, created: false, matchedOn: "email" };
+  }
+
+  // 2) phone search (digits)
+  if (phoneDigits) {
+    const foundByPhone = await mbFindClientBySearchText(phoneDigits);
+    if (foundByPhone) return { clientId: foundByPhone, created: false, matchedOn: "phone" };
+  }
+
+  // 3) create client (needs names)
+  const fn = (firstName || "").toString().trim();
+  const ln = (lastName || "").toString().trim();
+  if (!fn || !ln) {
+    return {
+      clientId: null,
+      created: false,
+      matchedOn: null,
+      error: "Missing first/last name to create a new client.",
+    };
+  }
+
+  const createdId = await mbCreateClient({
+    firstName: fn,
+    lastName: ln,
+    email: cleanEmail || undefined,
+    phone: cleanPhone || undefined,
+  });
+
+  return { clientId: createdId, created: true, matchedOn: "created" };
+}
+
+/**
  * ============
  * HEALTH CHECKS
  * ============
@@ -250,13 +386,10 @@ app.all("/mindbody", async (req, res) => {
 
   try {
     /**
-     * ✅✅✅ ACCEPT ALL VAPI SHAPES (THIS IS THE FIX)
-     *
-     * We support:
-     * 1) Normal: { action, date, ... }
-     * 2) Payload-wrapped: { payload: { action, ... } }
-     * 3) Vapi wrapper:
-     *    { message: { toolCallList: [ { function: { arguments: { action, ... }}}]}}
+     * ✅ VAPI BODY UNWRAP FIX
+     * If Vapi sends args nested like:
+     * req.body.message.toolCallList[0].function.arguments
+     * We pull that up so req.body.action exists.
      */
     const vapiArgs =
       req.body?.message?.toolCallList?.[0]?.function?.arguments ??
@@ -267,14 +400,10 @@ app.all("/mindbody", async (req, res) => {
     if (vapiArgs) {
       const parsed = typeof vapiArgs === "string" ? safeJsonParse(vapiArgs) : vapiArgs;
       if (parsed && typeof parsed === "object") {
-        req.body = parsed;
+        req.body = parsed; // makes the rest work unchanged
       }
-    } else if (req.body?.payload && typeof req.body.payload === "object") {
-      // If Vapi sends { payload: {...} }
-      req.body = req.body.payload;
     }
 
-    // ✅ now this works for query OR body OR body.action_type
     let action = req.query?.action || req.body?.action || req.body?.action_type || "";
 
     const paramsFromQuery = { ...(req.query || {}) };
@@ -387,10 +516,8 @@ app.all("/mindbody", async (req, res) => {
       });
 
       if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-      if (wantInstructor)
-        classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-      if (wantTimeRange)
-        classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
+      if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+      if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
       if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
       classes = classes.map(({ _timeBucket, ...rest }) => rest);
@@ -403,9 +530,7 @@ app.all("/mindbody", async (req, res) => {
               .slice(0, 10)
               .map(
                 (c, i) =>
-                  `${i + 1}) ${c.startTimeLocal || ""} — ${c.name}${
-                    c.instructor ? ` with ${c.instructor}` : ""
-                  }`
+                  `${i + 1}) ${c.startTimeLocal || ""} — ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`
               )
               .join(" ");
 
@@ -456,7 +581,6 @@ app.all("/mindbody", async (req, res) => {
 
     if (action === "book_class") {
       let classId = params.class_id || params.classId || null;
-
       if (!classId) {
         return reply(
           {
@@ -470,24 +594,33 @@ app.all("/mindbody", async (req, res) => {
         );
       }
 
+      // client_id optional now (we will find/create if missing)
       let clientId = params.client_id || params.clientId || null;
 
-      const first = (params.client_first_name || "").toString().trim();
-      const last = (params.client_last_name || "").toString().trim();
+      const firstName = (params.client_first_name || params.first_name || params.firstName || "").toString().trim();
+      const lastName = (params.client_last_name || params.last_name || params.lastName || "").toString().trim();
       const email = (params.email || "").toString().trim();
       const phone = normalizePhone(params.mobilephone || params.MobilePhone || params.phone);
 
+      // If no client_id, find or create (email -> phone -> create)
+      let clientMeta = null;
       if (!clientId) {
-        return reply(
-          {
-            success: false,
-            actionReceived: action,
-            message:
-              "Missing client_id. For now pass client_id (or we can re-add the client search/create block once schedule is stable).",
-            paramsReceived: { first, last, email, phone },
-          },
-          400
-        );
+        const result = await mbFindOrCreateClient({ firstName, lastName, email, phone });
+        if (!result.clientId) {
+          return reply(
+            {
+              success: false,
+              actionReceived: action,
+              message:
+                result.error ||
+                "Missing client_id and unable to find/create client. Provide email or phone (preferred) plus first/last name for new clients.",
+              paramsReceived: { firstName, lastName, email, phone },
+            },
+            400
+          );
+        }
+        clientId = result.clientId;
+        clientMeta = { created: result.created, matchedOn: result.matchedOn };
       }
 
       const bookResp = await mbFetch("/class/addclienttoclass", {
@@ -506,6 +639,7 @@ app.all("/mindbody", async (req, res) => {
           booked: true,
           clientId,
           classId,
+          client: clientMeta || undefined,
           raw: DEBUG_MODE ? bookResp : undefined,
         },
         200
@@ -533,6 +667,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
