@@ -1,11 +1,12 @@
-{
-import express from "express";
+// index.js (CommonJS) — Flow AI Mindbody Webhook (stable for Railway)
+
+const express = require("express");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * --- CORS / Preflight ---
+ * --- CORS / Preflight (helps dashboards + browsers) ---
  */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -23,12 +24,12 @@ app.use((req, res, next) => {
 const MINDBODY_BASE_URL =
   process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
 
-const siteId = process.env.MINDBODY_SITE_ID || "";
-const apiKey = process.env.MINDBODY_API_KEY || "";
-const sourceName = process.env.MINDBODY_SOURCE_NAME || "";
-const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
+const siteId = (process.env.MINDBODY_SITE_ID || "").trim();
+const apiKey = (process.env.MINDBODY_API_KEY || "").trim();
+const sourceName = (process.env.MINDBODY_SOURCE_NAME || "").trim();
+const sourcePassword = (process.env.MINDBODY_SOURCE_PASSWORD || "").trim();
 
-const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "1").trim();
+const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
@@ -36,24 +37,26 @@ const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE SHAPE (IMPORTANT)
+ * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
  * ============
- * DO NOT return a nested "results" object.
- * Return top-level keys like:
- * { success:true, say:"..." }
+ * ✅ Your server returns:
+ * { success: true, say: "..." }
  *
- * The voice platform wraps it into: results.say
+ * Agency Vault wraps into its own "results" object,
+ * so the action output becomes selectable as:
+ *   results.say
  */
 function sendSuccess(res, payload = {}) {
   return res.status(200).json({ success: true, ...payload });
 }
+
 function sendFail(res, message, extra = {}) {
   return res.status(200).json({ success: false, message, ...extra });
 }
 
 /**
  * ============
- * TIME / DATE HELPERS
+ * DATE/TIME HELPERS
  * ============
  */
 function nowInTZDateString(tz = STUDIO_TZ) {
@@ -81,23 +84,13 @@ function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
 }
 
 const WEEKDAY_MAP = {
-  sunday: 0,
-  sun: 0,
-  monday: 1,
-  mon: 1,
-  tuesday: 2,
-  tue: 2,
-  tues: 2,
-  wednesday: 3,
-  wed: 3,
-  thursday: 4,
-  thu: 4,
-  thur: 4,
-  thurs: 4,
-  friday: 5,
-  fri: 5,
-  saturday: 6,
-  sat: 6,
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3,
+  thursday: 4, thu: 4, thur: 4, thurs: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
 };
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
@@ -121,7 +114,6 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (!s) return nowInTZDateString(tz);
 
   if (looksLikeYYYYMMDD(s)) return s;
-
   if (s === "today") return nowInTZDateString(tz);
   if (s === "tomorrow") return addDaysYYYYMMDD(nowInTZDateString(tz), 1);
 
@@ -136,13 +128,15 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     const targetIdx = WEEKDAY_MAP[weekdayToken];
     let delta = (targetIdx - todayIdx + 7) % 7;
 
-    // "next Friday" means +7 if already Friday, otherwise next week's Friday
-    if (nextPrefix) delta = delta === 0 ? 7 : delta + 7;
-
+    // next Friday means "the Friday after this upcoming one"
+    if (nextPrefix) {
+      if (delta === 0) delta = 7;
+      delta += 7;
+    }
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
-  // Try parsing "Feb 21", "February 21 2026", etc.
+  // remove suffixes like 17th -> 17
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -159,7 +153,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     if (y && m && d) return `${y}-${m}-${d}`;
   }
 
-  // "the 17th"
+  // “the 17th”
   const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const today = nowInTZDateString(tz);
@@ -189,10 +183,6 @@ function normalizeArray(payload, keys = []) {
   return [];
 }
 
-function toLowerClean(x) {
-  return (x ?? "").toString().toLowerCase().trim();
-}
-
 function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
@@ -215,18 +205,30 @@ function format12h(hour, minute) {
   return `${hr}:${mm} ${ampm}`;
 }
 
-function timeBucketFromHour(hour) {
-  if (!Number.isFinite(hour)) return null;
-  if (hour < 12) return "morning";
-  if (hour < 17) return "afternoon";
-  return "evening";
-}
-
 function localDayRange(dateStr) {
   return {
     startLocal: `${dateStr}T00:00:00`,
     endLocal: `${dateStr}T23:59:59`,
   };
+}
+
+function extractCapacityInfo(c) {
+  const candidatesCapacity = [c.MaxCapacity, c.WebCapacity, c.Capacity, c.ClassCapacity];
+  const candidatesBooked = [c.TotalBooked, c.Visits, c.TotalBookedClients, c.Booked, c.NumBooked];
+
+  const capacity = candidatesCapacity.find((v) => Number.isFinite(Number(v)));
+  const booked = candidatesBooked.find((v) => Number.isFinite(Number(v)));
+
+  const capNum = capacity !== undefined ? Number(capacity) : null;
+  const bookedNum = booked !== undefined ? Number(booked) : null;
+
+  const spotsAvailable =
+    capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
+
+  const isWaitlistAvailable =
+    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+
+  return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
 
 function resolveLocationQuery(params) {
@@ -288,7 +290,11 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 }
 
 /**
- * Pull params from query OR body OR nested tool-call arguments
+ * Agency Vault / Voice platforms often send args nested.
+ * This pulls params from:
+ * - query
+ * - body
+ * - body.message.toolCallList[0].function.arguments (stringified JSON)
  */
 function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
@@ -321,9 +327,10 @@ function getIncomingParams(req) {
  */
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 
-app.get("/health", (req, res) => {
+app.all("/health", (req, res) => {
   return sendSuccess(res, {
     ok: true,
+    say: "", // keep present (some UIs list it)
     envDetected: {
       hasSiteId: Boolean(siteId),
       hasApiKey: Boolean(apiKey),
@@ -340,16 +347,39 @@ app.get("/health", (req, res) => {
 
 /**
  * ============
- * SCHEDULE (GET or POST)
+ * ENDPOINTS
  * ============
- * Inputs:
- * - date: "today" | "tomorrow" | "Friday" | "2026-02-17" | "Feb 21" | "the 17th"
- * - location_id: "1" etc
- * - onlySay: "1" to return only {say,date,timezone}
  */
+
+// 1) LOCATIONS
+app.all("/mb/locations", async (req, res) => {
+  const params = getIncomingParams(req);
+  console.log("HIT /mb/locations", { path: "/mb/locations", url: req.originalUrl, params });
+
+  try {
+    const data = await mbFetch("/site/locations", { method: "GET" });
+    const locations = normalizeArray(data, ["Locations", "locations"]);
+
+    return sendSuccess(res, {
+      count: locations.length,
+      locations: locations.map((l) => ({
+        id: l.Id ?? l.LocationId ?? null,
+        name: l.Name ?? l.LocationName ?? null,
+        address: l.Address ?? null,
+        city: l.City ?? null,
+        stateProv: l.StateProvCode ?? l.State ?? null,
+      })),
+    });
+  } catch (e) {
+    return sendFail(res, e?.message || "Server error");
+  }
+});
+
+// 2) SCHEDULE (GET or POST)
+// Returns a clean "say" string for voice
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
-  console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
+  console.log("HIT /mb/schedule", { path: "/mb/schedule", url: req.originalUrl, params });
 
   try {
     const rawDateInput = params.date || params.day || params.requested_day || params.requestedDate;
@@ -357,15 +387,12 @@ app.all("/mb/schedule", async (req, res) => {
 
     if (!date) {
       return sendFail(res, "Could not understand the requested date.", {
+        say: "Sorry — I couldn’t understand that date. Can you say it like today, tomorrow, or Friday?",
         received: { date: rawDateInput },
-        hint:
-          "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
       });
     }
 
     const { startLocal, endLocal } = localDayRange(date);
-
-    // Allow caller to pass location_id; fallback to DEFAULT_LOCATION_ID
     const locationQuery = resolveLocationQuery(params);
 
     const data = await mbFetch("/class/classes", {
@@ -375,17 +402,10 @@ app.all("/mb/schedule", async (req, res) => {
 
     const classesRaw = normalizeArray(data, ["Classes", "classes"]);
 
-    // Optional filters
-    const wantType = toLowerClean(params.class_type || params.class_name);
-    const wantInstructor = toLowerClean(params.instructor_name);
-    const wantTimeRange = toLowerClean(params.time_range);
-    const wantTime = toLowerClean(params.time);
-
     let classes = classesRaw.map((c) => {
       const classId = c.Id ?? c.ClassId ?? null;
       const name = c.ClassDescription?.Name ?? c.Name ?? "Class";
       const startDateTime = c.StartDateTime ?? null;
-      const endDateTime = c.EndDateTime ?? null;
 
       let instructor = c.Staff?.Name ?? c.InstructorName ?? null;
       if (!instructor && c.Staff) {
@@ -394,48 +414,112 @@ app.all("/mb/schedule", async (req, res) => {
         instructor = [first, last].filter(Boolean).join(" ").trim() || null;
       }
 
+      const cap = extractCapacityInfo(c);
       const st = parseNaiveISO(startDateTime);
       const startTimeLocal = st ? format12h(st.hour, st.minute) : null;
-      const bucket = st ? timeBucketFromHour(st.hour) : null;
 
       return {
         classId,
         name,
         startDateTime,
-        endDateTime,
         startTimeLocal,
         instructor,
-        _timeBucket: bucket,
+        capacity: cap.capacity,
+        booked: cap.booked,
+        spotsAvailable: cap.spotsAvailable,
+        isWaitlistAvailable: cap.isWaitlistAvailable,
       };
     });
 
-    if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-    if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
-    if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
+    // Optional filters (kept for future)
+    const wantType = (params.class_type || params.class_name || "").toString().toLowerCase().trim();
+    const wantInstructor = (params.instructor_name || "").toString().toLowerCase().trim();
+    const wantTime = (params.time || "").toString().toLowerCase().trim();
 
-    classes = classes.map(({ _timeBucket, ...rest }) => rest);
+    if (wantType) classes = classes.filter((x) => (x.name || "").toLowerCase().includes(wantType));
+    if (wantInstructor)
+      classes = classes.filter((x) => (x.instructor || "").toLowerCase().includes(wantInstructor));
+    if (wantTime)
+      classes = classes.filter((x) => (x.startTimeLocal || "").toLowerCase().includes(wantTime));
 
     const say =
       classes.length === 0
         ? `No classes found for ${date}.`
         : `Classes for ${date}: ` +
           classes
-            .slice(0, 25)
+            .slice(0, 20)
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
     const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
     if (onlySay === "1" || onlySay === "true") {
-      return sendSuccess(res, { say, date, timezone: STUDIO_TZ });
+      // Keep BOTH say + text for maximum UI compatibility
+      return sendSuccess(res, { date, timezone: STUDIO_TZ, say, text: say });
     }
 
     return sendSuccess(res, {
-      say,
       date,
       timezone: STUDIO_TZ,
+      appliedLocationFilter: locationQuery,
+      say,
+      text: say,
       classes,
       debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
+    });
+  } catch (e) {
+    return sendFail(res, e?.message || "Server error", {
+      say: "Sorry — I’m having trouble pulling the live schedule right now. Want me to connect you with the front desk?",
+    });
+  }
+});
+
+// 3) PRICING
+app.all("/mb/pricing", async (req, res) => {
+  const params = getIncomingParams(req);
+  console.log("HIT /mb/pricing", { path: "/mb/pricing", url: req.originalUrl, params });
+
+  try {
+    const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
+      mbFetch("/sale/services", { method: "GET" }),
+      mbFetch("/sale/packages", { method: "GET" }),
+      mbFetch("/sale/contracts", { method: "GET" }),
+    ]);
+
+    const services =
+      servicesResp.status === "fulfilled" ? normalizeArray(servicesResp.value, ["Services", "services"]) : [];
+    const packages =
+      packagesResp.status === "fulfilled" ? normalizeArray(packagesResp.value, ["Packages", "packages"]) : [];
+    const contracts =
+      contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
+
+    return sendSuccess(res, { offers: { services, packages, contracts } });
+  } catch (e) {
+    return sendFail(res, e?.message || "Server error");
+  }
+});
+
+// 4) BOOK (existing client only for now)
+app.all("/mb/book", async (req, res) => {
+  const params = getIncomingParams(req);
+  console.log("HIT /mb/book", { path: "/mb/book", url: req.originalUrl, params });
+
+  try {
+    const classId = params.class_id || params.classId;
+    if (!classId) return sendFail(res, "Missing class_id");
+
+    const clientId = params.client_id || params.clientId;
+    if (!clientId) return sendFail(res, "Missing client_id (existing client required)");
+
+    const bookResp = await mbFetch("/class/addclienttoclass", {
+      method: "POST",
+      body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
+    });
+
+    return sendSuccess(res, {
+      booked: true,
+      clientId,
+      classId,
+      raw: DEBUG_MODE ? bookResp : undefined,
     });
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
@@ -443,4 +527,5 @@ app.all("/mb/schedule", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log(`Server listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
