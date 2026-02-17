@@ -36,23 +36,46 @@ const STUDIO_TZ = process.env.TZ || "America/Vancouver";
 
 /**
  * ============
- * RESPONSE SHAPE (IMPORTANT)
+ * RESPONSE SHAPE
  * ============
- * IMPORTANT: Return FLAT JSON from webhook.
- * The Custom Action system will wrap this under "results".
+ * We return BOTH:
+ *  - top-level say/text/classes (so Custom Action can map results.say)
+ *  - nested results.say/text/classes (for backward compatibility)
  *
- * So you want your fields to appear as:
- *   results.say
- *   results.classes[]
- * not:
- *   results.results.say
+ * Final JSON:
+ * {
+ *   success: true,
+ *   say: "...",          <-- TOP LEVEL (platform exposes as results.say)
+ *   text: "...",
+ *   classes: [...],
+ *   results: { ... }     <-- nested copy for legacy
+ * }
  */
-function sendSuccess(res, payload = {}) {
-  return res.status(200).json(payload);
+function sendSuccess(res, resultsObj = {}) {
+  const say = resultsObj?.say ?? resultsObj?.text ?? "";
+  const text = resultsObj?.text ?? resultsObj?.say ?? "";
+  const classes = resultsObj?.classes ?? undefined;
+
+  return res.status(200).json({
+    success: true,
+
+    // TOP-LEVEL fields (Custom Action sees these as results.say, results.classes, etc.)
+    say,
+    text,
+    ...(classes !== undefined ? { classes } : {}),
+
+    // Legacy nested results
+    results: resultsObj,
+  });
 }
 
 function sendFail(res, message, extra = {}) {
-  return res.status(200).json({ success: false, message, ...extra });
+  return res.status(200).json({
+    success: false,
+    say: message,
+    text: message,
+    results: { message, ...extra },
+  });
 }
 
 /**
@@ -343,10 +366,8 @@ function getIncomingParams(req) {
  * ============
  */
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
-
 app.get("/health", (req, res) => {
   return sendSuccess(res, {
-    success: true,
     ok: true,
     envDetected: {
       hasSiteId: Boolean(siteId),
@@ -378,7 +399,6 @@ app.all("/mb/locations", async (req, res) => {
     const locations = normalizeArray(data, ["Locations", "locations"]);
 
     return sendSuccess(res, {
-      success: true,
       count: locations.length,
       locations: locations.map((l) => ({
         id: l.Id ?? l.LocationId ?? null,
@@ -481,9 +501,8 @@ app.all("/mb/schedule", async (req, res) => {
     const wantsOnlySay = onlySay === "1" || onlySay === "true" || onlySay === "yes";
 
     const payload = wantsOnlySay
-      ? { success: true, date, timezone: STUDIO_TZ, say, text: say }
+      ? { date, timezone: STUDIO_TZ, say, text: say }
       : {
-          success: true,
           date,
           timezone: STUDIO_TZ,
           appliedLocationFilter: locationQuery,
@@ -520,7 +539,7 @@ app.all("/mb/pricing", async (req, res) => {
     const contracts =
       contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    return sendSuccess(res, { success: true, offers: { services, packages, contracts } });
+    return sendSuccess(res, { offers: { services, packages, contracts } });
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
   }
@@ -544,7 +563,6 @@ app.all("/mb/book", async (req, res) => {
     });
 
     return sendSuccess(res, {
-      success: true,
       booked: true,
       clientId,
       classId,
@@ -595,36 +613,3 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
