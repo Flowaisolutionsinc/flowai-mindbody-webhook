@@ -4,12 +4,13 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * --- CORS / Preflight (helps dashboards + browsers) ---
+ * --- CORS / Preflight ---
  */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -27,7 +28,7 @@ const apiKey = process.env.MINDBODY_API_KEY || "";
 const sourceName = process.env.MINDBODY_SOURCE_NAME || "";
 const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
-const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "1").trim(); // ✅ default to 1
+const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
@@ -37,20 +38,18 @@ const STUDIO_TZ = "America/Vancouver";
  * ============
  * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
  * ============
- * Agency Vault WRAPS your webhook response under `results`.
- * So YOU must return a FLAT object:
- *
- *   { success: true, say: "...", ... }
- *
- * so Agency Vault can map:
- *   results.say
+ * ALWAYS return:
+ * {
+ *   success: true/false,
+ *   results: { ... }   <-- "results.say" must exist when successful
+ * }
  */
-function sendSuccess(res, payload = {}) {
-  return res.status(200).json({ success: true, ...payload });
+function sendSuccess(res, resultsObj = {}) {
+  return res.status(200).json({ success: true, results: resultsObj });
 }
 
 function sendFail(res, message, extra = {}) {
-  return res.status(200).json({ success: false, message, ...extra });
+  return res.status(200).json({ success: false, results: { message, ...extra } });
 }
 
 /**
@@ -83,23 +82,13 @@ function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
 }
 
 const WEEKDAY_MAP = {
-  sunday: 0,
-  sun: 0,
-  monday: 1,
-  mon: 1,
-  tuesday: 2,
-  tue: 2,
-  tues: 2,
-  wednesday: 3,
-  wed: 3,
-  thursday: 4,
-  thu: 4,
-  thur: 4,
-  thurs: 4,
-  friday: 5,
-  fri: 5,
-  saturday: 6,
-  sat: 6,
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3,
+  thursday: 4, thu: 4, thur: 4, thurs: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
 };
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
@@ -203,6 +192,7 @@ function toLowerClean(x) {
   return (x ?? "").toString().toLowerCase().trim();
 }
 
+// Mindbody often returns naive local times "2026-02-15T08:30:00"
 function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
@@ -258,7 +248,6 @@ function extractCapacityInfo(c) {
 }
 
 function resolveLocationQuery(params) {
-  // ✅ Allow overrides, but default to env=1
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
@@ -268,6 +257,7 @@ function resolveLocationQuery(params) {
   if (DEFAULT_LOCATION_IDS) return { LocationIds: DEFAULT_LOCATION_IDS };
   if (DEFAULT_LOCATION_ID) return { LocationIds: DEFAULT_LOCATION_ID };
 
+  // If nothing provided, still allow request to run (Mindbody may default)
   return {};
 }
 
@@ -360,8 +350,8 @@ app.get("/health", (req, res) => {
       hasSourceName: Boolean(sourceName),
       hasSourcePassword: Boolean(sourcePassword),
       baseUrl: MINDBODY_BASE_URL,
-      defaultLocationId: DEFAULT_LOCATION_ID,
-      defaultLocationIds: DEFAULT_LOCATION_IDS,
+      hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
+      hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
       debugMode: DEBUG_MODE,
       tz: STUDIO_TZ,
     },
@@ -410,8 +400,6 @@ app.all("/mb/schedule", async (req, res) => {
     if (!date) {
       return sendFail(res, "Could not understand the requested date.", {
         received: { date: rawDateInput },
-        hint:
-          "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
       });
     }
 
@@ -482,25 +470,32 @@ app.all("/mb/schedule", async (req, res) => {
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    // ✅ Fast path for voice agents / AV: tiny payload
-    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    if (onlySay === "1" || onlySay === "true") {
-      return sendSuccess(res, {
-        date,
-        timezone: STUDIO_TZ,
-        appliedLocationFilter: locationQuery,
-        say, // ✅ this becomes results.say in Agency Vault
-      });
-    }
+    // Support onlySay / only_say / onlysay
+    const onlySayRaw =
+      params.onlySay ?? params.only_say ?? params.onlysay ?? params.onlySAY ?? "";
+    const onlySay = String(onlySayRaw).trim().toLowerCase();
+    const wantsOnlySay = onlySay === "1" || onlySay === "true" || onlySay === "yes";
 
-    return sendSuccess(res, {
-      date,
-      timezone: STUDIO_TZ,
-      appliedLocationFilter: locationQuery,
-      say,     // ✅ results.say
-      classes, // optional bigger payload
-      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
-    });
+    const payload = wantsOnlySay
+      ? { date, timezone: STUDIO_TZ, say, text: say }
+      : {
+          date,
+          timezone: STUDIO_TZ,
+          appliedLocationFilter: locationQuery,
+          say,
+          text: say,
+          classes,
+          debug: DEBUG_MODE
+            ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput }
+            : undefined,
+        };
+
+    // IMPORTANT: keep response stable; DO NOT nest "results" inside results.
+    // Also duplicate say at top-level for compatibility if some mappers look there.
+    const out = { ...payload };
+    out.say = payload.say;
+
+    return sendSuccess(res, out);
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
   }
@@ -531,7 +526,7 @@ app.all("/mb/pricing", async (req, res) => {
   }
 });
 
-// 4) BOOK (kept as-is; you can extend later)
+// 4) BOOK
 app.all("/mb/book", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/book", { url: req.originalUrl, params });
@@ -559,8 +554,47 @@ app.all("/mb/book", async (req, res) => {
   }
 });
 
+/**
+ * ============
+ * LEGACY ENDPOINT
+ * ============
+ */
+app.all("/mindbody", async (req, res) => {
+  const params = getIncomingParams(req);
+  const action = params.action || params.action_type || "";
+  console.log("HIT /mindbody", { url: req.originalUrl, params, action });
+
+  if (!action) {
+    return sendFail(res, "Missing action.", {
+      receivedQuery: req.query || {},
+      receivedBody: req.body || {},
+      receivedParams: params,
+    });
+  }
+
+  if (action === "get_locations") {
+    req.url = "/mb/locations";
+    return app._router.handle(req, res);
+  }
+  if (action === "get_today_schedule") {
+    req.url = "/mb/schedule";
+    return app._router.handle(req, res);
+  }
+  if (action === "get_pricing_offers") {
+    req.url = "/mb/pricing";
+    return app._router.handle(req, res);
+  }
+  if (action === "book_class") {
+    req.url = "/mb/book";
+    return app._router.handle(req, res);
+  }
+
+  return sendFail(res, `Unknown action: ${action}`, { receivedParams: params });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
