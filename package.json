@@ -1,17 +1,16 @@
 {
   "name": "flowai-mindbody-webhook",
   "version": "1.0.0",
-  "description": "Flow AI Mindbody Webhook Server",
-  "main": "index.js",
   "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.19.2"
   }
 }
 
