@@ -37,15 +37,14 @@ const STUDIO_TZ = "America/Vancouver";
  * ============
  * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
  * ============
- * IMPORTANT:
- * We return TOP-LEVEL FIELDS like:
- *   { success: true, say: "...", date: "...", ... }
+ * Agency Vault wraps your entire JSON inside its own `results`.
+ * So DO NOT return a nested `results` object from your server.
  *
- * Agency Vault wraps the response as "results.*" in its UI,
- * so this becomes available as:
- *   results.say
- *   results.date
- * etc.
+ * ✅ Return:
+ * { success: true, say: "...", ... }
+ *
+ * Then Agency Vault field path becomes:
+ * results.say
  */
 function sendSuccess(res, payload = {}) {
   return res.status(200).json({ success: true, ...payload });
@@ -117,14 +116,6 @@ function looksLikeYYYYMMDD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-/**
- * Accepts:
- * - "today", "tomorrow"
- * - "friday", "next friday", "this friday"
- * - "2026-02-17"
- * - "February 21st, 2026"
- * Returns: YYYY-MM-DD in studio TZ, or null if cannot parse
- */
 function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (!raw) return nowInTZDateString(tz);
 
@@ -132,14 +123,11 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   const s = s0.toLowerCase().trim();
   if (!s) return nowInTZDateString(tz);
 
-  // direct YYYY-MM-DD
   if (looksLikeYYYYMMDD(s)) return s;
 
-  // today / tomorrow
   if (s === "today") return nowInTZDateString(tz);
   if (s === "tomorrow") return addDaysYYYYMMDD(nowInTZDateString(tz), 1);
 
-  // "this friday" -> treat as friday (same-week)
   const thisPrefix = s.startsWith("this ");
   const nextPrefix = s.startsWith("next ");
   const weekdayToken = nextPrefix ? s.slice(5).trim() : thisPrefix ? s.slice(5).trim() : s;
@@ -159,7 +147,6 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
-  // Parse long-form date like "February 21st, 2026"
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -176,7 +163,6 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     if (y && m && d) return `${y}-${m}-${d}`;
   }
 
-  // If caller says "the 17th"
   const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const today = nowInTZDateString(tz);
@@ -210,7 +196,6 @@ function toLowerClean(x) {
   return (x ?? "").toString().toLowerCase().trim();
 }
 
-// Mindbody often returns naive local times "2026-02-15T08:30:00"
 function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
@@ -323,11 +308,6 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   return json ?? { raw: text };
 }
 
-/**
- * ============
- * UNIVERSAL PARAMS UNWRAP
- * ============
- */
 function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
   let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
@@ -358,6 +338,7 @@ function getIncomingParams(req) {
  * ============
  */
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
+
 app.get("/health", (req, res) => {
   return sendSuccess(res, {
     ok: true,
@@ -474,8 +455,7 @@ app.all("/mb/schedule", async (req, res) => {
     });
 
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor)
-      classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
@@ -492,15 +472,13 @@ app.all("/mb/schedule", async (req, res) => {
 
     const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
     if (onlySay === "1" || onlySay === "true") {
-      // IMPORTANT: say is TOP LEVEL
       return sendSuccess(res, { date, timezone: STUDIO_TZ, say });
     }
 
-    // IMPORTANT: say is TOP LEVEL
     return sendSuccess(res, {
       date,
       timezone: STUDIO_TZ,
-      appliedLocationFilter: resolveLocationQuery(params),
+      appliedLocationFilter: locationQuery,
       say,
       classes,
       debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
@@ -523,19 +501,12 @@ app.all("/mb/pricing", async (req, res) => {
     ]);
 
     const services =
-      servicesResp.status === "fulfilled"
-        ? normalizeArray(servicesResp.value, ["Services", "services"])
-        : [];
+      servicesResp.status === "fulfilled" ? normalizeArray(servicesResp.value, ["Services", "services"]) : [];
     const packages =
-      packagesResp.status === "fulfilled"
-        ? normalizeArray(packagesResp.value, ["Packages", "packages"])
-        : [];
+      packagesResp.status === "fulfilled" ? normalizeArray(packagesResp.value, ["Packages", "packages"]) : [];
     const contracts =
-      contractsResp.status === "fulfilled"
-        ? normalizeArray(contractsResp.value, ["Contracts", "contracts"])
-        : [];
+      contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    // top-level offers
     return sendSuccess(res, { offers: { services, packages, contracts } });
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
@@ -570,46 +541,9 @@ app.all("/mb/book", async (req, res) => {
   }
 });
 
-/**
- * ============
- * LEGACY ENDPOINT
- * ============
- */
-app.all("/mindbody", async (req, res) => {
-  const params = getIncomingParams(req);
-  const action = params.action || params.action_type || "";
-  console.log("HIT /mindbody", { url: req.originalUrl, params, action });
-
-  if (!action) {
-    return sendFail(res, "Missing action.", {
-      receivedQuery: req.query || {},
-      receivedBody: req.body || {},
-      receivedParams: params,
-    });
-  }
-
-  if (action === "get_locations") {
-    req.url = "/mb/locations";
-    return app._router.handle(req, res);
-  }
-  if (action === "get_today_schedule") {
-    req.url = "/mb/schedule";
-    return app._router.handle(req, res);
-  }
-  if (action === "get_pricing_offers") {
-    req.url = "/mb/pricing";
-    return app._router.handle(req, res);
-  }
-  if (action === "book_class") {
-    req.url = "/mb/book";
-    return app._router.handle(req, res);
-  }
-
-  return sendFail(res, `Unknown action: ${action}`, { receivedParams: params });
-});
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
