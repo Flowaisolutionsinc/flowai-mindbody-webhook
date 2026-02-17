@@ -22,10 +22,10 @@ app.use((req, res, next) => {
 const MINDBODY_BASE_URL =
   process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
 
-const siteId = process.env.MINDBODY_SITE_ID || "";
-const apiKey = process.env.MINDBODY_API_KEY || "";
-const sourceName = process.env.MINDBODY_SOURCE_NAME || "";
-const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
+const siteId = (process.env.MINDBODY_SITE_ID || "").trim();
+const apiKey = (process.env.MINDBODY_API_KEY || "").trim();
+const sourceName = (process.env.MINDBODY_SOURCE_NAME || "").trim();
+const sourcePassword = (process.env.MINDBODY_SOURCE_PASSWORD || "").trim();
 
 const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
@@ -35,86 +35,41 @@ const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
+ * RESPONSE SHAPE (AGENCY VAULT COMPAT)
  * ============
- * AV wraps your response JSON into `results`.
- * So AV should read: results.say
+ * Different tool-runners wrap webhooks differently.
+ * To avoid "hiccup" parsing issues, we return speak text in multiple safe places:
  *
- * We ALWAYS return a top-level `say` (even on failure) so AV can speak reliably.
+ * - say (top-level)
+ * - text (top-level)
+ * - results.say (nested)
+ * - results.text (nested)
+ *
+ * Your prompt already checks results.say, then fallbacks.
  */
-function sendOK(res, payload = {}) {
+function sendSuccess(res, payload = {}) {
   return res.status(200).json({ success: true, ...payload });
 }
 
-function sendSoftFail(res, message, extra = {}) {
-  // Keep HTTP 200 so AV doesn't treat it as a transport error.
-  // Always include `say` so AV can map and your agent can speak something.
-  return res.status(200).json({
-    success: false,
-    say: "Sorry — I’m not able to pull that up on my end right now.",
-    message,
-    ...extra,
-  });
+function sendFail(res, message, extra = {}) {
+  return res.status(200).json({ success: false, message, ...extra });
 }
 
-/**
- * ============
- * SAFE HELPERS
- * ============
- */
-function safeJsonParse(x) {
-  try {
-    return typeof x === "string" ? JSON.parse(x) : x;
-  } catch {
-    return null;
-  }
-}
+function withSpeakFields(payload, sayText) {
+  const say = (sayText || "").toString();
+  const text = say;
 
-function normalizeArray(payload, keys = []) {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  for (const k of keys) {
-    if (Array.isArray(payload[k])) return payload[k];
-  }
-  if (Array.isArray(payload.Results)) return payload.Results;
-  return [];
-}
-
-function toLowerClean(x) {
-  return (x ?? "").toString().toLowerCase().trim();
-}
-
-/**
- * ============
- * INCOMING PARAMS (AV + CURL + BROWSERS)
- * ============
- * Supports:
- * - query params (GET)
- * - JSON body (POST)
- * - nested tool arguments if AV sends them that way
- */
-function getIncomingParams(req) {
-  const q = { ...(req.query || {}) };
-  let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
-
-  const maybeArgs =
-    req.body?.message?.toolCallList?.[0]?.function?.arguments ??
-    req.body?.message?.toolCalls?.[0]?.function?.arguments ??
-    req.body?.toolCallList?.[0]?.function?.arguments ??
-    req.body?.toolCalls?.[0]?.function?.arguments ??
-    null;
-
-  if (maybeArgs) {
-    const parsed = typeof maybeArgs === "string" ? safeJsonParse(maybeArgs) : maybeArgs;
-    if (parsed && typeof parsed === "object") b = { ...b, ...parsed };
-  }
-
-  if (b.params && typeof b.params === "object") {
-    b = { ...b.params, ...b };
-    delete b.params;
-  }
-
-  return { ...q, ...b };
+  // Put speech in multiple predictable places
+  return {
+    ...payload,
+    say,
+    text,
+    results: {
+      ...(payload.results && typeof payload.results === "object" ? payload.results : {}),
+      say,
+      text,
+    },
+  };
 }
 
 /**
@@ -210,7 +165,6 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
-  // Parse "February 19th, 2026", "Feb 19", etc.
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -227,7 +181,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     if (y && m && d) return `${y}-${m}-${d}`;
   }
 
-  // Handle "the 17th"
+  // e.g. "the 17th"
   const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const today = nowInTZDateString(tz);
@@ -239,11 +193,26 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   return null;
 }
 
-function localDayRange(dateStr) {
-  return {
-    startLocal: `${dateStr}T00:00:00`,
-    endLocal: `${dateStr}T23:59:59`,
-  };
+function safeJsonParse(x) {
+  try {
+    return typeof x === "string" ? JSON.parse(x) : x;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeArray(payload, keys = []) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  for (const k of keys) {
+    if (Array.isArray(payload[k])) return payload[k];
+  }
+  if (Array.isArray(payload.Results)) return payload.Results;
+  return [];
+}
+
+function toLowerClean(x) {
+  return (x ?? "").toString().toLowerCase().trim();
 }
 
 function parseNaiveISO(iso) {
@@ -275,6 +244,13 @@ function timeBucketFromHour(hour) {
   return "evening";
 }
 
+function localDayRange(dateStr) {
+  return {
+    startLocal: `${dateStr}T00:00:00`,
+    endLocal: `${dateStr}T23:59:59`,
+  };
+}
+
 function extractCapacityInfo(c) {
   const candidatesCapacity = [c.MaxCapacity, c.WebCapacity, c.Capacity, c.ClassCapacity];
   const candidatesBooked = [c.TotalBooked, c.Visits, c.TotalBookedClients, c.Booked, c.NumBooked];
@@ -288,8 +264,7 @@ function extractCapacityInfo(c) {
   const spotsAvailable =
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
-  const isWaitlistAvailable =
-    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+  const isWaitlistAvailable = c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
 
   return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
@@ -307,11 +282,6 @@ function resolveLocationQuery(params) {
   return {};
 }
 
-/**
- * ============
- * MINDBODY FETCH
- * ============
- */
 async function mbFetch(path, { method = "GET", query, body } = {}) {
   if (!siteId || !apiKey || !sourceName || !sourcePassword) {
     throw new Error(
@@ -357,6 +327,32 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   return json ?? { raw: text };
 }
 
+function getIncomingParams(req) {
+  const q = { ...(req.query || {}) };
+  let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
+
+  // Supports tool-runners that embed function arguments in toolCalls/toolCallList
+  const maybeArgs =
+    req.body?.message?.toolCallList?.[0]?.function?.arguments ??
+    req.body?.message?.toolCalls?.[0]?.function?.arguments ??
+    req.body?.toolCallList?.[0]?.function?.arguments ??
+    req.body?.toolCalls?.[0]?.function?.arguments ??
+    null;
+
+  if (maybeArgs) {
+    const parsed = typeof maybeArgs === "string" ? safeJsonParse(maybeArgs) : maybeArgs;
+    if (parsed && typeof parsed === "object") b = { ...b, ...parsed };
+  }
+
+  // Supports payloads like { params: {...} }
+  if (b.params && typeof b.params === "object") {
+    b = { ...b.params, ...b };
+    delete b.params;
+  }
+
+  return { ...q, ...b };
+}
+
 /**
  * ============
  * HEALTH
@@ -365,7 +361,7 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 
 app.get("/health", (req, res) => {
-  return sendOK(res, {
+  return sendSuccess(res, {
     ok: true,
     envDetected: {
       hasSiteId: Boolean(siteId),
@@ -383,9 +379,11 @@ app.get("/health", (req, res) => {
 
 /**
  * ============
- * 1) LOCATIONS
+ * CLEAN ENDPOINTS
  * ============
  */
+
+// 1) LOCATIONS
 app.all("/mb/locations", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/locations", { method: req.method, url: req.originalUrl, params });
@@ -394,37 +392,28 @@ app.all("/mb/locations", async (req, res) => {
     const data = await mbFetch("/site/locations", { method: "GET" });
     const locations = normalizeArray(data, ["Locations", "locations"]);
 
-    const say =
-      locations.length === 0
-        ? "No locations found."
-        : `Found ${locations.length} locations.`;
-
-    return sendOK(res, {
-      say,
-      count: locations.length,
-      locations: locations.map((l) => ({
-        id: l.Id ?? l.LocationId ?? null,
-        name: l.Name ?? l.LocationName ?? null,
-        address: l.Address ?? null,
-        city: l.City ?? null,
-        stateProv: l.StateProvCode ?? l.State ?? null,
-      })),
-    });
+    return sendSuccess(
+      res,
+      withSpeakFields(
+        {
+          count: locations.length,
+          locations: locations.map((l) => ({
+            id: l.Id ?? l.LocationId ?? null,
+            name: l.Name ?? l.LocationName ?? null,
+            address: l.Address ?? null,
+            city: l.City ?? null,
+            stateProv: l.StateProvCode ?? l.State ?? null,
+          })),
+        },
+        `Found ${locations.length} locations.`
+      )
+    );
   } catch (e) {
-    return sendSoftFail(res, e?.message || "Server error");
+    return sendFail(res, e?.message || "Server error");
   }
 });
 
-/**
- * ============
- * 2) SCHEDULE (AV HARDENED)
- * ============
- * Works for BOTH:
- * - GET /mb/schedule?date=tomorrow&location_id=1&onlySay=1
- * - POST /mb/schedule { "date":"tomorrow","location_id":"1","onlySay":"1" }
- *
- * Always returns top-level `say` (AV reads results.say)
- */
+// 2) SCHEDULE
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
@@ -434,11 +423,19 @@ app.all("/mb/schedule", async (req, res) => {
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
 
     if (!date) {
-      return sendSoftFail(res, "Could not understand the requested date.", {
-        received: { date: rawDateInput },
-        hint:
-          "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
-      });
+      return sendSuccess(
+        res,
+        withSpeakFields(
+          {
+            success: false,
+            message: "Could not understand the requested date.",
+            received: { date: rawDateInput },
+            hint:
+              "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
+          },
+          "Sorry — I couldn’t understand that date. Could you repeat it as today, tomorrow, or a specific date?"
+        )
+      );
     }
 
     const { startLocal, endLocal } = localDayRange(date);
@@ -493,42 +490,57 @@ app.all("/mb/schedule", async (req, res) => {
     });
 
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor)
-      classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
     classes = classes.map(({ _timeBucket, ...rest }) => rest);
+
+    // Build speech. Keep it short when onlySay=1 to avoid TTS/tool limits.
+    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
+    const maxItems = onlySay === "1" || onlySay === "true" ? 12 : 20;
 
     const say =
       classes.length === 0
         ? `No classes found for ${date}.`
         : `Classes for ${date}: ` +
           classes
-            .slice(0, 25)
+            .slice(0, maxItems)
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    // IMPORTANT: Always include say at top level for AV mapping.
-    return sendOK(res, {
-      date,
-      timezone: STUDIO_TZ,
-      appliedLocationFilter: locationQuery,
-      say,
-      text: say, // convenience
-      classes, // optional; AV can ignore
-      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
-    });
+    if (onlySay === "1" || onlySay === "true") {
+      return sendSuccess(
+        res,
+        withSpeakFields(
+          {
+            date,
+            timezone: STUDIO_TZ,
+          },
+          say
+        )
+      );
+    }
+
+    return sendSuccess(
+      res,
+      withSpeakFields(
+        {
+          date,
+          timezone: STUDIO_TZ,
+          appliedLocationFilter: locationQuery,
+          classes,
+          debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
+        },
+        say
+      )
+    );
   } catch (e) {
-    return sendSoftFail(res, e?.message || "Server error");
+    return sendFail(res, e?.message || "Server error");
   }
 });
 
-/**
- * ============
- * 3) PRICING
- * ============
- */
+// 3) PRICING
 app.all("/mb/pricing", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/pricing", { method: req.method, url: req.originalUrl, params });
@@ -541,72 +553,63 @@ app.all("/mb/pricing", async (req, res) => {
     ]);
 
     const services =
-      servicesResp.status === "fulfilled"
-        ? normalizeArray(servicesResp.value, ["Services", "services"])
-        : [];
+      servicesResp.status === "fulfilled" ? normalizeArray(servicesResp.value, ["Services", "services"]) : [];
     const packages =
-      packagesResp.status === "fulfilled"
-        ? normalizeArray(packagesResp.value, ["Packages", "packages"])
-        : [];
+      packagesResp.status === "fulfilled" ? normalizeArray(packagesResp.value, ["Packages", "packages"]) : [];
     const contracts =
-      contractsResp.status === "fulfilled"
-        ? normalizeArray(contractsResp.value, ["Contracts", "contracts"])
-        : [];
+      contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    const say = "Pricing data pulled successfully.";
+    const say = `I pulled pricing successfully. I can share intro options, drop-ins, and memberships.`;
 
-    return sendOK(res, {
-      say,
-      offers: { services, packages, contracts },
-    });
+    return sendSuccess(
+      res,
+      withSpeakFields(
+        {
+          offers: { services, packages, contracts },
+        },
+        say
+      )
+    );
   } catch (e) {
-    return sendSoftFail(res, e?.message || "Server error");
+    return sendFail(res, e?.message || "Server error");
   }
 });
 
-/**
- * ============
- * 4) BOOK
- * ============
- * NOTE: This requires client_id right now (existing client).
- * If you want "new client booking", that needs a create-client step first.
- */
+// 4) BOOK (existing-client only in this version)
 app.all("/mb/book", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/book", { method: req.method, url: req.originalUrl, params });
 
   try {
     const classId = params.class_id || params.classId;
-    if (!classId) return sendSoftFail(res, "Missing class_id", { say: "Sorry — I’m missing the class ID." });
+    if (!classId) return sendFail(res, "Missing class_id");
 
     const clientId = params.client_id || params.clientId;
-    if (!clientId)
-      return sendSoftFail(res, "Missing client_id", {
-        say: "Sorry — I need the client ID for that booking.",
-      });
+    if (!clientId) return sendFail(res, "Missing client_id (existing client required)");
 
     const bookResp = await mbFetch("/class/addclienttoclass", {
       method: "POST",
       body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
     });
 
-    return sendOK(res, {
-      say: "Booked successfully.",
-      booked: true,
-      clientId,
-      classId,
-      raw: DEBUG_MODE ? bookResp : undefined,
-    });
+    return sendSuccess(
+      res,
+      withSpeakFields(
+        {
+          booked: true,
+          clientId,
+          classId,
+          raw: DEBUG_MODE ? bookResp : undefined,
+        },
+        "Booked successfully."
+      )
+    );
   } catch (e) {
-    return sendSoftFail(res, e?.message || "Server error");
+    return sendFail(res, e?.message || "Server error");
   }
 });
 
-/**
- * ============
- * START
- * ============
- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
