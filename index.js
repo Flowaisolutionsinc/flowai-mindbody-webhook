@@ -31,21 +31,21 @@ const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").tri
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
-const STUDIO_TZ = "America/Vancouver";
+const STUDIO_TZ = process.env.TZ?.trim() || "America/Vancouver";
 
 /**
  * ============
- * RESPONSE SHAPE (AGENCY VAULT COMPAT)
+ * RESPONSE SHAPE (AGENCY VAULT SAFE)
  * ============
- * Different tool-runners wrap webhooks differently.
- * To avoid "hiccup" parsing issues, we return speak text in multiple safe places:
+ * IMPORTANT:
+ * AgencyVault wraps webhook JSON under `results`.
+ * So if we return:
+ *   { say: "...", text: "..." }
+ * AV will expose:
+ *   results.say / results.text
  *
- * - say (top-level)
- * - text (top-level)
- * - results.say (nested)
- * - results.text (nested)
- *
- * Your prompt already checks results.say, then fallbacks.
+ * DO NOT return a nested `results` object, or you'll get:
+ *   results.results.say (double nesting) and weird parser hiccups.
  */
 function sendSuccess(res, payload = {}) {
   return res.status(200).json({ success: true, ...payload });
@@ -55,20 +55,19 @@ function sendFail(res, message, extra = {}) {
   return res.status(200).json({ success: false, message, ...extra });
 }
 
-function withSpeakFields(payload, sayText) {
-  const say = (sayText || "").toString();
-  const text = say;
+function clampTTS(text, maxChars = 900) {
+  const s = (text ?? "").toString().replace(/\s+/g, " ").trim();
+  if (s.length <= maxChars) return s;
+  return s.slice(0, maxChars - 1).trimEnd() + "…";
+}
 
-  // Put speech in multiple predictable places
+function speakPayload({ say, text, ...rest }) {
+  const safeSay = clampTTS(say, 900);
+  const safeText = (text ?? say ?? "").toString();
   return {
-    ...payload,
-    say,
-    text,
-    results: {
-      ...(payload.results && typeof payload.results === "object" ? payload.results : {}),
-      say,
-      text,
-    },
+    ...rest,
+    say: safeSay,
+    text: safeText,
   };
 }
 
@@ -282,6 +281,22 @@ function resolveLocationQuery(params) {
   return {};
 }
 
+/**
+ * ============
+ * FETCH (WITH TIMEOUT) — prevents voice "hiccup loops"
+ * ============
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 6500) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 async function mbFetch(path, { method = "GET", query, body } = {}) {
   if (!siteId || !apiKey || !sourceName || !sourcePassword) {
     throw new Error(
@@ -308,11 +323,15 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     SourcePassword: sourcePassword,
   };
 
-  const res = await fetch(url.toString(), {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const res = await fetchWithTimeout(
+    url.toString(),
+    {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    },
+    6500
+  );
 
   const text = await res.text();
   const json = safeJsonParse(text);
@@ -394,19 +413,18 @@ app.all("/mb/locations", async (req, res) => {
 
     return sendSuccess(
       res,
-      withSpeakFields(
-        {
-          count: locations.length,
-          locations: locations.map((l) => ({
-            id: l.Id ?? l.LocationId ?? null,
-            name: l.Name ?? l.LocationName ?? null,
-            address: l.Address ?? null,
-            city: l.City ?? null,
-            stateProv: l.StateProvCode ?? l.State ?? null,
-          })),
-        },
-        `Found ${locations.length} locations.`
-      )
+      speakPayload({
+        say: `Found ${locations.length} locations.`,
+        text: `Found ${locations.length} locations.`,
+        count: locations.length,
+        locations: locations.map((l) => ({
+          id: l.Id ?? l.LocationId ?? null,
+          name: l.Name ?? l.LocationName ?? null,
+          address: l.Address ?? null,
+          city: l.City ?? null,
+          stateProv: l.StateProvCode ?? l.State ?? null,
+        })),
+      })
     );
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
@@ -425,16 +443,15 @@ app.all("/mb/schedule", async (req, res) => {
     if (!date) {
       return sendSuccess(
         res,
-        withSpeakFields(
-          {
-            success: false,
-            message: "Could not understand the requested date.",
-            received: { date: rawDateInput },
-            hint:
-              "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
-          },
-          "Sorry — I couldn’t understand that date. Could you repeat it as today, tomorrow, or a specific date?"
-        )
+        speakPayload({
+          success: false,
+          message: "Could not understand the requested date.",
+          received: { date: rawDateInput },
+          hint:
+            "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
+          say: "Sorry — I couldn’t understand that date. Could you say today, tomorrow, or a specific date?",
+          text: "Sorry — I couldn’t understand that date. Could you say today, tomorrow, or a specific date?",
+        })
       );
     }
 
@@ -496,9 +513,10 @@ app.all("/mb/schedule", async (req, res) => {
 
     classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
-    // Build speech. Keep it short when onlySay=1 to avoid TTS/tool limits.
+    // Build speech (keep it short to avoid TTS/tool limits)
     const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    const maxItems = onlySay === "1" || onlySay === "true" ? 12 : 20;
+    const isOnlySay = onlySay === "1" || onlySay === "true";
+    const maxItems = isOnlySay ? 10 : 20;
 
     const say =
       classes.length === 0
@@ -507,36 +525,48 @@ app.all("/mb/schedule", async (req, res) => {
           classes
             .slice(0, maxItems)
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
-            .join(" | ");
+            .join(". ");
 
-    if (onlySay === "1" || onlySay === "true") {
+    // ONLYSAY: return very small payload (this matters for voice stability)
+    if (isOnlySay) {
       return sendSuccess(
         res,
-        withSpeakFields(
-          {
-            date,
-            timezone: STUDIO_TZ,
-          },
-          say
-        )
+        speakPayload({
+          date,
+          timezone: STUDIO_TZ,
+          say,
+          text: say,
+        })
       );
     }
 
     return sendSuccess(
       res,
-      withSpeakFields(
-        {
-          date,
-          timezone: STUDIO_TZ,
-          appliedLocationFilter: locationQuery,
-          classes,
-          debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
-        },
-        say
-      )
+      speakPayload({
+        date,
+        timezone: STUDIO_TZ,
+        appliedLocationFilter: locationQuery,
+        classes,
+        debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
+        say,
+        text: say,
+      })
     );
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    // If MB times out / errors, return a clean voice-safe fallback instead of "hiccup"
+    const msg = e?.name === "AbortError"
+      ? "Sorry — I’m having trouble loading the schedule right now. Please try again in a moment."
+      : "Sorry — I couldn’t pull up the schedule right now. Please try again.";
+
+    return sendSuccess(
+      res,
+      speakPayload({
+        success: false,
+        message: e?.message || "Server error",
+        say: msg,
+        text: msg,
+      })
+    );
   }
 });
 
@@ -559,16 +589,15 @@ app.all("/mb/pricing", async (req, res) => {
     const contracts =
       contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    const say = `I pulled pricing successfully. I can share intro options, drop-ins, and memberships.`;
+    const say = `I pulled pricing successfully. I can share drop-ins, intro offers, and memberships.`;
 
     return sendSuccess(
       res,
-      withSpeakFields(
-        {
-          offers: { services, packages, contracts },
-        },
-        say
-      )
+      speakPayload({
+        offers: { services, packages, contracts },
+        say,
+        text: say,
+      })
     );
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
@@ -594,15 +623,14 @@ app.all("/mb/book", async (req, res) => {
 
     return sendSuccess(
       res,
-      withSpeakFields(
-        {
-          booked: true,
-          clientId,
-          classId,
-          raw: DEBUG_MODE ? bookResp : undefined,
-        },
-        "Booked successfully."
-      )
+      speakPayload({
+        booked: true,
+        clientId,
+        classId,
+        raw: DEBUG_MODE ? bookResp : undefined,
+        say: "Booked successfully.",
+        text: "Booked successfully.",
+      })
     );
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
@@ -611,5 +639,6 @@ app.all("/mb/book", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
