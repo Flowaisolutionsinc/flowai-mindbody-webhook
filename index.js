@@ -35,39 +35,30 @@ const STUDIO_TZ = process.env.TZ?.trim() || "America/Vancouver";
 
 /**
  * ============
- * RESPONSE SHAPE (AGENCY VAULT SAFE)
+ * RESPONSE SHAPE (AGENCY VAULT COMPAT)
  * ============
- * IMPORTANT:
- * AgencyVault wraps webhook JSON under `results`.
- * So if we return:
- *   { say: "...", text: "..." }
- * AV will expose:
- *   results.say / results.text
- *
- * DO NOT return a nested `results` object, or you'll get:
- *   results.results.say (double nesting) and weird parser hiccups.
+ * AV often expects results.say (selected field in Custom Action)
+ * We'll always include results.say, and also top-level say/text for debug/manual testing.
  */
 function sendSuccess(res, payload = {}) {
   return res.status(200).json({ success: true, ...payload });
 }
-
 function sendFail(res, message, extra = {}) {
   return res.status(200).json({ success: false, message, ...extra });
 }
+function withSpeakFields(payload, sayText) {
+  const say = (sayText || "").toString();
+  const text = say;
 
-function clampTTS(text, maxChars = 900) {
-  const s = (text ?? "").toString().replace(/\s+/g, " ").trim();
-  if (s.length <= maxChars) return s;
-  return s.slice(0, maxChars - 1).trimEnd() + "…";
-}
-
-function speakPayload({ say, text, ...rest }) {
-  const safeSay = clampTTS(say, 900);
-  const safeText = (text ?? say ?? "").toString();
   return {
-    ...rest,
-    say: safeSay,
-    text: safeText,
+    ...payload,
+    say,
+    text,
+    results: {
+      ...(payload.results && typeof payload.results === "object" ? payload.results : {}),
+      say,
+      text,
+    },
   };
 }
 
@@ -263,7 +254,8 @@ function extractCapacityInfo(c) {
   const spotsAvailable =
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
-  const isWaitlistAvailable = c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+  const isWaitlistAvailable =
+    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
 
   return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
@@ -282,19 +274,19 @@ function resolveLocationQuery(params) {
 }
 
 /**
- * ============
- * FETCH (WITH TIMEOUT) — prevents voice "hiccup loops"
- * ============
+ * Hard limit spoken payload so AV / TTS doesn’t choke.
+ * (AV failures often look like “system hiccup” in the transcript.)
  */
-async function fetchWithTimeout(url, options = {}, timeoutMs = 6500) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    return res;
-  } finally {
-    clearTimeout(id);
-  }
+function hardTruncateSpeak(s, maxChars = 850) {
+  const str = (s || "").toString();
+  if (str.length <= maxChars) return str;
+  // Trim nicely at a separator if possible
+  const cut = str.slice(0, maxChars);
+  const lastBar = cut.lastIndexOf("|");
+  if (lastBar > 200) return cut.slice(0, lastBar).trim();
+  const lastPeriod = cut.lastIndexOf(".");
+  if (lastPeriod > 200) return cut.slice(0, lastPeriod + 1).trim();
+  return cut.trim();
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -323,15 +315,11 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     SourcePassword: sourcePassword,
   };
 
-  const res = await fetchWithTimeout(
-    url.toString(),
-    {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-    },
-    6500
-  );
+  const res = await fetch(url.toString(), {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
 
   const text = await res.text();
   const json = safeJsonParse(text);
@@ -398,7 +386,7 @@ app.get("/health", (req, res) => {
 
 /**
  * ============
- * CLEAN ENDPOINTS
+ * ENDPOINTS
  * ============
  */
 
@@ -413,25 +401,26 @@ app.all("/mb/locations", async (req, res) => {
 
     return sendSuccess(
       res,
-      speakPayload({
-        say: `Found ${locations.length} locations.`,
-        text: `Found ${locations.length} locations.`,
-        count: locations.length,
-        locations: locations.map((l) => ({
-          id: l.Id ?? l.LocationId ?? null,
-          name: l.Name ?? l.LocationName ?? null,
-          address: l.Address ?? null,
-          city: l.City ?? null,
-          stateProv: l.StateProvCode ?? l.State ?? null,
-        })),
-      })
+      withSpeakFields(
+        {
+          count: locations.length,
+          locations: locations.map((l) => ({
+            id: l.Id ?? l.LocationId ?? null,
+            name: l.Name ?? l.LocationName ?? null,
+            address: l.Address ?? null,
+            city: l.City ?? null,
+            stateProv: l.StateProvCode ?? l.State ?? null,
+          })),
+        },
+        `Found ${locations.length} locations.`
+      )
     );
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
   }
 });
 
-// 2) SCHEDULE
+// 2) SCHEDULE (small + reliable)
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
@@ -441,18 +430,10 @@ app.all("/mb/schedule", async (req, res) => {
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
 
     if (!date) {
-      return sendSuccess(
-        res,
-        speakPayload({
-          success: false,
-          message: "Could not understand the requested date.",
-          received: { date: rawDateInput },
-          hint:
-            "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
-          say: "Sorry — I couldn’t understand that date. Could you say today, tomorrow, or a specific date?",
-          text: "Sorry — I couldn’t understand that date. Could you say today, tomorrow, or a specific date?",
-        })
+      const say = hardTruncateSpeak(
+        "Sorry — I couldn’t understand that date. Please say today, tomorrow, morning/afternoon/evening, or a specific date like February 21st."
       );
+      return sendSuccess(res, withSpeakFields({ date: null, timezone: STUDIO_TZ }, say));
     }
 
     const { startLocal, endLocal } = localDayRange(date);
@@ -467,8 +448,10 @@ app.all("/mb/schedule", async (req, res) => {
 
     const wantType = toLowerClean(params.class_type || params.class_name);
     const wantInstructor = toLowerClean(params.instructor_name);
-    const wantTimeRange = toLowerClean(params.time_range);
     const wantTime = toLowerClean(params.time);
+
+    // NEW: time_range is how we keep speech small and stable
+    const timeRange = toLowerClean(params.time_range);
 
     let classes = classesRaw.map((c) => {
       const classId = c.Id ?? c.ClassId ?? null;
@@ -506,67 +489,87 @@ app.all("/mb/schedule", async (req, res) => {
       };
     });
 
+    // Filters
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-    if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
+    if (wantInstructor)
+      classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
-    classes = classes.map(({ _timeBucket, ...rest }) => rest);
-
-    // Build speech (keep it short to avoid TTS/tool limits)
-    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    const isOnlySay = onlySay === "1" || onlySay === "true";
-    const maxItems = isOnlySay ? 10 : 20;
-
-    const say =
-      classes.length === 0
-        ? `No classes found for ${date}.`
-        : `Classes for ${date}: ` +
-          classes
-            .slice(0, maxItems)
-            .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
-            .join(". ");
-
-    // ONLYSAY: return very small payload (this matters for voice stability)
-    if (isOnlySay) {
-      return sendSuccess(
-        res,
-        speakPayload({
-          date,
-          timezone: STUDIO_TZ,
-          say,
-          text: say,
-        })
-      );
+    // Bucket filter if time_range provided
+    if (timeRange === "morning" || timeRange === "afternoon" || timeRange === "evening") {
+      classes = classes.filter((x) => toLowerClean(x._timeBucket) === timeRange);
     }
 
+    // Prepare buckets for “pick a time of day”
+    const bucketCounts = { morning: 0, afternoon: 0, evening: 0 };
+    for (const c of classes) {
+      const b = toLowerClean(c._timeBucket);
+      if (b === "morning" || b === "afternoon" || b === "evening") bucketCounts[b] += 1;
+    }
+
+    // Remove internal field for response objects
+    const cleanedClasses = classes.map(({ _timeBucket, ...rest }) => rest);
+
+    const onlySay = toLowerClean(params.onlySay || params.only_say);
+
+    // If onlySay=1 and NO time_range provided, do NOT dump the whole day.
+    // Force a choice so AV never chokes on huge speech.
+    if ((onlySay === "1" || onlySay === "true") && !(timeRange === "morning" || timeRange === "afternoon" || timeRange === "evening")) {
+      if (cleanedClasses.length === 0) {
+        const say = hardTruncateSpeak(`No classes found for ${date}.`);
+        return sendSuccess(res, withSpeakFields({ date, timezone: STUDIO_TZ }, say));
+      }
+
+      const say = hardTruncateSpeak(
+        `I can share the schedule for ${date} by time of day. Do you want morning, afternoon, or evening?`
+      );
+      return sendSuccess(res, withSpeakFields({ date, timezone: STUDIO_TZ }, say));
+    }
+
+    // Build spoken list (always small)
+    const maxItems = (onlySay === "1" || onlySay === "true") ? 10 : 20;
+
+    const say =
+      cleanedClasses.length === 0
+        ? `No classes found for ${date}${timeRange ? ` (${timeRange})` : ""}.`
+        : `Classes for ${date}${timeRange ? ` (${timeRange})` : ""}: ` +
+          cleanedClasses
+            .slice(0, maxItems)
+            .map((c) => {
+              const t = c.startTimeLocal ? `${c.startTimeLocal} ` : "";
+              const inst = c.instructor ? ` with ${c.instructor}` : "";
+              return `${t}${c.name}${inst}`;
+            })
+            .join(" | ");
+
+    const finalSay = hardTruncateSpeak(say);
+
+    // For onlySay=1, return only speech + date/tz (small payload)
+    if (onlySay === "1" || onlySay === "true") {
+      return sendSuccess(res, withSpeakFields({ date, timezone: STUDIO_TZ }, finalSay));
+    }
+
+    // Full payload (debug/manual use)
     return sendSuccess(
       res,
-      speakPayload({
-        date,
-        timezone: STUDIO_TZ,
-        appliedLocationFilter: locationQuery,
-        classes,
-        debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
-        say,
-        text: say,
-      })
+      withSpeakFields(
+        {
+          date,
+          timezone: STUDIO_TZ,
+          appliedLocationFilter: locationQuery,
+          countsByBucket: bucketCounts,
+          classes: cleanedClasses,
+          debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
+        },
+        finalSay
+      )
     );
   } catch (e) {
-    // If MB times out / errors, return a clean voice-safe fallback instead of "hiccup"
-    const msg = e?.name === "AbortError"
-      ? "Sorry — I’m having trouble loading the schedule right now. Please try again in a moment."
-      : "Sorry — I couldn’t pull up the schedule right now. Please try again.";
-
-    return sendSuccess(
-      res,
-      speakPayload({
-        success: false,
-        message: e?.message || "Server error",
-        say: msg,
-        text: msg,
-      })
+    // IMPORTANT: Still return a speakable message so AV doesn't "blank" and pretend it failed
+    const say = hardTruncateSpeak(
+      "I’m having trouble pulling the schedule right now. Please try again in a moment."
     );
+    return sendSuccess(res, withSpeakFields({ timezone: STUDIO_TZ, error: DEBUG_MODE ? e?.message : undefined }, say));
   }
 });
 
@@ -589,18 +592,22 @@ app.all("/mb/pricing", async (req, res) => {
     const contracts =
       contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    const say = `I pulled pricing successfully. I can share drop-ins, intro offers, and memberships.`;
+    const say = hardTruncateSpeak(
+      "I pulled pricing successfully. I can share intro options, drop-ins, and memberships."
+    );
 
     return sendSuccess(
       res,
-      speakPayload({
-        offers: { services, packages, contracts },
-        say,
-        text: say,
-      })
+      withSpeakFields(
+        {
+          offers: { services, packages, contracts },
+        },
+        say
+      )
     );
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    const say = hardTruncateSpeak("I’m having trouble pulling pricing right now. Please try again in a moment.");
+    return sendSuccess(res, withSpeakFields({}, say));
   }
 });
 
@@ -623,22 +630,25 @@ app.all("/mb/book", async (req, res) => {
 
     return sendSuccess(
       res,
-      speakPayload({
-        booked: true,
-        clientId,
-        classId,
-        raw: DEBUG_MODE ? bookResp : undefined,
-        say: "Booked successfully.",
-        text: "Booked successfully.",
-      })
+      withSpeakFields(
+        {
+          booked: true,
+          clientId,
+          classId,
+          raw: DEBUG_MODE ? bookResp : undefined,
+        },
+        "Booked successfully."
+      )
     );
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    const say = hardTruncateSpeak("I couldn’t complete that booking just now. Please try again.");
+    return sendSuccess(res, withSpeakFields({}, say));
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
