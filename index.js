@@ -4,7 +4,7 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * --- CORS / Preflight ---
+ * --- CORS / Preflight (helps dashboards + browsers) ---
  */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -29,34 +29,97 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
 const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
-
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
+
 const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
  * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
  * ============
- * Your server should NOT return a nested `results` object.
- * Agency Vault wraps your entire JSON inside its own `results`.
+ * AV wraps your response JSON into `results`.
+ * So AV should read: results.say
  *
- * ✅ Return:
- * { success: true, say: "...", text: "..." }
- *
- * Then AV field path becomes:
- * results.say
+ * We ALWAYS return a top-level `say` (even on failure) so AV can speak reliably.
  */
-function sendSuccess(res, payload = {}) {
+function sendOK(res, payload = {}) {
   return res.status(200).json({ success: true, ...payload });
 }
 
-function sendFail(res, message, extra = {}) {
-  return res.status(200).json({ success: false, message, ...extra });
+function sendSoftFail(res, message, extra = {}) {
+  // Keep HTTP 200 so AV doesn't treat it as a transport error.
+  // Always include `say` so AV can map and your agent can speak something.
+  return res.status(200).json({
+    success: false,
+    say: "Sorry — I’m not able to pull that up on my end right now.",
+    message,
+    ...extra,
+  });
 }
 
 /**
  * ============
- * DATE HELPERS (TZ-AWARE)
+ * SAFE HELPERS
+ * ============
+ */
+function safeJsonParse(x) {
+  try {
+    return typeof x === "string" ? JSON.parse(x) : x;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeArray(payload, keys = []) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  for (const k of keys) {
+    if (Array.isArray(payload[k])) return payload[k];
+  }
+  if (Array.isArray(payload.Results)) return payload.Results;
+  return [];
+}
+
+function toLowerClean(x) {
+  return (x ?? "").toString().toLowerCase().trim();
+}
+
+/**
+ * ============
+ * INCOMING PARAMS (AV + CURL + BROWSERS)
+ * ============
+ * Supports:
+ * - query params (GET)
+ * - JSON body (POST)
+ * - nested tool arguments if AV sends them that way
+ */
+function getIncomingParams(req) {
+  const q = { ...(req.query || {}) };
+  let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
+
+  const maybeArgs =
+    req.body?.message?.toolCallList?.[0]?.function?.arguments ??
+    req.body?.message?.toolCalls?.[0]?.function?.arguments ??
+    req.body?.toolCallList?.[0]?.function?.arguments ??
+    req.body?.toolCalls?.[0]?.function?.arguments ??
+    null;
+
+  if (maybeArgs) {
+    const parsed = typeof maybeArgs === "string" ? safeJsonParse(maybeArgs) : maybeArgs;
+    if (parsed && typeof parsed === "object") b = { ...b, ...parsed };
+  }
+
+  if (b.params && typeof b.params === "object") {
+    b = { ...b.params, ...b };
+    delete b.params;
+  }
+
+  return { ...q, ...b };
+}
+
+/**
+ * ============
+ * TIME / DATE HELPERS
  * ============
  */
 function nowInTZDateString(tz = STUDIO_TZ) {
@@ -84,13 +147,23 @@ function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
 }
 
 const WEEKDAY_MAP = {
-  sunday: 0, sun: 0,
-  monday: 1, mon: 1,
-  tuesday: 2, tue: 2, tues: 2,
-  wednesday: 3, wed: 3,
-  thursday: 4, thu: 4, thur: 4, thurs: 4,
-  friday: 5, fri: 5,
-  saturday: 6, sat: 6,
+  sunday: 0,
+  sun: 0,
+  monday: 1,
+  mon: 1,
+  tuesday: 2,
+  tue: 2,
+  tues: 2,
+  wednesday: 3,
+  wed: 3,
+  thursday: 4,
+  thu: 4,
+  thur: 4,
+  thurs: 4,
+  friday: 5,
+  fri: 5,
+  saturday: 6,
+  sat: 6,
 };
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
@@ -130,13 +203,14 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     let delta = (targetIdx - todayIdx + 7) % 7;
 
     if (nextPrefix) {
-      // push to following week
-      delta = delta === 0 ? 7 : delta + 7;
+      if (delta === 0) delta = 7;
+      else delta += 7;
     }
+
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
-  // handle "Feb 21st 2026", "February 21, 2026"
+  // Parse "February 19th, 2026", "Feb 19", etc.
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -153,7 +227,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     if (y && m && d) return `${y}-${m}-${d}`;
   }
 
-  // handle "the 17th" => current month/year
+  // Handle "the 17th"
   const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const today = nowInTZDateString(tz);
@@ -165,26 +239,11 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   return null;
 }
 
-function safeJsonParse(x) {
-  try {
-    return typeof x === "string" ? JSON.parse(x) : x;
-  } catch {
-    return null;
-  }
-}
-
-function normalizeArray(payload, keys = []) {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  for (const k of keys) {
-    if (Array.isArray(payload[k])) return payload[k];
-  }
-  if (Array.isArray(payload.Results)) return payload.Results;
-  return [];
-}
-
-function toLowerClean(x) {
-  return (x ?? "").toString().toLowerCase().trim();
+function localDayRange(dateStr) {
+  return {
+    startLocal: `${dateStr}T00:00:00`,
+    endLocal: `${dateStr}T23:59:59`,
+  };
 }
 
 function parseNaiveISO(iso) {
@@ -216,13 +275,6 @@ function timeBucketFromHour(hour) {
   return "evening";
 }
 
-function localDayRange(dateStr) {
-  return {
-    startLocal: `${dateStr}T00:00:00`,
-    endLocal: `${dateStr}T23:59:59`,
-  };
-}
-
 function extractCapacityInfo(c) {
   const candidatesCapacity = [c.MaxCapacity, c.WebCapacity, c.Capacity, c.ClassCapacity];
   const candidatesBooked = [c.TotalBooked, c.Visits, c.TotalBookedClients, c.Booked, c.NumBooked];
@@ -246,7 +298,6 @@ function resolveLocationQuery(params) {
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
-  // allow "1,2,3" for scaling
   if (locationIds) return { LocationIds: locationIds };
   if (locationId) return { LocationIds: locationId };
 
@@ -256,6 +307,11 @@ function resolveLocationQuery(params) {
   return {};
 }
 
+/**
+ * ============
+ * MINDBODY FETCH
+ * ============
+ */
 async function mbFetch(path, { method = "GET", query, body } = {}) {
   if (!siteId || !apiKey || !sourceName || !sourcePassword) {
     throw new Error(
@@ -301,40 +357,15 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   return json ?? { raw: text };
 }
 
-function getIncomingParams(req) {
-  const q = { ...(req.query || {}) };
-  let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
-
-  // handle tool-call argument wrappers (if any)
-  const maybeArgs =
-    req.body?.message?.toolCallList?.[0]?.function?.arguments ??
-    req.body?.message?.toolCalls?.[0]?.function?.arguments ??
-    req.body?.toolCallList?.[0]?.function?.arguments ??
-    req.body?.toolCalls?.[0]?.function?.arguments ??
-    null;
-
-  if (maybeArgs) {
-    const parsed = typeof maybeArgs === "string" ? safeJsonParse(maybeArgs) : maybeArgs;
-    if (parsed && typeof parsed === "object") b = { ...b, ...parsed };
-  }
-
-  // allow { params: {...} }
-  if (b.params && typeof b.params === "object") {
-    b = { ...b.params, ...b };
-    delete b.params;
-  }
-
-  return { ...q, ...b };
-}
-
 /**
  * ============
  * HEALTH
  * ============
  */
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
+
 app.get("/health", (req, res) => {
-  return sendSuccess(res, {
+  return sendOK(res, {
     ok: true,
     envDetected: {
       hasSiteId: Boolean(siteId),
@@ -352,20 +383,24 @@ app.get("/health", (req, res) => {
 
 /**
  * ============
- * ENDPOINTS
+ * 1) LOCATIONS
  * ============
  */
-
-// LOCATIONS
 app.all("/mb/locations", async (req, res) => {
   const params = getIncomingParams(req);
-  console.log("HIT /mb/locations", { url: req.originalUrl, params });
+  console.log("HIT /mb/locations", { method: req.method, url: req.originalUrl, params });
 
   try {
     const data = await mbFetch("/site/locations", { method: "GET" });
     const locations = normalizeArray(data, ["Locations", "locations"]);
 
-    return sendSuccess(res, {
+    const say =
+      locations.length === 0
+        ? "No locations found."
+        : `Found ${locations.length} locations.`;
+
+    return sendOK(res, {
+      say,
       count: locations.length,
       locations: locations.map((l) => ({
         id: l.Id ?? l.LocationId ?? null,
@@ -376,21 +411,30 @@ app.all("/mb/locations", async (req, res) => {
       })),
     });
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return sendSoftFail(res, e?.message || "Server error");
   }
 });
 
-// SCHEDULE
+/**
+ * ============
+ * 2) SCHEDULE (AV HARDENED)
+ * ============
+ * Works for BOTH:
+ * - GET /mb/schedule?date=tomorrow&location_id=1&onlySay=1
+ * - POST /mb/schedule { "date":"tomorrow","location_id":"1","onlySay":"1" }
+ *
+ * Always returns top-level `say` (AV reads results.say)
+ */
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
-  console.log("HIT /mb/schedule", { path: "/mb/schedule", url: req.originalUrl, params });
+  console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
 
   try {
     const rawDateInput = params.date || params.day || params.requested_day || params.requestedDate;
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
 
     if (!date) {
-      return sendFail(res, "Could not understand the requested date.", {
+      return sendSoftFail(res, "Could not understand the requested date.", {
         received: { date: rawDateInput },
         hint:
           "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
@@ -407,11 +451,10 @@ app.all("/mb/schedule", async (req, res) => {
 
     const classesRaw = normalizeArray(data, ["Classes", "classes"]);
 
-    // optional filters (for future)
     const wantType = toLowerClean(params.class_type || params.class_name);
     const wantInstructor = toLowerClean(params.instructor_name);
-    const wantTimeRange = toLowerClean(params.time_range); // morning/afternoon/evening
-    const wantTime = toLowerClean(params.time); // "7:15"
+    const wantTimeRange = toLowerClean(params.time_range);
+    const wantTime = toLowerClean(params.time);
 
     let classes = classesRaw.map((c) => {
       const classId = c.Id ?? c.ClassId ?? null;
@@ -450,48 +493,45 @@ app.all("/mb/schedule", async (req, res) => {
     });
 
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+    if (wantInstructor)
+      classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
-    // remove internal helper
     classes = classes.map(({ _timeBucket, ...rest }) => rest);
 
-    // keep spoken output short-ish
-    const MAX_SPOKEN = 20;
     const say =
       classes.length === 0
         ? `No classes found for ${date}.`
         : `Classes for ${date}: ` +
           classes
-            .slice(0, MAX_SPOKEN)
+            .slice(0, 25)
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    // IMPORTANT: return BOTH say and text for maximum compatibility
-    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    if (onlySay === "1" || onlySay === "true") {
-      return sendSuccess(res, { date, timezone: STUDIO_TZ, say, text: say });
-    }
-
-    return sendSuccess(res, {
+    // IMPORTANT: Always include say at top level for AV mapping.
+    return sendOK(res, {
       date,
       timezone: STUDIO_TZ,
       appliedLocationFilter: locationQuery,
       say,
-      text: say,
-      classes,
+      text: say, // convenience
+      classes, // optional; AV can ignore
       debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
     });
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return sendSoftFail(res, e?.message || "Server error");
   }
 });
 
-// PRICING
+/**
+ * ============
+ * 3) PRICING
+ * ============
+ */
 app.all("/mb/pricing", async (req, res) => {
   const params = getIncomingParams(req);
-  console.log("HIT /mb/pricing", { url: req.originalUrl, params });
+  console.log("HIT /mb/pricing", { method: req.method, url: req.originalUrl, params });
 
   try {
     const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
@@ -501,57 +541,72 @@ app.all("/mb/pricing", async (req, res) => {
     ]);
 
     const services =
-      servicesResp.status === "fulfilled" ? normalizeArray(servicesResp.value, ["Services", "services"]) : [];
+      servicesResp.status === "fulfilled"
+        ? normalizeArray(servicesResp.value, ["Services", "services"])
+        : [];
     const packages =
-      packagesResp.status === "fulfilled" ? normalizeArray(packagesResp.value, ["Packages", "packages"]) : [];
+      packagesResp.status === "fulfilled"
+        ? normalizeArray(packagesResp.value, ["Packages", "packages"])
+        : [];
     const contracts =
-      contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
+      contractsResp.status === "fulfilled"
+        ? normalizeArray(contractsResp.value, ["Contracts", "contracts"])
+        : [];
 
-    return sendSuccess(res, { offers: { services, packages, contracts } });
+    const say = "Pricing data pulled successfully.";
+
+    return sendOK(res, {
+      say,
+      offers: { services, packages, contracts },
+    });
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return sendSoftFail(res, e?.message || "Server error");
   }
 });
 
-// BOOK (requires existing client_id for now)
+/**
+ * ============
+ * 4) BOOK
+ * ============
+ * NOTE: This requires client_id right now (existing client).
+ * If you want "new client booking", that needs a create-client step first.
+ */
 app.all("/mb/book", async (req, res) => {
   const params = getIncomingParams(req);
-  console.log("HIT /mb/book", { url: req.originalUrl, params });
+  console.log("HIT /mb/book", { method: req.method, url: req.originalUrl, params });
 
   try {
     const classId = params.class_id || params.classId;
-    if (!classId) return sendFail(res, "Missing class_id");
+    if (!classId) return sendSoftFail(res, "Missing class_id", { say: "Sorry — I’m missing the class ID." });
 
     const clientId = params.client_id || params.clientId;
-    if (!clientId) return sendFail(res, "Missing client_id (existing client required)");
+    if (!clientId)
+      return sendSoftFail(res, "Missing client_id", {
+        say: "Sorry — I need the client ID for that booking.",
+      });
 
     const bookResp = await mbFetch("/class/addclienttoclass", {
       method: "POST",
       body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
     });
 
-    return sendSuccess(res, {
+    return sendOK(res, {
+      say: "Booked successfully.",
       booked: true,
       clientId,
       classId,
-      say: "Booked successfully.",
-      text: "Booked successfully.",
       raw: DEBUG_MODE ? bookResp : undefined,
     });
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return sendSoftFail(res, e?.message || "Server error");
   }
 });
 
 /**
- * Optional: keep your original legacy path working
- * so you can point actions at /mindbody if you ever did before.
+ * ============
+ * START
+ * ============
  */
-app.all("/mindbody", async (req, res) => {
-  // Treat /mindbody as an alias for schedule
-  req.url = "/mb/schedule";
-  return app._router.handle(req, res, () => {});
-});
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
