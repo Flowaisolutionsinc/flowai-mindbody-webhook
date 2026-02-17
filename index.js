@@ -1,3 +1,4 @@
+{
 import express from "express";
 
 const app = express();
@@ -10,7 +11,6 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -28,7 +28,7 @@ const apiKey = process.env.MINDBODY_API_KEY || "";
 const sourceName = process.env.MINDBODY_SOURCE_NAME || "";
 const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
-const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
+const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "1").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
@@ -36,44 +36,19 @@ const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE SHAPE (IMPORTANT FOR CUSTOM ACTIONS)
+ * RESPONSE SHAPE (IMPORTANT)
  * ============
- * Your platform wraps your JSON inside its own `results`.
- * So the easiest stable mapping is:
- * - return top-level `say`
- * - platform reads: results.say
+ * DO NOT return a nested "results" object.
+ * Return top-level keys like:
+ * { success:true, say:"..." }
  *
- * GUARANTEE:
- * - success responses ALWAYS include say + text
- * - fail responses ALWAYS include say + text
+ * The voice platform wraps it into: results.say
  */
 function sendSuccess(res, payload = {}) {
-  const say = (payload.say ?? payload.text ?? "").toString();
-  const text = (payload.text ?? payload.say ?? "").toString();
-
-  // prevent accidental nested results
-  const { results, ...rest } = payload;
-
-  return res.status(200).json({
-    success: true,
-    say,
-    text,
-    ...rest,
-  });
+  return res.status(200).json({ success: true, ...payload });
 }
-
 function sendFail(res, message, extra = {}) {
-  const msg = (message || "Please try again.").toString();
-  const say = `Sorry — my system hiccupped. ${msg}`;
-  const { results, ...rest } = extra;
-
-  return res.status(200).json({
-    success: false,
-    say,
-    text: say,
-    message: msg,
-    ...rest,
-  });
+  return res.status(200).json({ success: false, message, ...extra });
 }
 
 /**
@@ -106,13 +81,23 @@ function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
 }
 
 const WEEKDAY_MAP = {
-  sunday: 0, sun: 0,
-  monday: 1, mon: 1,
-  tuesday: 2, tue: 2, tues: 2,
-  wednesday: 3, wed: 3,
-  thursday: 4, thu: 4, thur: 4, thurs: 4,
-  friday: 5, fri: 5,
-  saturday: 6, sat: 6,
+  sunday: 0,
+  sun: 0,
+  monday: 1,
+  mon: 1,
+  tuesday: 2,
+  tue: 2,
+  tues: 2,
+  wednesday: 3,
+  wed: 3,
+  thursday: 4,
+  thu: 4,
+  thur: 4,
+  thurs: 4,
+  friday: 5,
+  fri: 5,
+  saturday: 6,
+  sat: 6,
 };
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
@@ -128,15 +113,6 @@ function looksLikeYYYYMMDD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-/**
- * Accepts:
- * - "today", "tomorrow"
- * - "friday", "next friday", "this friday"
- * - "2026-02-17"
- * - "February 21st, 2026"
- * - "the 17th"
- * Returns: YYYY-MM-DD in studio TZ, or null if cannot parse
- */
 function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (!raw) return nowInTZDateString(tz);
 
@@ -160,15 +136,13 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     const targetIdx = WEEKDAY_MAP[weekdayToken];
     let delta = (targetIdx - todayIdx + 7) % 7;
 
-    if (nextPrefix) {
-      // if "next friday" and today is friday, jump 7
-      if (delta === 0) delta = 7;
-      else delta += 7;
-    }
+    // "next Friday" means +7 if already Friday, otherwise next week's Friday
+    if (nextPrefix) delta = delta === 0 ? 7 : delta + 7;
 
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
+  // Try parsing "Feb 21", "February 21 2026", etc.
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -219,7 +193,6 @@ function toLowerClean(x) {
   return (x ?? "").toString().toLowerCase().trim();
 }
 
-// Mindbody often returns naive local times "2026-02-15T08:30:00"
 function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
@@ -254,24 +227,6 @@ function localDayRange(dateStr) {
     startLocal: `${dateStr}T00:00:00`,
     endLocal: `${dateStr}T23:59:59`,
   };
-}
-
-function extractCapacityInfo(c) {
-  const candidatesCapacity = [c.MaxCapacity, c.WebCapacity, c.Capacity, c.ClassCapacity];
-  const candidatesBooked = [c.TotalBooked, c.Visits, c.TotalBookedClients, c.Booked, c.NumBooked];
-
-  const capacity = candidatesCapacity.find((v) => Number.isFinite(Number(v)));
-  const booked = candidatesBooked.find((v) => Number.isFinite(Number(v)));
-
-  const capNum = capacity !== undefined ? Number(capacity) : null;
-  const bookedNum = booked !== undefined ? Number(booked) : null;
-
-  const spotsAvailable =
-    capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
-
-  const isWaitlistAvailable = c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
-
-  return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
 
 function resolveLocationQuery(params) {
@@ -333,9 +288,7 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 }
 
 /**
- * ============
- * UNIVERSAL PARAMS UNWRAP (query + body + tool-call payloads)
- * ============
+ * Pull params from query OR body OR nested tool-call arguments
  */
 function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
@@ -368,10 +321,8 @@ function getIncomingParams(req) {
  */
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 
-app.all("/health", (req, res) => {
+app.get("/health", (req, res) => {
   return sendSuccess(res, {
-    say: "",
-    text: "",
     ok: true,
     envDetected: {
       hasSiteId: Boolean(siteId),
@@ -389,12 +340,16 @@ app.all("/health", (req, res) => {
 
 /**
  * ============
- * CORE: SCHEDULE HANDLER (shared by /mb/schedule and /mindbody alias)
+ * SCHEDULE (GET or POST)
  * ============
+ * Inputs:
+ * - date: "today" | "tomorrow" | "Friday" | "2026-02-17" | "Feb 21" | "the 17th"
+ * - location_id: "1" etc
+ * - onlySay: "1" to return only {say,date,timezone}
  */
-async function handleSchedule(req, res) {
+app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
-  console.log("HIT schedule", { path: req.path, url: req.originalUrl, params });
+  console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
 
   try {
     const rawDateInput = params.date || params.day || params.requested_day || params.requestedDate;
@@ -403,10 +358,14 @@ async function handleSchedule(req, res) {
     if (!date) {
       return sendFail(res, "Could not understand the requested date.", {
         received: { date: rawDateInput },
+        hint:
+          "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
       });
     }
 
     const { startLocal, endLocal } = localDayRange(date);
+
+    // Allow caller to pass location_id; fallback to DEFAULT_LOCATION_ID
     const locationQuery = resolveLocationQuery(params);
 
     const data = await mbFetch("/class/classes", {
@@ -416,6 +375,7 @@ async function handleSchedule(req, res) {
 
     const classesRaw = normalizeArray(data, ["Classes", "classes"]);
 
+    // Optional filters
     const wantType = toLowerClean(params.class_type || params.class_name);
     const wantInstructor = toLowerClean(params.instructor_name);
     const wantTimeRange = toLowerClean(params.time_range);
@@ -434,9 +394,6 @@ async function handleSchedule(req, res) {
         instructor = [first, last].filter(Boolean).join(" ").trim() || null;
       }
 
-      const location = c.Location?.Name ?? c.LocationName ?? null;
-      const cap = extractCapacityInfo(c);
-
       const st = parseNaiveISO(startDateTime);
       const startTimeLocal = st ? format12h(st.hour, st.minute) : null;
       const bucket = st ? timeBucketFromHour(st.hour) : null;
@@ -448,11 +405,6 @@ async function handleSchedule(req, res) {
         endDateTime,
         startTimeLocal,
         instructor,
-        location,
-        capacity: cap.capacity,
-        booked: cap.booked,
-        spotsAvailable: cap.spotsAvailable,
-        isWaitlistAvailable: cap.isWaitlistAvailable,
         _timeBucket: bucket,
       };
     });
@@ -469,135 +421,21 @@ async function handleSchedule(req, res) {
         ? `No classes found for ${date}.`
         : `Classes for ${date}: ` +
           classes
-            .slice(0, 20)
+            .slice(0, 25)
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    // Reduce payload if onlySay requested (recommended for voice tools)
-    const onlySay = String(params.onlySay ?? params.only_say ?? "").trim().toLowerCase();
-    const wantsOnlySay = onlySay === "1" || onlySay === "true" || onlySay === "yes";
-
-    if (wantsOnlySay) {
-      return sendSuccess(res, {
-        say,
-        text: say,
-        date,
-        timezone: STUDIO_TZ,
-      });
+    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
+    if (onlySay === "1" || onlySay === "true") {
+      return sendSuccess(res, { say, date, timezone: STUDIO_TZ });
     }
 
     return sendSuccess(res, {
       say,
-      text: say,
       date,
       timezone: STUDIO_TZ,
-      appliedLocationFilter: locationQuery,
       classes,
-      debug: DEBUG_MODE
-        ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput }
-        : undefined,
-    });
-  } catch (e) {
-    return sendFail(res, e?.message || "Server error");
-  }
-}
-
-/**
- * ============
- * ROUTES
- * ============
- */
-
-// Primary (recommended)
-app.all("/mb/schedule", handleSchedule);
-
-// Alias (so you can keep “main url” style if you ever want)
-app.all("/mindbody", (req, res) => {
-  // default onlySay=1 for tool stability unless caller overrides
-  if (req.query && req.query.onlySay === undefined) req.query.onlySay = "1";
-  if (req.body && typeof req.body === "object" && req.body.onlySay === undefined) req.body.onlySay = "1";
-  return handleSchedule(req, res);
-});
-
-// Locations
-app.all("/mb/locations", async (req, res) => {
-  const params = getIncomingParams(req);
-  console.log("HIT /mb/locations", { url: req.originalUrl, params });
-
-  try {
-    const data = await mbFetch("/site/locations", { method: "GET" });
-    const locations = normalizeArray(data, ["Locations", "locations"]);
-
-    return sendSuccess(res, {
-      say: "",
-      text: "",
-      count: locations.length,
-      locations: locations.map((l) => ({
-        id: l.Id ?? l.LocationId ?? null,
-        name: l.Name ?? l.LocationName ?? null,
-        address: l.Address ?? null,
-        city: l.City ?? null,
-        stateProv: l.StateProvCode ?? l.State ?? null,
-      })),
-    });
-  } catch (e) {
-    return sendFail(res, e?.message || "Server error");
-  }
-});
-
-// Pricing
-app.all("/mb/pricing", async (req, res) => {
-  const params = getIncomingParams(req);
-  console.log("HIT /mb/pricing", { url: req.originalUrl, params });
-
-  try {
-    const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
-      mbFetch("/sale/services", { method: "GET" }),
-      mbFetch("/sale/packages", { method: "GET" }),
-      mbFetch("/sale/contracts", { method: "GET" }),
-    ]);
-
-    const services =
-      servicesResp.status === "fulfilled" ? normalizeArray(servicesResp.value, ["Services", "services"]) : [];
-    const packages =
-      packagesResp.status === "fulfilled" ? normalizeArray(packagesResp.value, ["Packages", "packages"]) : [];
-    const contracts =
-      contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
-
-    return sendSuccess(res, {
-      say: "",
-      text: "",
-      offers: { services, packages, contracts },
-    });
-  } catch (e) {
-    return sendFail(res, e?.message || "Server error");
-  }
-});
-
-// Book (existing client required)
-app.all("/mb/book", async (req, res) => {
-  const params = getIncomingParams(req);
-  console.log("HIT /mb/book", { url: req.originalUrl, params });
-
-  try {
-    const classId = params.class_id || params.classId;
-    if (!classId) return sendFail(res, "Missing class_id");
-
-    const clientId = params.client_id || params.clientId;
-    if (!clientId) return sendFail(res, "Missing client_id (existing client required)");
-
-    const bookResp = await mbFetch("/class/addclienttoclass", {
-      method: "POST",
-      body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
-    });
-
-    return sendSuccess(res, {
-      say: "",
-      text: "",
-      booked: true,
-      clientId,
-      classId,
-      debug: DEBUG_MODE ? { raw: bookResp } : undefined,
+      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
     });
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
@@ -605,7 +443,4 @@ app.all("/mb/book", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
-
-
+app.listen(PORT, "0.0.0.0", () => console.log(`Server listening on ${PORT}`));
