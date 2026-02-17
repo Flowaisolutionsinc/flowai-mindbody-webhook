@@ -37,19 +37,22 @@ const STUDIO_TZ = "America/Vancouver";
  * ============
  * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
  * ============
- * ALWAYS return:
- * {
- *   success: true/false,
- *   results: { ... }
- * }
- * so Agency Vault can reliably map fields like: results.say
+ * IMPORTANT:
+ * We return TOP-LEVEL FIELDS like:
+ *   { success: true, say: "...", date: "...", ... }
+ *
+ * Agency Vault wraps the response as "results.*" in its UI,
+ * so this becomes available as:
+ *   results.say
+ *   results.date
+ * etc.
  */
-function sendSuccess(res, resultsObj = {}) {
-  return res.status(200).json({ success: true, results: resultsObj });
+function sendSuccess(res, payload = {}) {
+  return res.status(200).json({ success: true, ...payload });
 }
 
 function sendFail(res, message, extra = {}) {
-  return res.status(200).json({ success: false, results: { message, ...extra } });
+  return res.status(200).json({ success: false, message, ...extra });
 }
 
 /**
@@ -152,17 +155,14 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
       if (delta === 0) delta = 7;
       else delta += 7;
     }
-    // "this friday" behaves like regular "friday" (delta 0..6)
 
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
   // Parse long-form date like "February 21st, 2026"
-  // Remove ordinal suffixes: 1st/2nd/3rd/4th etc.
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
-    // Convert parsed date into YYYY-MM-DD in studio tz by formatting parts
     const parts = new Intl.DateTimeFormat("en-CA", {
       timeZone: tz,
       year: "numeric",
@@ -405,7 +405,7 @@ app.all("/mb/locations", async (req, res) => {
   }
 });
 
-// 2) SCHEDULE (date can be "Friday", "next Friday", "today", etc.)
+// 2) SCHEDULE
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/schedule", { url: req.originalUrl, params });
@@ -474,7 +474,8 @@ app.all("/mb/schedule", async (req, res) => {
     });
 
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+    if (wantInstructor)
+      classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x._timeBucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
@@ -489,29 +490,21 @@ app.all("/mb/schedule", async (req, res) => {
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    // ✅ Always return results.say AND include legacy nested results.results.say for smooth Agency Vault mapping
-    const resultPayload = {
+    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
+    if (onlySay === "1" || onlySay === "true") {
+      // IMPORTANT: say is TOP LEVEL
+      return sendSuccess(res, { date, timezone: STUDIO_TZ, say });
+    }
+
+    // IMPORTANT: say is TOP LEVEL
+    return sendSuccess(res, {
       date,
       timezone: STUDIO_TZ,
       appliedLocationFilter: resolveLocationQuery(params),
-
-      // Primary field: results.say  (because sendSuccess wraps it under "results")
       say,
-
-      // Legacy compatibility: results.results.say
-      results: { say },
-
       classes,
       debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
-    };
-
-    // If onlySay=1 -> still keep results.say + legacy results.results.say (optionally skip classes for speed)
-    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    if (onlySay === "1" || onlySay === "true") {
-      return sendSuccess(res, { date, timezone: STUDIO_TZ, say, results: { say } });
-    }
-
-    return sendSuccess(res, resultPayload);
+    });
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
   }
@@ -530,12 +523,19 @@ app.all("/mb/pricing", async (req, res) => {
     ]);
 
     const services =
-      servicesResp.status === "fulfilled" ? normalizeArray(servicesResp.value, ["Services", "services"]) : [];
+      servicesResp.status === "fulfilled"
+        ? normalizeArray(servicesResp.value, ["Services", "services"])
+        : [];
     const packages =
-      packagesResp.status === "fulfilled" ? normalizeArray(packagesResp.value, ["Packages", "packages"]) : [];
+      packagesResp.status === "fulfilled"
+        ? normalizeArray(packagesResp.value, ["Packages", "packages"])
+        : [];
     const contracts =
-      contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
+      contractsResp.status === "fulfilled"
+        ? normalizeArray(contractsResp.value, ["Contracts", "contracts"])
+        : [];
 
+    // top-level offers
     return sendSuccess(res, { offers: { services, packages, contracts } });
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
@@ -610,6 +610,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
