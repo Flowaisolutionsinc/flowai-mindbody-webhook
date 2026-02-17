@@ -4,13 +4,12 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * --- CORS / Preflight ---
+ * --- CORS / Preflight (helps dashboards + browsers) ---
  */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -38,18 +37,33 @@ const STUDIO_TZ = "America/Vancouver";
  * ============
  * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
  * ============
- * ALWAYS return:
+ * We FORCE both:
+ *  - results.say
+ *  - results.results.say
+ *
+ * by returning:
  * {
- *   success: true/false,
- *   results: { ... }   <-- "results.say" must exist when successful
+ *   success: true,
+ *   results: {
+ *     ...payload,
+ *     results: payload
+ *   }
  * }
  */
+function wrapResults(payload = {}) {
+  const obj = payload && typeof payload === "object" ? payload : { value: payload };
+  return { ...obj, results: obj };
+}
+
 function sendSuccess(res, resultsObj = {}) {
-  return res.status(200).json({ success: true, results: resultsObj });
+  return res.status(200).json({ success: true, results: wrapResults(resultsObj) });
 }
 
 function sendFail(res, message, extra = {}) {
-  return res.status(200).json({ success: false, results: { message, ...extra } });
+  return res.status(200).json({
+    success: false,
+    results: wrapResults({ message, ...extra }),
+  });
 }
 
 /**
@@ -82,13 +96,23 @@ function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
 }
 
 const WEEKDAY_MAP = {
-  sunday: 0, sun: 0,
-  monday: 1, mon: 1,
-  tuesday: 2, tue: 2, tues: 2,
-  wednesday: 3, wed: 3,
-  thursday: 4, thu: 4, thur: 4, thurs: 4,
-  friday: 5, fri: 5,
-  saturday: 6, sat: 6,
+  sunday: 0,
+  sun: 0,
+  monday: 1,
+  mon: 1,
+  tuesday: 2,
+  tue: 2,
+  tues: 2,
+  wednesday: 3,
+  wed: 3,
+  thursday: 4,
+  thu: 4,
+  thur: 4,
+  thurs: 4,
+  friday: 5,
+  fri: 5,
+  saturday: 6,
+  sat: 6,
 };
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
@@ -192,7 +216,6 @@ function toLowerClean(x) {
   return (x ?? "").toString().toLowerCase().trim();
 }
 
-// Mindbody often returns naive local times "2026-02-15T08:30:00"
 function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
@@ -257,7 +280,6 @@ function resolveLocationQuery(params) {
   if (DEFAULT_LOCATION_IDS) return { LocationIds: DEFAULT_LOCATION_IDS };
   if (DEFAULT_LOCATION_ID) return { LocationIds: DEFAULT_LOCATION_ID };
 
-  // If nothing provided, still allow request to run (Mindbody may default)
   return {};
 }
 
@@ -400,6 +422,8 @@ app.all("/mb/schedule", async (req, res) => {
     if (!date) {
       return sendFail(res, "Could not understand the requested date.", {
         received: { date: rawDateInput },
+        hint:
+          "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
       });
     }
 
@@ -470,32 +494,15 @@ app.all("/mb/schedule", async (req, res) => {
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    // Support onlySay / only_say / onlysay
-    const onlySayRaw =
-      params.onlySay ?? params.only_say ?? params.onlysay ?? params.onlySAY ?? "";
-    const onlySay = String(onlySayRaw).trim().toLowerCase();
-    const wantsOnlySay = onlySay === "1" || onlySay === "true" || onlySay === "yes";
-
-    const payload = wantsOnlySay
-      ? { date, timezone: STUDIO_TZ, say, text: say }
-      : {
-          date,
-          timezone: STUDIO_TZ,
-          appliedLocationFilter: locationQuery,
-          say,
-          text: say,
-          classes,
-          debug: DEBUG_MODE
-            ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput }
-            : undefined,
-        };
-
-    // IMPORTANT: keep response stable; DO NOT nest "results" inside results.
-    // Also duplicate say at top-level for compatibility if some mappers look there.
-    const out = { ...payload };
-    out.say = payload.say;
-
-    return sendSuccess(res, out);
+    return sendSuccess(res, {
+      date,
+      timezone: STUDIO_TZ,
+      appliedLocationFilter: resolveLocationQuery(params),
+      say,
+      text: say,
+      classes,
+      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
+    });
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
   }
@@ -526,7 +533,7 @@ app.all("/mb/pricing", async (req, res) => {
   }
 });
 
-// 4) BOOK
+// 4) BOOK (leave hardening for next)
 app.all("/mb/book", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/book", { url: req.originalUrl, params });
@@ -576,7 +583,7 @@ app.all("/mindbody", async (req, res) => {
     req.url = "/mb/locations";
     return app._router.handle(req, res);
   }
-  if (action === "get_today_schedule") {
+  if (action === "get_today_schedule" || action === "get_schedule_by_date") {
     req.url = "/mb/schedule";
     return app._router.handle(req, res);
   }
@@ -594,6 +601,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
