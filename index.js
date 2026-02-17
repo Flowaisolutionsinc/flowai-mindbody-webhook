@@ -10,6 +10,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -29,25 +30,28 @@ const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
 const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
-
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
+
 const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE SHAPE (IMPORTANT)
+ * RESPONSE SHAPE (IMPORTANT FOR CUSTOM ACTIONS)
  * ============
- * Your server MUST NOT return a nested `results` object.
- * The platform wraps your response inside its own `results`,
- * so:
- *   top-level `say`  -> platform field `results.say`
+ * Your platform wraps your JSON inside its own `results`.
+ * So the easiest stable mapping is:
+ * - return top-level `say`
+ * - platform reads: results.say
+ *
+ * GUARANTEE:
+ * - success responses ALWAYS include say + text
+ * - fail responses ALWAYS include say + text
  */
 function sendSuccess(res, payload = {}) {
-  // Always include say/text fields (even if empty) to stabilize mappings.
-  const say = typeof payload.say === "string" ? payload.say : "";
-  const text = typeof payload.text === "string" ? payload.text : "";
+  const say = (payload.say ?? payload.text ?? "").toString();
+  const text = (payload.text ?? payload.say ?? "").toString();
 
-  // Remove any accidental nested results key
+  // prevent accidental nested results
   const { results, ...rest } = payload;
 
   return res.status(200).json({
@@ -59,19 +63,22 @@ function sendSuccess(res, payload = {}) {
 }
 
 function sendFail(res, message, extra = {}) {
+  const msg = (message || "Please try again.").toString();
+  const say = `Sorry — my system hiccupped. ${msg}`;
   const { results, ...rest } = extra;
+
   return res.status(200).json({
     success: false,
-    say: "",
-    text: "",
-    message: message || "Unknown error",
+    say,
+    text: say,
+    message: msg,
     ...rest,
   });
 }
 
 /**
  * ============
- * DATE HELPERS
+ * TIME / DATE HELPERS
  * ============
  */
 function nowInTZDateString(tz = STUDIO_TZ) {
@@ -121,7 +128,15 @@ function looksLikeYYYYMMDD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-// Resolves: today/tomorrow/Friday/next Friday/Feb 21/February 21st, 2026/the 17th
+/**
+ * Accepts:
+ * - "today", "tomorrow"
+ * - "friday", "next friday", "this friday"
+ * - "2026-02-17"
+ * - "February 21st, 2026"
+ * - "the 17th"
+ * Returns: YYYY-MM-DD in studio TZ, or null if cannot parse
+ */
 function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (!raw) return nowInTZDateString(tz);
 
@@ -146,6 +161,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     let delta = (targetIdx - todayIdx + 7) % 7;
 
     if (nextPrefix) {
+      // if "next friday" and today is friday, jump 7
       if (delta === 0) delta = 7;
       else delta += 7;
     }
@@ -153,7 +169,6 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
-  // Try parsing natural dates
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -204,6 +219,7 @@ function toLowerClean(x) {
   return (x ?? "").toString().toLowerCase().trim();
 }
 
+// Mindbody often returns naive local times "2026-02-15T08:30:00"
 function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
@@ -253,8 +269,7 @@ function extractCapacityInfo(c) {
   const spotsAvailable =
     capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
 
-  const isWaitlistAvailable =
-    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
+  const isWaitlistAvailable = c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
 
   return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
 }
@@ -318,7 +333,9 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
 }
 
 /**
- * Collect params from query + body (supports tool-call payloads too)
+ * ============
+ * UNIVERSAL PARAMS UNWRAP (query + body + tool-call payloads)
+ * ============
  */
 function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
@@ -372,7 +389,7 @@ app.all("/health", (req, res) => {
 
 /**
  * ============
- * SCHEDULE (core)
+ * CORE: SCHEDULE HANDLER (shared by /mb/schedule and /mindbody alias)
  * ============
  */
 async function handleSchedule(req, res) {
@@ -380,16 +397,12 @@ async function handleSchedule(req, res) {
   console.log("HIT schedule", { path: req.path, url: req.originalUrl, params });
 
   try {
-    const rawDateInput =
-      params.date || params.day || params.requested_day || params.requestedDate;
-
+    const rawDateInput = params.date || params.day || params.requested_day || params.requestedDate;
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
 
     if (!date) {
       return sendFail(res, "Could not understand the requested date.", {
         received: { date: rawDateInput },
-        hint:
-          "Send YYYY-MM-DD, or words like today, tomorrow, Friday, next Friday, or a date like February 21, 2026.",
       });
     }
 
@@ -460,20 +473,29 @@ async function handleSchedule(req, res) {
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    // For Custom Actions, we want "say" to be the ONLY thing needed.
-    // We'll still return classes, but the agent should read results.say.
-    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    if (onlySay === "1" || onlySay === "true") {
-      return sendSuccess(res, { say, date, timezone: STUDIO_TZ });
+    // Reduce payload if onlySay requested (recommended for voice tools)
+    const onlySay = String(params.onlySay ?? params.only_say ?? "").trim().toLowerCase();
+    const wantsOnlySay = onlySay === "1" || onlySay === "true" || onlySay === "yes";
+
+    if (wantsOnlySay) {
+      return sendSuccess(res, {
+        say,
+        text: say,
+        date,
+        timezone: STUDIO_TZ,
+      });
     }
 
     return sendSuccess(res, {
       say,
+      text: say,
       date,
       timezone: STUDIO_TZ,
       appliedLocationFilter: locationQuery,
       classes,
-      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
+      debug: DEBUG_MODE
+        ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput }
+        : undefined,
     });
   } catch (e) {
     return sendFail(res, e?.message || "Server error");
@@ -486,18 +508,18 @@ async function handleSchedule(req, res) {
  * ============
  */
 
-// canonical schedule route
+// Primary (recommended)
 app.all("/mb/schedule", handleSchedule);
 
-// ALIAS route (this is what your Custom Action is currently pointing to)
-app.all("/mindbody", async (req, res) => {
-  // default to onlySay for the action, unless explicitly overridden
+// Alias (so you can keep “main url” style if you ever want)
+app.all("/mindbody", (req, res) => {
+  // default onlySay=1 for tool stability unless caller overrides
   if (req.query && req.query.onlySay === undefined) req.query.onlySay = "1";
   if (req.body && typeof req.body === "object" && req.body.onlySay === undefined) req.body.onlySay = "1";
   return handleSchedule(req, res);
 });
 
-// locations
+// Locations
 app.all("/mb/locations", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/locations", { url: req.originalUrl, params });
@@ -523,7 +545,7 @@ app.all("/mb/locations", async (req, res) => {
   }
 });
 
-// pricing (kept simple)
+// Pricing
 app.all("/mb/pricing", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/pricing", { url: req.originalUrl, params });
@@ -552,7 +574,7 @@ app.all("/mb/pricing", async (req, res) => {
   }
 });
 
-// booking (requires client_id)
+// Book (existing client required)
 app.all("/mb/book", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/book", { url: req.originalUrl, params });
@@ -584,5 +606,6 @@ app.all("/mb/book", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
