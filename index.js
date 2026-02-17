@@ -489,20 +489,26 @@ app.all("/mb/schedule", async (req, res) => {
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
-    // Always return results.say so Agency Vault mapping works
+    // ✅ Always return results.say AND include legacy nested results.results.say for smooth Agency Vault mapping
     const resultPayload = {
       date,
       timezone: STUDIO_TZ,
       appliedLocationFilter: resolveLocationQuery(params),
+
+      // Primary field: results.say  (because sendSuccess wraps it under "results")
       say,
+
+      // Legacy compatibility: results.results.say
+      results: { say },
+
       classes,
       debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
     };
 
-    // If onlySay=1 -> still keep results.say (optionally skip classes for speed)
+    // If onlySay=1 -> still keep results.say + legacy results.results.say (optionally skip classes for speed)
     const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
     if (onlySay === "1" || onlySay === "true") {
-      return sendSuccess(res, { date, timezone: STUDIO_TZ, say });
+      return sendSuccess(res, { date, timezone: STUDIO_TZ, say, results: { say } });
     }
 
     return sendSuccess(res, resultPayload);
@@ -604,6 +610,7 @@ app.all("/mindbody", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
