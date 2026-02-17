@@ -27,7 +27,7 @@ const apiKey = process.env.MINDBODY_API_KEY || "";
 const sourceName = process.env.MINDBODY_SOURCE_NAME || "";
 const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD || "";
 
-const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
+const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "1").trim(); // ✅ default to 1
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
@@ -37,14 +37,13 @@ const STUDIO_TZ = "America/Vancouver";
  * ============
  * RESPONSE SHAPE (IMPORTANT FOR AGENCY VAULT)
  * ============
- * Agency Vault wraps your entire JSON inside its own `results`.
- * So DO NOT return a nested `results` object from your server.
+ * Agency Vault WRAPS your webhook response under `results`.
+ * So YOU must return a FLAT object:
  *
- * ✅ Return:
- * { success: true, say: "...", ... }
+ *   { success: true, say: "...", ... }
  *
- * Then Agency Vault field path becomes:
- * results.say
+ * so Agency Vault can map:
+ *   results.say
  */
 function sendSuccess(res, payload = {}) {
   return res.status(200).json({ success: true, ...payload });
@@ -116,6 +115,14 @@ function looksLikeYYYYMMDD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
+/**
+ * Accepts:
+ * - "today", "tomorrow"
+ * - "friday", "next friday", "this friday"
+ * - "2026-02-17"
+ * - "February 21st, 2026"
+ * Returns: YYYY-MM-DD in studio TZ, or null if cannot parse
+ */
 function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (!raw) return nowInTZDateString(tz);
 
@@ -251,6 +258,7 @@ function extractCapacityInfo(c) {
 }
 
 function resolveLocationQuery(params) {
+  // ✅ Allow overrides, but default to env=1
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
@@ -308,6 +316,11 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   return json ?? { raw: text };
 }
 
+/**
+ * ============
+ * UNIVERSAL PARAMS UNWRAP
+ * ============
+ */
 function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
   let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
@@ -338,7 +351,6 @@ function getIncomingParams(req) {
  * ============
  */
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
-
 app.get("/health", (req, res) => {
   return sendSuccess(res, {
     ok: true,
@@ -348,8 +360,8 @@ app.get("/health", (req, res) => {
       hasSourceName: Boolean(sourceName),
       hasSourcePassword: Boolean(sourcePassword),
       baseUrl: MINDBODY_BASE_URL,
-      hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
-      hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
+      defaultLocationId: DEFAULT_LOCATION_ID,
+      defaultLocationIds: DEFAULT_LOCATION_IDS,
       debugMode: DEBUG_MODE,
       tz: STUDIO_TZ,
     },
@@ -470,17 +482,23 @@ app.all("/mb/schedule", async (req, res) => {
             .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
             .join(" | ");
 
+    // ✅ Fast path for voice agents / AV: tiny payload
     const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
     if (onlySay === "1" || onlySay === "true") {
-      return sendSuccess(res, { date, timezone: STUDIO_TZ, say });
+      return sendSuccess(res, {
+        date,
+        timezone: STUDIO_TZ,
+        appliedLocationFilter: locationQuery,
+        say, // ✅ this becomes results.say in Agency Vault
+      });
     }
 
     return sendSuccess(res, {
       date,
       timezone: STUDIO_TZ,
       appliedLocationFilter: locationQuery,
-      say,
-      classes,
+      say,     // ✅ results.say
+      classes, // optional bigger payload
       debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
     });
   } catch (e) {
@@ -513,7 +531,7 @@ app.all("/mb/pricing", async (req, res) => {
   }
 });
 
-// 4) BOOK
+// 4) BOOK (kept as-is; you can extend later)
 app.all("/mb/book", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/book", { url: req.originalUrl, params });
@@ -543,6 +561,7 @@ app.all("/mb/book", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
