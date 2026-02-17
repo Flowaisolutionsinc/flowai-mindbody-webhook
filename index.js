@@ -31,35 +31,34 @@ const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").tri
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
-const STUDIO_TZ = process.env.TZ?.trim() || "America/Vancouver";
+const STUDIO_TZ = process.env.TZ || "America/Vancouver";
 
 /**
- * ============
- * RESPONSE SHAPE (AGENCY VAULT COMPAT)
- * ============
- * AV often expects results.say (selected field in Custom Action)
- * We'll always include results.say, and also top-level say/text for debug/manual testing.
+ * =========================
+ * AGENCY VAULT COMPAT OUTPUT
+ * =========================
+ * IMPORTANT:
+ * - Agency Vault typically WRAPS your JSON response under "results".
+ * - If you ALSO include a nested "results" object, AV ends up with results.results.say etc.
+ *
+ * So we ONLY return top-level:
+ *   { success: true, say: "...", text: "..." }
+ *
+ * Then AV can reliably read results.say (because it wraps top-level under results).
  */
-function sendSuccess(res, payload = {}) {
-  return res.status(200).json({ success: true, ...payload });
+function sendOk(res, payload = {}) {
+  return res.status(200).json(payload);
 }
-function sendFail(res, message, extra = {}) {
-  return res.status(200).json({ success: false, message, ...extra });
-}
-function withSpeakFields(payload, sayText) {
-  const say = (sayText || "").toString();
-  const text = say;
 
-  return {
-    ...payload,
-    say,
-    text,
-    results: {
-      ...(payload.results && typeof payload.results === "object" ? payload.results : {}),
-      say,
-      text,
-    },
-  };
+function okSay(res, sayText, extra = {}) {
+  const say = (sayText || "").toString();
+  return sendOk(res, { success: true, say, text: say, ...extra });
+}
+
+function failSay(res, sayText, extra = {}) {
+  const say = (sayText || "").toString();
+  // Keep HTTP 200 so the tool runner doesn’t treat it as a hard failure
+  return sendOk(res, { success: false, say, text: say, ...extra });
 }
 
 /**
@@ -155,6 +154,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
+  // Remove suffixes like 19th -> 19
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -241,25 +241,6 @@ function localDayRange(dateStr) {
   };
 }
 
-function extractCapacityInfo(c) {
-  const candidatesCapacity = [c.MaxCapacity, c.WebCapacity, c.Capacity, c.ClassCapacity];
-  const candidatesBooked = [c.TotalBooked, c.Visits, c.TotalBookedClients, c.Booked, c.NumBooked];
-
-  const capacity = candidatesCapacity.find((v) => Number.isFinite(Number(v)));
-  const booked = candidatesBooked.find((v) => Number.isFinite(Number(v)));
-
-  const capNum = capacity !== undefined ? Number(capacity) : null;
-  const bookedNum = booked !== undefined ? Number(booked) : null;
-
-  const spotsAvailable =
-    capNum !== null && bookedNum !== null ? Math.max(capNum - bookedNum, 0) : null;
-
-  const isWaitlistAvailable =
-    c.IsWaitlistAvailable ?? c.WaitlistAvailable ?? c.AllowWaitlist ?? null;
-
-  return { capacity: capNum, booked: bookedNum, spotsAvailable, isWaitlistAvailable };
-}
-
 function resolveLocationQuery(params) {
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
@@ -271,22 +252,6 @@ function resolveLocationQuery(params) {
   if (DEFAULT_LOCATION_ID) return { LocationIds: DEFAULT_LOCATION_ID };
 
   return {};
-}
-
-/**
- * Hard limit spoken payload so AV / TTS doesn’t choke.
- * (AV failures often look like “system hiccup” in the transcript.)
- */
-function hardTruncateSpeak(s, maxChars = 850) {
-  const str = (s || "").toString();
-  if (str.length <= maxChars) return str;
-  // Trim nicely at a separator if possible
-  const cut = str.slice(0, maxChars);
-  const lastBar = cut.lastIndexOf("|");
-  if (lastBar > 200) return cut.slice(0, lastBar).trim();
-  const lastPeriod = cut.lastIndexOf(".");
-  if (lastPeriod > 200) return cut.slice(0, lastPeriod + 1).trim();
-  return cut.trim();
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -338,7 +303,6 @@ function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
   let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
 
-  // Supports tool-runners that embed function arguments in toolCalls/toolCallList
   const maybeArgs =
     req.body?.message?.toolCallList?.[0]?.function?.arguments ??
     req.body?.message?.toolCalls?.[0]?.function?.arguments ??
@@ -351,7 +315,6 @@ function getIncomingParams(req) {
     if (parsed && typeof parsed === "object") b = { ...b, ...parsed };
   }
 
-  // Supports payloads like { params: {...} }
   if (b.params && typeof b.params === "object") {
     b = { ...b.params, ...b };
     delete b.params;
@@ -368,19 +331,17 @@ function getIncomingParams(req) {
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 
 app.get("/health", (req, res) => {
-  return sendSuccess(res, {
+  return sendOk(res, {
     ok: true,
-    envDetected: {
-      hasSiteId: Boolean(siteId),
-      hasApiKey: Boolean(apiKey),
-      hasSourceName: Boolean(sourceName),
-      hasSourcePassword: Boolean(sourcePassword),
-      baseUrl: MINDBODY_BASE_URL,
-      hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
-      hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
-      debugMode: DEBUG_MODE,
-      tz: STUDIO_TZ,
-    },
+    hasSiteId: Boolean(siteId),
+    hasApiKey: Boolean(apiKey),
+    hasSourceName: Boolean(sourceName),
+    hasSourcePassword: Boolean(sourcePassword),
+    baseUrl: MINDBODY_BASE_URL,
+    hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
+    hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
+    debugMode: DEBUG_MODE,
+    tz: STUDIO_TZ,
   });
 });
 
@@ -390,7 +351,7 @@ app.get("/health", (req, res) => {
  * ============
  */
 
-// 1) LOCATIONS
+// LOCATIONS
 app.all("/mb/locations", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/locations", { method: req.method, url: req.originalUrl, params });
@@ -399,28 +360,26 @@ app.all("/mb/locations", async (req, res) => {
     const data = await mbFetch("/site/locations", { method: "GET" });
     const locations = normalizeArray(data, ["Locations", "locations"]);
 
-    return sendSuccess(
+    return okSay(
       res,
-      withSpeakFields(
-        {
-          count: locations.length,
-          locations: locations.map((l) => ({
-            id: l.Id ?? l.LocationId ?? null,
-            name: l.Name ?? l.LocationName ?? null,
-            address: l.Address ?? null,
-            city: l.City ?? null,
-            stateProv: l.StateProvCode ?? l.State ?? null,
-          })),
-        },
-        `Found ${locations.length} locations.`
-      )
+      `Found ${locations.length} locations.`,
+      {
+        count: locations.length,
+        locations: locations.map((l) => ({
+          id: l.Id ?? l.LocationId ?? null,
+          name: l.Name ?? l.LocationName ?? null,
+          address: l.Address ?? null,
+          city: l.City ?? null,
+          stateProv: l.StateProvCode ?? l.State ?? null,
+        })),
+      }
     );
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return failSay(res, "I can’t access locations right now.", { message: e?.message || "Server error" });
   }
 });
 
-// 2) SCHEDULE (small + reliable)
+// SCHEDULE (SMALL + BUCKETED)
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
@@ -430,10 +389,11 @@ app.all("/mb/schedule", async (req, res) => {
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
 
     if (!date) {
-      const say = hardTruncateSpeak(
-        "Sorry — I couldn’t understand that date. Please say today, tomorrow, morning/afternoon/evening, or a specific date like February 21st."
+      return failSay(
+        res,
+        "Sorry — I didn’t catch the date. Would you like today, tomorrow, or a specific date?",
+        { received: { date: rawDateInput } }
       );
-      return sendSuccess(res, withSpeakFields({ date: null, timezone: STUDIO_TZ }, say));
     }
 
     const { startLocal, endLocal } = localDayRange(date);
@@ -448,16 +408,13 @@ app.all("/mb/schedule", async (req, res) => {
 
     const wantType = toLowerClean(params.class_type || params.class_name);
     const wantInstructor = toLowerClean(params.instructor_name);
-    const wantTime = toLowerClean(params.time);
 
-    // NEW: time_range is how we keep speech small and stable
-    const timeRange = toLowerClean(params.time_range);
+    // NEW: time_range bucket from caller (“morning” | “afternoon” | “evening”)
+    const wantTimeRange = toLowerClean(params.time_range);
 
     let classes = classesRaw.map((c) => {
-      const classId = c.Id ?? c.ClassId ?? null;
       const name = c.ClassDescription?.Name ?? c.Name ?? "Class";
       const startDateTime = c.StartDateTime ?? null;
-      const endDateTime = c.EndDateTime ?? null;
 
       let instructor = c.Staff?.Name ?? c.InstructorName ?? null;
       if (!instructor && c.Staff) {
@@ -466,114 +423,79 @@ app.all("/mb/schedule", async (req, res) => {
         instructor = [first, last].filter(Boolean).join(" ").trim() || null;
       }
 
-      const location = c.Location?.Name ?? c.LocationName ?? null;
-      const cap = extractCapacityInfo(c);
-
       const st = parseNaiveISO(startDateTime);
       const startTimeLocal = st ? format12h(st.hour, st.minute) : null;
       const bucket = st ? timeBucketFromHour(st.hour) : null;
 
       return {
-        classId,
         name,
-        startDateTime,
-        endDateTime,
         startTimeLocal,
         instructor,
-        location,
-        capacity: cap.capacity,
-        booked: cap.booked,
-        spotsAvailable: cap.spotsAvailable,
-        isWaitlistAvailable: cap.isWaitlistAvailable,
-        _timeBucket: bucket,
+        _bucket: bucket,
       };
     });
 
-    // Filters
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor)
-      classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-    if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
+    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
 
-    // Bucket filter if time_range provided
-    if (timeRange === "morning" || timeRange === "afternoon" || timeRange === "evening") {
-      classes = classes.filter((x) => toLowerClean(x._timeBucket) === timeRange);
+    const morning = classes.filter((c) => c._bucket === "morning");
+    const afternoon = classes.filter((c) => c._bucket === "afternoon");
+    const evening = classes.filter((c) => c._bucket === "evening");
+
+    // Default small response ALWAYS
+    // - If no time_range specified: give counts + ask which bucket
+    // - If time_range specified: list only that bucket (short list, includes instructor)
+    const maxItems = 8;
+
+    const listBucket = (label, arr) => {
+      if (!arr.length) return `${label}: none`;
+      const shown = arr.slice(0, maxItems).map((c) => {
+        const who = c.instructor ? ` with ${c.instructor}` : "";
+        return `${c.startTimeLocal || ""} ${c.name}${who}`.trim();
+      });
+      const more = arr.length > maxItems ? ` | plus ${arr.length - maxItems} more` : "";
+      return `${label}: ${shown.join(" | ")}${more}`;
+    };
+
+    if (wantTimeRange === "morning" || wantTimeRange === "afternoon" || wantTimeRange === "evening") {
+      const picked =
+        wantTimeRange === "morning" ? morning : wantTimeRange === "afternoon" ? afternoon : evening;
+
+      const say =
+        picked.length === 0
+          ? `No ${wantTimeRange} classes found for ${date}.`
+          : `${wantTimeRange[0].toUpperCase()}${wantTimeRange.slice(1)} classes for ${date}: ` +
+            picked
+              .slice(0, maxItems)
+              .map((c) => `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`)
+              .join(" | ") +
+            (picked.length > maxItems ? ` | plus ${picked.length - maxItems} more` : "");
+
+      return okSay(res, say, { date, timezone: STUDIO_TZ });
     }
 
-    // Prepare buckets for “pick a time of day”
-    const bucketCounts = { morning: 0, afternoon: 0, evening: 0 };
-    for (const c of classes) {
-      const b = toLowerClean(c._timeBucket);
-      if (b === "morning" || b === "afternoon" || b === "evening") bucketCounts[b] += 1;
+    // No bucket requested → summarize counts and ask which part of day
+    const total = classes.length;
+    if (total === 0) {
+      return okSay(res, `No classes found for ${date}.`, { date, timezone: STUDIO_TZ });
     }
-
-    // Remove internal field for response objects
-    const cleanedClasses = classes.map(({ _timeBucket, ...rest }) => rest);
-
-    const onlySay = toLowerClean(params.onlySay || params.only_say);
-
-    // If onlySay=1 and NO time_range provided, do NOT dump the whole day.
-    // Force a choice so AV never chokes on huge speech.
-    if ((onlySay === "1" || onlySay === "true") && !(timeRange === "morning" || timeRange === "afternoon" || timeRange === "evening")) {
-      if (cleanedClasses.length === 0) {
-        const say = hardTruncateSpeak(`No classes found for ${date}.`);
-        return sendSuccess(res, withSpeakFields({ date, timezone: STUDIO_TZ }, say));
-      }
-
-      const say = hardTruncateSpeak(
-        `I can share the schedule for ${date} by time of day. Do you want morning, afternoon, or evening?`
-      );
-      return sendSuccess(res, withSpeakFields({ date, timezone: STUDIO_TZ }, say));
-    }
-
-    // Build spoken list (always small)
-    const maxItems = (onlySay === "1" || onlySay === "true") ? 10 : 20;
 
     const say =
-      cleanedClasses.length === 0
-        ? `No classes found for ${date}${timeRange ? ` (${timeRange})` : ""}.`
-        : `Classes for ${date}${timeRange ? ` (${timeRange})` : ""}: ` +
-          cleanedClasses
-            .slice(0, maxItems)
-            .map((c) => {
-              const t = c.startTimeLocal ? `${c.startTimeLocal} ` : "";
-              const inst = c.instructor ? ` with ${c.instructor}` : "";
-              return `${t}${c.name}${inst}`;
-            })
-            .join(" | ");
+      `For ${date}, we have ` +
+      `${morning.length} in the morning, ${afternoon.length} in the afternoon, and ${evening.length} in the evening. ` +
+      `Which would you like — morning, afternoon, or evening?`;
 
-    const finalSay = hardTruncateSpeak(say);
-
-    // For onlySay=1, return only speech + date/tz (small payload)
-    if (onlySay === "1" || onlySay === "true") {
-      return sendSuccess(res, withSpeakFields({ date, timezone: STUDIO_TZ }, finalSay));
-    }
-
-    // Full payload (debug/manual use)
-    return sendSuccess(
-      res,
-      withSpeakFields(
-        {
-          date,
-          timezone: STUDIO_TZ,
-          appliedLocationFilter: locationQuery,
-          countsByBucket: bucketCounts,
-          classes: cleanedClasses,
-          debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
-        },
-        finalSay
-      )
-    );
+    return okSay(res, say, { date, timezone: STUDIO_TZ });
   } catch (e) {
-    // IMPORTANT: Still return a speakable message so AV doesn't "blank" and pretend it failed
-    const say = hardTruncateSpeak(
-      "I’m having trouble pulling the schedule right now. Please try again in a moment."
+    return failSay(
+      res,
+      "I’m not able to pull the schedule right now. Would you like me to try again?",
+      { message: e?.message || "Server error" }
     );
-    return sendSuccess(res, withSpeakFields({ timezone: STUDIO_TZ, error: DEBUG_MODE ? e?.message : undefined }, say));
   }
 });
 
-// 3) PRICING
+// PRICING
 app.all("/mb/pricing", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/pricing", { method: req.method, url: req.originalUrl, params });
@@ -592,57 +514,41 @@ app.all("/mb/pricing", async (req, res) => {
     const contracts =
       contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    const say = hardTruncateSpeak(
-      "I pulled pricing successfully. I can share intro options, drop-ins, and memberships."
-    );
-
-    return sendSuccess(
+    return okSay(
       res,
-      withSpeakFields(
-        {
-          offers: { services, packages, contracts },
-        },
-        say
-      )
+      "I pulled pricing successfully.",
+      { offers: { services, packages, contracts } }
     );
   } catch (e) {
-    const say = hardTruncateSpeak("I’m having trouble pulling pricing right now. Please try again in a moment.");
-    return sendSuccess(res, withSpeakFields({}, say));
+    return failSay(res, "I can’t access pricing right now.", { message: e?.message || "Server error" });
   }
 });
 
-// 4) BOOK (existing-client only in this version)
+// BOOK (existing-client only in this version)
 app.all("/mb/book", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/book", { method: req.method, url: req.originalUrl, params });
 
   try {
     const classId = params.class_id || params.classId;
-    if (!classId) return sendFail(res, "Missing class_id");
+    if (!classId) return failSay(res, "Missing class_id.");
 
     const clientId = params.client_id || params.clientId;
-    if (!clientId) return sendFail(res, "Missing client_id (existing client required)");
+    if (!clientId) return failSay(res, "Missing client_id (existing client required).");
 
     const bookResp = await mbFetch("/class/addclienttoclass", {
       method: "POST",
       body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
     });
 
-    return sendSuccess(
-      res,
-      withSpeakFields(
-        {
-          booked: true,
-          clientId,
-          classId,
-          raw: DEBUG_MODE ? bookResp : undefined,
-        },
-        "Booked successfully."
-      )
-    );
+    return okSay(res, "Booked successfully.", {
+      booked: true,
+      clientId,
+      classId,
+      raw: DEBUG_MODE ? bookResp : undefined,
+    });
   } catch (e) {
-    const say = hardTruncateSpeak("I couldn’t complete that booking just now. Please try again.");
-    return sendSuccess(res, withSpeakFields({}, say));
+    return failSay(res, "I couldn’t complete that booking.", { message: e?.message || "Server error" });
   }
 });
 
