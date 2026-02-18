@@ -37,23 +37,22 @@ const STUDIO_TZ = "America/Vancouver";
  * ============
  * RESPONSE (AGENCY VAULT COMPAT)
  * ============
- * We return ONLY:
- * { success: true/false, results: { say, text, ... } }
- *
  * IMPORTANT:
- * - NO top-level say/text
- * - NO nested results inside results
+ * - DO NOT return { results: {...} } from the server.
+ * - Agency Vault wraps the API response into `results.*` automatically.
+ * - So we return top-level: { success, say, text, ... }
  */
-function ok(res, results = {}) {
-  return res.status(200).json({ success: true, results });
+function ok(res, payload = {}) {
+  return res.status(200).json({ success: true, ...payload });
 }
 
 function fail(res, message, extra = {}) {
-  // do NOT put a fake "say" here; leave it empty so the agent knows it failed
   return res.status(200).json({
     success: false,
     message: message || "Request failed",
-    results: { say: "", text: "", ...extra },
+    say: "",
+    text: "",
+    ...extra,
   });
 }
 
@@ -377,7 +376,8 @@ app.all("/mb/schedule", async (req, res) => {
   try {
     const rawDateInput = params.date || params.day || params.requested_day || params.requestedDate;
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
-    if (!date) return fail(res, "Could not understand the requested date.", { receivedDate: rawDateInput });
+    if (!date)
+      return fail(res, "Could not understand the requested date.", { receivedDate: rawDateInput });
 
     const { startLocal, endLocal } = localDayRange(date);
 
@@ -411,17 +411,12 @@ app.all("/mb/schedule", async (req, res) => {
       const startTimeLocal = st ? format12h(st.hour, st.minute) : null;
       const bucket = st ? timeBucketFromHour(st.hour) : null;
 
-      return {
-        classId,
-        name,
-        startTimeLocal,
-        instructor,
-        bucket,
-      };
+      return { classId, name, startTimeLocal, instructor, bucket };
     });
 
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+    if (wantInstructor)
+      classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x.bucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
@@ -453,9 +448,7 @@ app.all("/mb/schedule", async (req, res) => {
     }
 
     const say =
-      parts.length === 0
-        ? `No classes found for ${date}.`
-        : `Classes for ${date}. ${parts.join(" ")}`;
+      parts.length === 0 ? `No classes found for ${date}.` : `Classes for ${date}. ${parts.join(" ")}`;
 
     return ok(res, {
       say,
@@ -528,3 +521,4 @@ app.all("/mb/book", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
