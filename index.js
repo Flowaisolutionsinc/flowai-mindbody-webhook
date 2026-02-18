@@ -10,7 +10,6 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -28,36 +27,40 @@ const apiKey = (process.env.MINDBODY_API_KEY || "").trim();
 const sourceName = (process.env.MINDBODY_SOURCE_NAME || "").trim();
 const sourcePassword = (process.env.MINDBODY_SOURCE_PASSWORD || "").trim();
 
-const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
+const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "1").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 const STUDIO_TZ = process.env.TZ || "America/Vancouver";
 
 /**
- * ============
- * IMPORTANT RESPONSE SHAPE (AGENCY VAULT SAFE)
- * ============
- * Agency Vault wraps the webhook response under `results.*`
- * So we MUST return speech at the TOP LEVEL:
- *   { say: "...", text: "..." }
- * Do NOT nest { results: { say: ... } } because AV becomes `results.results.say`.
+ * ===========================
+ * IMPORTANT RESPONSE RULE
+ * ===========================
+ * DO NOT NEST results.* at all.
+ * Only return TOP-LEVEL:
+ * - success
+ * - say
+ * - text
+ * plus optional metadata fields.
  */
-function sendSuccess(res, payload = {}) {
-  return res.status(200).json({ success: true, ...payload });
+function sendOk(res, payload) {
+  return res.status(200).json(payload);
 }
-function sendFail(res, message, extra = {}) {
-  return res.status(200).json({ success: false, message, ...extra });
+
+function okSpeak(res, say, extra = {}) {
+  const speech = (say || "").toString();
+  return sendOk(res, { success: true, say: speech, text: speech, ...extra });
 }
-function withSpeech(payload, sayText) {
-  const say = (sayText || "").toString();
-  const text = say;
-  return { ...payload, say, text };
+
+function failSpeak(res, say, extra = {}) {
+  const speech = (say || "").toString();
+  return sendOk(res, { success: false, say: speech, text: speech, ...extra });
 }
 
 /**
  * ============
- * TIME / DATE HELPERS
+ * DATE HELPERS (TZ-SAFE)
  * ============
  */
 function nowInTZDateString(tz = STUDIO_TZ) {
@@ -67,6 +70,7 @@ function nowInTZDateString(tz = STUDIO_TZ) {
     month: "2-digit",
     day: "2-digit",
   }).formatToParts(new Date());
+
   const y = parts.find((p) => p.type === "year")?.value;
   const m = parts.find((p) => p.type === "month")?.value;
   const d = parts.find((p) => p.type === "day")?.value;
@@ -84,18 +88,30 @@ function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
 }
 
 const WEEKDAY_MAP = {
-  sunday: 0, sun: 0,
-  monday: 1, mon: 1,
-  tuesday: 2, tue: 2, tues: 2,
-  wednesday: 3, wed: 3,
-  thursday: 4, thu: 4, thur: 4, thurs: 4,
-  friday: 5, fri: 5,
-  saturday: 6, sat: 6,
+  sunday: 0,
+  sun: 0,
+  monday: 1,
+  mon: 1,
+  tuesday: 2,
+  tue: 2,
+  tues: 2,
+  wednesday: 3,
+  wed: 3,
+  thursday: 4,
+  thu: 4,
+  thur: 4,
+  thurs: 4,
+  friday: 5,
+  fri: 5,
+  saturday: 6,
+  sat: 6,
 };
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" })
-    .formatToParts(new Date());
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    weekday: "long",
+  }).formatToParts(new Date());
   const wd = parts.find((p) => p.type === "weekday")?.value?.toLowerCase();
   return WEEKDAY_MAP[wd] ?? null;
 }
@@ -112,6 +128,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (!s) return nowInTZDateString(tz);
 
   if (looksLikeYYYYMMDD(s)) return s;
+
   if (s === "today") return nowInTZDateString(tz);
   if (s === "tomorrow") return addDaysYYYYMMDD(nowInTZDateString(tz), 1);
 
@@ -122,24 +139,36 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (WEEKDAY_MAP[weekdayToken] !== undefined) {
     const todayIdx = tzWeekdayIndex(tz);
     if (todayIdx === null) return null;
+
     const targetIdx = WEEKDAY_MAP[weekdayToken];
     let delta = (targetIdx - todayIdx + 7) % 7;
-    if (nextPrefix) delta = delta === 0 ? 7 : delta + 7;
+
+    if (nextPrefix) {
+      if (delta === 0) delta = 7;
+      else delta += 7;
+    }
+
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
+  // Remove ordinal suffixes: 17th -> 17
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
     const parts = new Intl.DateTimeFormat("en-CA", {
-      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
     }).formatToParts(parsed);
+
     const y = parts.find((p) => p.type === "year")?.value;
     const m = parts.find((p) => p.type === "month")?.value;
     const d = parts.find((p) => p.type === "day")?.value;
     if (y && m && d) return `${y}-${m}-${d}`;
   }
 
+  // e.g. "the 17th"
   const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const today = nowInTZDateString(tz);
@@ -151,6 +180,11 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   return null;
 }
 
+/**
+ * ============
+ * MISC HELPERS
+ * ============
+ */
 function safeJsonParse(x) {
   try {
     return typeof x === "string" ? JSON.parse(x) : x;
@@ -162,7 +196,9 @@ function safeJsonParse(x) {
 function normalizeArray(payload, keys = []) {
   if (!payload) return [];
   if (Array.isArray(payload)) return payload;
-  for (const k of keys) if (Array.isArray(payload[k])) return payload[k];
+  for (const k of keys) {
+    if (Array.isArray(payload[k])) return payload[k];
+  }
   if (Array.isArray(payload.Results)) return payload.Results;
   return [];
 }
@@ -185,7 +221,7 @@ function parseNaiveISO(iso) {
 function format12h(hour, minute) {
   const h = Number(hour);
   const m = Number(minute);
-  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return "";
   const ampm = h >= 12 ? "PM" : "AM";
   let hr = h % 12;
   if (hr === 0) hr = 12;
@@ -194,30 +230,38 @@ function format12h(hour, minute) {
 }
 
 function timeBucketFromHour(hour) {
-  if (!Number.isFinite(hour)) return null;
+  if (!Number.isFinite(hour)) return "";
   if (hour < 12) return "morning";
   if (hour < 17) return "afternoon";
   return "evening";
 }
 
 function localDayRange(dateStr) {
-  return { startLocal: `${dateStr}T00:00:00`, endLocal: `${dateStr}T23:59:59` };
+  return {
+    startLocal: `${dateStr}T00:00:00`,
+    endLocal: `${dateStr}T23:59:59`,
+  };
 }
 
 function resolveLocationQuery(params) {
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
+
   if (locationIds) return { LocationIds: locationIds };
   if (locationId) return { LocationIds: locationId };
+
   if (DEFAULT_LOCATION_IDS) return { LocationIds: DEFAULT_LOCATION_IDS };
   if (DEFAULT_LOCATION_ID) return { LocationIds: DEFAULT_LOCATION_ID };
+
   return {};
 }
 
-async function mbFetch(path, { method = "GET", query, body, timeoutMs = 8000 } = {}) {
+async function mbFetch(path, { method = "GET", query, body } = {}) {
   if (!siteId || !apiKey || !sourceName || !sourcePassword) {
     throw new Error(
-      `Missing ENV. hasSiteId=${Boolean(siteId)} hasApiKey=${Boolean(apiKey)} hasSourceName=${Boolean(sourceName)} hasSourcePassword=${Boolean(sourcePassword)}`
+      `Missing ENV. hasSiteId=${Boolean(siteId)} hasApiKey=${Boolean(apiKey)} hasSourceName=${Boolean(
+        sourceName
+      )} hasSourcePassword=${Boolean(sourcePassword)}`
     );
   }
 
@@ -238,15 +282,11 @@ async function mbFetch(path, { method = "GET", query, body, timeoutMs = 8000 } =
     SourcePassword: sourcePassword,
   };
 
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
   const res = await fetch(url.toString(), {
     method,
     headers,
-    signal: controller.signal,
     body: body ? JSON.stringify(body) : undefined,
-  }).finally(() => clearTimeout(t));
+  });
 
   const text = await res.text();
   const json = safeJsonParse(text);
@@ -262,21 +302,11 @@ async function mbFetch(path, { method = "GET", query, body, timeoutMs = 8000 } =
 }
 
 function getIncomingParams(req) {
+  // For GET custom actions this is basically req.query
   const q = { ...(req.query || {}) };
   let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
 
-  const maybeArgs =
-    req.body?.message?.toolCallList?.[0]?.function?.arguments ??
-    req.body?.message?.toolCalls?.[0]?.function?.arguments ??
-    req.body?.toolCallList?.[0]?.function?.arguments ??
-    req.body?.toolCalls?.[0]?.function?.arguments ??
-    null;
-
-  if (maybeArgs) {
-    const parsed = typeof maybeArgs === "string" ? safeJsonParse(maybeArgs) : maybeArgs;
-    if (parsed && typeof parsed === "object") b = { ...b, ...parsed };
-  }
-
+  // Some runners send { params: {...} }
   if (b.params && typeof b.params === "object") {
     b = { ...b.params, ...b };
     delete b.params;
@@ -287,34 +317,26 @@ function getIncomingParams(req) {
 
 /**
  * ============
- * UTIL: CLAMP SPEECH SIZE
- * ============
- */
-function clampSpeech(s, maxChars = 850) {
-  const str = (s || "").toString();
-  if (str.length <= maxChars) return str;
-  return str.slice(0, maxChars - 20).trimEnd() + "…";
-}
-
-/**
- * ============
  * HEALTH
  * ============
  */
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
+
 app.get("/health", (req, res) => {
-  return sendSuccess(res, {
-    ok: true,
-    envDetected: {
+  return sendOk(res, {
+    success: true,
+    say: "OK",
+    text: "OK",
+    env: {
       hasSiteId: Boolean(siteId),
       hasApiKey: Boolean(apiKey),
       hasSourceName: Boolean(sourceName),
       hasSourcePassword: Boolean(sourcePassword),
       baseUrl: MINDBODY_BASE_URL,
-      hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
-      hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
-      debugMode: DEBUG_MODE,
       tz: STUDIO_TZ,
+      defaultLocationId: DEFAULT_LOCATION_ID,
+      defaultLocationIds: DEFAULT_LOCATION_IDS || null,
+      debugMode: DEBUG_MODE,
     },
   });
 });
@@ -325,7 +347,37 @@ app.get("/health", (req, res) => {
  * ============
  */
 
-// SCHEDULE
+// 1) LOCATIONS
+app.all("/mb/locations", async (req, res) => {
+  const params = getIncomingParams(req);
+  console.log("HIT /mb/locations", { method: req.method, url: req.originalUrl, params });
+
+  try {
+    const data = await mbFetch("/site/locations", { method: "GET" });
+    const locations = normalizeArray(data, ["Locations", "locations"]);
+
+    return okSpeak(
+      res,
+      `Found ${locations.length} locations.`,
+      {
+        count: locations.length,
+        locations: locations.map((l) => ({
+          id: l.Id ?? l.LocationId ?? null,
+          name: l.Name ?? l.LocationName ?? null,
+          address: l.Address ?? null,
+          city: l.City ?? null,
+          stateProv: l.StateProvCode ?? l.State ?? null,
+        })),
+      }
+    );
+  } catch (e) {
+    return failSpeak(res, "Sorry, I couldn't access locations right now.", {
+      error: DEBUG_MODE ? String(e?.message || e) : undefined,
+    });
+  }
+});
+
+// 2) SCHEDULE (TOP-LEVEL say/text ONLY, SMALL OUTPUT, OPTIONAL time_range)
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
@@ -335,112 +387,149 @@ app.all("/mb/schedule", async (req, res) => {
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
 
     if (!date) {
-      const say = "Sorry — I couldn’t understand that date. Could you say today, tomorrow, or a specific date?";
-      return sendSuccess(res, withSpeech({ success: false, received: { date: rawDateInput } }, say));
+      return failSpeak(
+        res,
+        "Sorry — I couldn’t understand that date. Could you say today, tomorrow, or a specific date?",
+        { received: { date: rawDateInput } }
+      );
     }
 
+    const timeRange = toLowerClean(params.time_range); // morning/afternoon/evening optional
     const { startLocal, endLocal } = localDayRange(date);
     const locationQuery = resolveLocationQuery(params);
 
     const data = await mbFetch("/class/classes", {
       method: "GET",
       query: { StartDateTime: startLocal, EndDateTime: endLocal, ...locationQuery },
-      timeoutMs: 9000,
     });
 
     const classesRaw = normalizeArray(data, ["Classes", "classes"]);
 
-    const wantTimeRange = toLowerClean(params.time_range);
-    const wantType = toLowerClean(params.class_type || params.class_name);
-    const wantInstructor = toLowerClean(params.instructor_name);
-
+    // Map to minimal fields
     let classes = classesRaw.map((c) => {
       const name = c.ClassDescription?.Name ?? c.Name ?? "Class";
       const startDateTime = c.StartDateTime ?? null;
 
-      let instructor = c.Staff?.Name ?? c.InstructorName ?? null;
+      let instructor = c.Staff?.Name ?? c.InstructorName ?? "";
       if (!instructor && c.Staff) {
         const first = c.Staff.FirstName || "";
         const last = c.Staff.LastName || "";
-        instructor = [first, last].filter(Boolean).join(" ").trim() || null;
+        instructor = [first, last].filter(Boolean).join(" ").trim();
       }
 
       const st = parseNaiveISO(startDateTime);
-      const startTimeLocal = st ? format12h(st.hour, st.minute) : null;
-      const bucket = st ? timeBucketFromHour(st.hour) : null;
+      const startTimeLocal = st ? format12h(st.hour, st.minute) : "";
+      const bucket = st ? timeBucketFromHour(st.hour) : "";
 
-      return { name, instructor, startTimeLocal, _bucket: bucket };
+      return { name, instructor, startTimeLocal, bucket };
     });
 
-    if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
-    if (wantTimeRange) classes = classes.filter((x) => x._bucket === wantTimeRange);
+    // Optional bucket filter
+    if (timeRange && ["morning", "afternoon", "evening"].includes(timeRange)) {
+      classes = classes.filter((x) => x.bucket === timeRange);
+    }
 
-    // onlySay handling
+    // SMALL RESULT (this is the entire point)
     const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    const isOnlySay = onlySay === "1" || onlySay === "true";
+    const limit = 6; // keep tiny for voice tools
 
-    // Build a compact speech response
-    const formatLine = (c) =>
-      `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`.trim();
+    const list = classes
+      .slice(0, limit)
+      .map((c) => {
+        const withInstructor = c.instructor ? ` with ${c.instructor}` : "";
+        return `${c.startTimeLocal} ${c.name}${withInstructor}`.trim();
+      })
+      .filter(Boolean)
+      .join(" | ");
 
-    if (classes.length === 0) {
-      const say = wantTimeRange
-        ? `No ${wantTimeRange} classes found for ${date}.`
-        : `No classes found for ${date}.`;
-      return sendSuccess(res, withSpeech({ date, timezone: STUDIO_TZ }, say));
+    const say =
+      classes.length === 0
+        ? `No classes found for ${date}${timeRange ? ` in the ${timeRange}` : ""}.`
+        : `Classes for ${date}${timeRange ? ` (${timeRange})` : ""}: ${list}`;
+
+    // Return only say/text (NO nesting)
+    // If onlySay=1, do NOT include big arrays
+    if (onlySay === "1" || onlySay === "true") {
+      return okSpeak(res, say, {
+        date,
+        timezone: STUDIO_TZ,
+      });
     }
 
-    // If not filtering by time_range, we will group into morning/afternoon/evening
-    if (!wantTimeRange) {
-      const groups = { morning: [], afternoon: [], evening: [] };
-      for (const c of classes) {
-        if (c._bucket && groups[c._bucket]) groups[c._bucket].push(c);
-      }
-
-      // cap each group to keep speech small
-      const capPerGroup = 5;
-      const parts = [];
-
-      for (const key of ["morning", "afternoon", "evening"]) {
-        const arr = groups[key];
-        if (!arr.length) continue;
-        const shown = arr.slice(0, capPerGroup).map(formatLine).join(" | ");
-        const extra = arr.length > capPerGroup ? ` | and ${arr.length - capPerGroup} more` : "";
-        parts.push(`${key.toUpperCase()}: ${shown}${extra}`);
-      }
-
-      let say = `Classes for ${date}. ` + parts.join(". ");
-
-      // HARD clamp so AV/TTS never drops it
-      say = clampSpeech(say, 850);
-
-      return sendSuccess(
-        res,
-        withSpeech(
-          { date, timezone: STUDIO_TZ, ...(DEBUG_MODE ? { rawCount: classesRaw.length } : {}) },
-          say
-        )
-      );
-    }
-
-    // If time_range IS provided, return only that group and keep it short
-    const maxItems = isOnlySay ? 10 : 20;
-    let say =
-      `Classes for ${date} (${wantTimeRange}): ` +
-      classes.slice(0, maxItems).map(formatLine).join(" | ");
-
-    if (classes.length > maxItems) say += ` | and ${classes.length - maxItems} more`;
-
-    say = clampSpeech(say, 850);
-
-    return sendSuccess(res, withSpeech({ date, timezone: STUDIO_TZ }, say));
+    // If not onlySay, include a small structured list (still minimal)
+    return okSpeak(res, say, {
+      date,
+      timezone: STUDIO_TZ,
+      appliedLocationFilter: locationQuery,
+      classes: classes.map(({ bucket, ...rest }) => rest),
+      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
+    });
   } catch (e) {
-    const msg = e?.name === "AbortError"
-      ? "Timed out while contacting Mindbody."
-      : (e?.message || "Server error");
+    return failSpeak(res, "Sorry, I couldn't access the schedule right now.", {
+      error: DEBUG_MODE ? String(e?.message || e) : undefined,
+    });
+  }
+});
 
-    return sendFail(res, msg);
+// 3) PRICING (kept simple; still top-level say/text only)
+app.all("/mb/pricing", async (req, res) => {
+  const params = getIncomingParams(req);
+  console.log("HIT /mb/pricing", { method: req.method, url: req.originalUrl, params });
+
+  try {
+    const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
+      mbFetch("/sale/services", { method: "GET" }),
+      mbFetch("/sale/packages", { method: "GET" }),
+      mbFetch("/sale/contracts", { method: "GET" }),
+    ]);
+
+    const services =
+      servicesResp.status === "fulfilled" ? normalizeArray(servicesResp.value, ["Services", "services"]) : [];
+    const packages =
+      packagesResp.status === "fulfilled" ? normalizeArray(packagesResp.value, ["Packages", "packages"]) : [];
+    const contracts =
+      contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
+
+    // Keep speech short
+    const say = "I pulled pricing successfully. What are you looking for — intro offers, drop-ins, or memberships?";
+
+    return okSpeak(res, say, {
+      offers: DEBUG_MODE ? { services, packages, contracts } : undefined,
+    });
+  } catch (e) {
+    return failSpeak(res, "Sorry, I couldn't access pricing right now.", {
+      error: DEBUG_MODE ? String(e?.message || e) : undefined,
+    });
+  }
+});
+
+// 4) BOOK (existing-client only in this version)
+app.all("/mb/book", async (req, res) => {
+  const params = getIncomingParams(req);
+  console.log("HIT /mb/book", { method: req.method, url: req.originalUrl, params });
+
+  try {
+    const classId = params.class_id || params.classId;
+    if (!classId) return failSpeak(res, "Missing class_id.");
+
+    const clientId = params.client_id || params.clientId;
+    if (!clientId) return failSpeak(res, "Missing client_id (existing client required).");
+
+    const bookResp = await mbFetch("/class/addclienttoclass", {
+      method: "POST",
+      body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
+    });
+
+    return okSpeak(res, "Booked successfully.", {
+      booked: true,
+      clientId: String(clientId),
+      classId: String(classId),
+      raw: DEBUG_MODE ? bookResp : undefined,
+    });
+  } catch (e) {
+    return failSpeak(res, "Sorry, I couldn't complete that booking right now.", {
+      error: DEBUG_MODE ? String(e?.message || e) : undefined,
+    });
   }
 });
 
