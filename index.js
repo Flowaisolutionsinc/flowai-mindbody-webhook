@@ -35,24 +35,30 @@ const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE (AGENCY VAULT COMPAT)
+ * RESPONSE (AGENCY VAULT COMPAT) — ALWAYS WRAPPED
  * ============
- * IMPORTANT:
- * - DO NOT return { results: {...} } from the server.
- * - Agency Vault wraps the API response into `results.*` automatically.
- * - So we return top-level: { success, say, text, ... }
+ * Always return:
+ * { success: true/false, results: { ... } }
+ *
+ * Never return top-level say/text.
+ * Never return results inside results.
  */
-function ok(res, payload = {}) {
-  return res.status(200).json({ success: true, ...payload });
+function ok(res, results = {}) {
+  return res.status(200).json({
+    success: true,
+    results: results || {},
+  });
 }
 
 function fail(res, message, extra = {}) {
   return res.status(200).json({
     success: false,
     message: message || "Request failed",
-    say: "",
-    text: "",
-    ...extra,
+    results: {
+      say: "",
+      text: "",
+      ...extra,
+    },
   });
 }
 
@@ -238,6 +244,7 @@ function resolveLocationQuery(params) {
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
+  // Mindbody v6 expects LocationIds as comma-separated list
   if (locationIds) return { LocationIds: locationIds };
   if (locationId) return { LocationIds: locationId };
 
@@ -296,6 +303,7 @@ function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
   let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
 
+  // OpenAI-ish / tool-call-ish bodies (depending on platform)
   const maybeArgs =
     req.body?.message?.toolCallList?.[0]?.function?.arguments ??
     req.body?.message?.toolCalls?.[0]?.function?.arguments ??
@@ -308,6 +316,7 @@ function getIncomingParams(req) {
     if (parsed && typeof parsed === "object") b = { ...b, ...parsed };
   }
 
+  // If platform wraps params inside params:{...}
   if (b.params && typeof b.params === "object") {
     b = { ...b.params, ...b };
     delete b.params;
@@ -374,10 +383,13 @@ app.all("/mb/schedule", async (req, res) => {
   console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
 
   try {
-    const rawDateInput = params.date || params.day || params.requested_day || params.requestedDate;
+    const rawDateInput =
+      params.date || params.day || params.requested_day || params.requestedDate || params.requested_date;
+
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
-    if (!date)
+    if (!date) {
       return fail(res, "Could not understand the requested date.", { receivedDate: rawDateInput });
+    }
 
     const { startLocal, endLocal } = localDayRange(date);
 
@@ -415,8 +427,7 @@ app.all("/mb/schedule", async (req, res) => {
     });
 
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
-    if (wantInstructor)
-      classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x.bucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
@@ -434,7 +445,7 @@ app.all("/mb/schedule", async (req, res) => {
     const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
     const isOnlySay = onlySay === "1" || onlySay === "true";
 
-    // keep speech short
+    // keep speech short in onlySay mode
     const maxPerBucket = isOnlySay ? 6 : 999;
 
     const parts = [];
@@ -450,6 +461,7 @@ app.all("/mb/schedule", async (req, res) => {
     const say =
       parts.length === 0 ? `No classes found for ${date}.` : `Classes for ${date}. ${parts.join(" ")}`;
 
+    // ✅ ALWAYS WRAPPED under results
     return ok(res, {
       say,
       text: say,
@@ -521,4 +533,5 @@ app.all("/mb/book", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
