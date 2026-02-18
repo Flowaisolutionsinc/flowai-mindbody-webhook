@@ -20,44 +20,35 @@ app.use((req, res, next) => {
  * ============
  */
 const MINDBODY_BASE_URL =
-  (process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6").trim();
+  process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
 
 const siteId = (process.env.MINDBODY_SITE_ID || "").trim();
 const apiKey = (process.env.MINDBODY_API_KEY || "").trim();
 const sourceName = (process.env.MINDBODY_SOURCE_NAME || "").trim();
 const sourcePassword = (process.env.MINDBODY_SOURCE_PASSWORD || "").trim();
 
-const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "1").trim();
+const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
-
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
+
 const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE (AGENCY VAULT COMPAT - STRICT)
+ * RESPONSE (AGENCY VAULT COMPAT)
  * ============
- * ALWAYS return:
- * { success: true/false, results: { say: string, text: string, ... } }
- * - NEVER top-level say/text
- * - NEVER results nested inside results
+ * Return ONLY:
+ * { success: true/false, results: { say, text, ... } }
  */
 function ok(res, results = {}) {
-  const say = typeof results.say === "string" ? results.say : "";
-  const text = typeof results.text === "string" ? results.text : say;
-  const merged = { ...results, say, text };
-  return res.status(200).json({ success: true, results: merged });
+  return res.status(200).json({ success: true, results });
 }
 
 function fail(res, message, extra = {}) {
   return res.status(200).json({
     success: false,
     message: message || "Request failed",
-    results: {
-      say: "",
-      text: "",
-      ...extra,
-    },
+    results: { say: "", text: "", ...extra },
   });
 }
 
@@ -131,6 +122,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (!s) return nowInTZDateString(tz);
 
   if (looksLikeYYYYMMDD(s)) return s;
+
   if (s === "today") return nowInTZDateString(tz);
   if (s === "tomorrow") return addDaysYYYYMMDD(nowInTZDateString(tz), 1);
 
@@ -153,7 +145,6 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
-  // try parse "Feb 21" / "February 21st, 2026"
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -170,7 +161,6 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     if (y && m && d) return `${y}-${m}-${d}`;
   }
 
-  // "the 17th" -> current month/year
   const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const today = nowInTZDateString(tz);
@@ -240,8 +230,13 @@ function localDayRange(dateStr) {
   };
 }
 
+/**
+ * Location behavior:
+ * - Prefer caller-provided (LocationIds)
+ * - Else env DEFAULT_LOCATION_IDS / DEFAULT_LOCATION_ID
+ * - Else HARD DEFAULT to "1" (Roundhouse)
+ */
 function resolveLocationQuery(params) {
-  // allow either LocationIds or single LocationId; mindbody expects LocationIds
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
@@ -251,7 +246,7 @@ function resolveLocationQuery(params) {
   if (DEFAULT_LOCATION_IDS) return { LocationIds: DEFAULT_LOCATION_IDS };
   if (DEFAULT_LOCATION_ID) return { LocationIds: DEFAULT_LOCATION_ID };
 
-  return {};
+  return { LocationIds: "1" };
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -276,6 +271,7 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     "Api-Key": apiKey,
     SiteId: siteId,
     "Source-Name": sourceName,
+    Password: sourcePassword,
     SourcePassword: sourcePassword,
   };
 
@@ -298,14 +294,11 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   return json ?? { raw: text };
 }
 
-/**
- * AgencyVault sometimes sends args in different places.
- * This merges query + body + toolCall arguments.
- */
 function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
   let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
 
+  // Support platforms that send tool args nested
   const maybeArgs =
     req.body?.message?.toolCallList?.[0]?.function?.arguments ??
     req.body?.message?.toolCalls?.[0]?.function?.arguments ??
@@ -335,8 +328,7 @@ app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is run
 
 app.get("/health", (req, res) => {
   return ok(res, {
-    say: "ok",
-    text: "ok",
+    ok: true,
     envDetected: {
       hasSiteId: Boolean(siteId),
       hasApiKey: Boolean(apiKey),
@@ -363,10 +355,9 @@ app.all("/mb/locations", async (req, res) => {
     const data = await mbFetch("/site/locations", { method: "GET" });
     const locations = normalizeArray(data, ["Locations", "locations"]);
 
-    const say = `Found ${locations.length} locations.`;
     return ok(res, {
-      say,
-      text: say,
+      say: `Found ${locations.length} locations.`,
+      text: `Found ${locations.length} locations.`,
       locations: locations.map((l) => ({
         id: l.Id ?? l.LocationId ?? null,
         name: l.Name ?? l.LocationName ?? null,
@@ -392,7 +383,6 @@ app.all("/mb/schedule", async (req, res) => {
 
     const { startLocal, endLocal } = localDayRange(date);
 
-    // IMPORTANT: match your Custom Action parameter name: time_range
     const wantTimeRange = toLowerClean(params.time_range || params.timeRange); // morning/afternoon/evening
     const wantType = toLowerClean(params.class_type || params.class_name);
     const wantInstructor = toLowerClean(params.instructor_name);
@@ -426,13 +416,12 @@ app.all("/mb/schedule", async (req, res) => {
       return { classId, name, startTimeLocal, instructor, bucket };
     });
 
-    // optional filters
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
     if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x.bucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
-    // group by bucket for cleaner speech
+    // Group by bucket for clean speech
     const buckets = { morning: [], afternoon: [], evening: [] };
     for (const c of classes) {
       const b = c.bucket || "morning";
@@ -443,8 +432,12 @@ app.all("/mb/schedule", async (req, res) => {
     const formatItem = (c) =>
       `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`.trim();
 
-    // keep speech short by default
-    const maxPerBucket = 6;
+    // ✅ DEFAULT ONLYSAY = TRUE (so calls stay concise even if the action doesn't send onlySay)
+    const onlySayRaw = String(params.onlySay || params.only_say || "").trim().toLowerCase();
+    const isOnlySay = onlySayRaw ? (onlySayRaw === "1" || onlySayRaw === "true") : true;
+
+    const maxPerBucket = isOnlySay ? 6 : 999;
+
     const parts = [];
     const order = wantTimeRange ? [wantTimeRange] : ["morning", "afternoon", "evening"];
 
@@ -460,7 +453,6 @@ app.all("/mb/schedule", async (req, res) => {
         ? `No classes found for ${date}.`
         : `Classes for ${date}. ${parts.join(" ")}`;
 
-    // STRICT schema
     return ok(res, {
       say,
       text: say,
@@ -488,7 +480,8 @@ app.all("/mb/pricing", async (req, res) => {
     const contracts =
       contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    const say = "I pulled pricing successfully. Ask me for drop-ins, intro offers, or memberships and I’ll read the exact options.";
+    const say =
+      "I pulled pricing successfully. Ask me for drop-ins, intro offers, or memberships and I’ll read the exact options.";
 
     return ok(res, {
       say,
@@ -530,8 +523,9 @@ app.all("/mb/book", async (req, res) => {
   }
 });
 
-const PORT = Number(process.env.PORT || 8080);
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
