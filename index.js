@@ -27,7 +27,7 @@ const apiKey = (process.env.MINDBODY_API_KEY || "").trim();
 const sourceName = (process.env.MINDBODY_SOURCE_NAME || "").trim();
 const sourcePassword = (process.env.MINDBODY_SOURCE_PASSWORD || "").trim();
 
-const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "1").trim();
+const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
 const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
@@ -37,18 +37,32 @@ const STUDIO_TZ = "America/Vancouver";
  * ============
  * RESPONSE (AGENCY VAULT COMPAT)
  * ============
- * Always return:
- * { success: true/false, results: { say, text, ... } }
- * Never put say/text at top-level.
+ * Return BOTH:
+ * - top-level say/text  (many platforms only read top-level)
+ * - results.say/results.text (your internal standard)
+ *
+ * Shape:
+ * { success: true/false, say: string, text: string, results: { say, text, ... }, message?: string }
  */
 function ok(res, results = {}) {
-  return res.status(200).json({ success: true, results });
+  const say = typeof results.say === "string" ? results.say : "";
+  const text = typeof results.text === "string" ? results.text : say;
+
+  return res.status(200).json({
+    success: true,
+    say,
+    text,
+    results: { ...results, say, text },
+  });
 }
 
 function fail(res, message, extra = {}) {
   return res.status(200).json({
     success: false,
-    results: { say: "", text: "", message: message || "Request failed", ...extra },
+    message: message || "Request failed",
+    say: "",
+    text: "",
+    results: { say: "", text: "", ...extra },
   });
 }
 
@@ -231,18 +245,16 @@ function localDayRange(dateStr) {
 }
 
 function resolveLocationQuery(params) {
-  // We default to 1 if nothing is sent.
-  const locationId = (params.location_id || params.locationId || DEFAULT_LOCATION_ID || "1")
-    .toString()
-    .trim();
-
-  const locationIds = (params.location_ids || params.locationIds || DEFAULT_LOCATION_IDS || "")
-    .toString()
-    .trim();
+  const locationId = (params.location_id || params.locationId || "").toString().trim();
+  const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
   if (locationIds) return { LocationIds: locationIds };
   if (locationId) return { LocationIds: locationId };
-  return { LocationIds: "1" };
+
+  if (DEFAULT_LOCATION_IDS) return { LocationIds: DEFAULT_LOCATION_IDS };
+  if (DEFAULT_LOCATION_ID) return { LocationIds: DEFAULT_LOCATION_ID };
+
+  return {};
 }
 
 async function mbFetch(path, { method = "GET", query, body } = {}) {
@@ -329,9 +341,9 @@ app.get("/health", (req, res) => {
       hasApiKey: Boolean(apiKey),
       hasSourceName: Boolean(sourceName),
       hasSourcePassword: Boolean(sourcePassword),
-      baseUrl: MINDBODY_BASE_URL,
       hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
       hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
+      baseUrl: MINDBODY_BASE_URL,
       debugMode: DEBUG_MODE,
       tz: STUDIO_TZ,
     },
@@ -344,7 +356,29 @@ app.get("/health", (req, res) => {
  * ============
  */
 
-// SCHEDULE
+// 1) LOCATIONS
+app.all("/mb/locations", async (req, res) => {
+  try {
+    const data = await mbFetch("/site/locations", { method: "GET" });
+    const locations = normalizeArray(data, ["Locations", "locations"]);
+
+    return ok(res, {
+      say: `Found ${locations.length} locations.`,
+      text: `Found ${locations.length} locations.`,
+      locations: locations.map((l) => ({
+        id: l.Id ?? l.LocationId ?? null,
+        name: l.Name ?? l.LocationName ?? null,
+        address: l.Address ?? null,
+        city: l.City ?? null,
+        stateProv: l.StateProvCode ?? l.State ?? null,
+      })),
+    });
+  } catch (e) {
+    return fail(res, e?.message || "Server error");
+  }
+});
+
+// 2) SCHEDULE
 app.all("/mb/schedule", async (req, res) => {
   const params = getIncomingParams(req);
   console.log("HIT /mb/schedule", { method: req.method, url: req.originalUrl, params });
@@ -357,6 +391,9 @@ app.all("/mb/schedule", async (req, res) => {
     const { startLocal, endLocal } = localDayRange(date);
 
     const wantTimeRange = toLowerClean(params.time_range || params.timeRange); // morning/afternoon/evening
+    const wantType = toLowerClean(params.class_type || params.class_name);
+    const wantInstructor = toLowerClean(params.instructor_name);
+    const wantTime = toLowerClean(params.time);
 
     const locationQuery = resolveLocationQuery(params);
 
@@ -368,6 +405,7 @@ app.all("/mb/schedule", async (req, res) => {
     const classesRaw = normalizeArray(data, ["Classes", "classes"]);
 
     let classes = classesRaw.map((c) => {
+      const classId = c.Id ?? c.ClassId ?? null;
       const name = c.ClassDescription?.Name ?? c.Name ?? "Class";
       const startDateTime = c.StartDateTime ?? null;
 
@@ -382,15 +420,13 @@ app.all("/mb/schedule", async (req, res) => {
       const startTimeLocal = st ? format12h(st.hour, st.minute) : null;
       const bucket = st ? timeBucketFromHour(st.hour) : null;
 
-      return {
-        name,
-        startTimeLocal,
-        instructor,
-        bucket,
-      };
+      return { classId, name, startTimeLocal, instructor, bucket };
     });
 
+    if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
+    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x.bucket) === wantTimeRange);
+    if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
     const buckets = { morning: [], afternoon: [], evening: [] };
     for (const c of classes) {
@@ -402,8 +438,10 @@ app.all("/mb/schedule", async (req, res) => {
     const formatItem = (c) =>
       `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`.trim();
 
-    // Force short output for voice + tool platforms
-    const maxPerBucket = 6;
+    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
+    const isOnlySay = onlySay === "1" || onlySay === "true";
+
+    const maxPerBucket = isOnlySay ? 6 : 999;
 
     const parts = [];
     const order = wantTimeRange ? [wantTimeRange] : ["morning", "afternoon", "evening"];
@@ -415,20 +453,64 @@ app.all("/mb/schedule", async (req, res) => {
       parts.push(`${b[0].toUpperCase() + b.slice(1)}: ${slice}`);
     }
 
-    let say =
+    const say =
       parts.length === 0
         ? `No classes found for ${date}.`
         : `Classes for ${date}. ${parts.join(" ")}`;
 
-    // Hard cap the speech string (prevents truncation)
-    const MAX_CHARS = 1200;
-    if (say.length > MAX_CHARS) say = say.slice(0, MAX_CHARS - 3) + "...";
+    return ok(res, { say, text: say, date, timezone: STUDIO_TZ });
+  } catch (e) {
+    return fail(res, e?.message || "Server error");
+  }
+});
+
+// 3) PRICING
+app.all("/mb/pricing", async (req, res) => {
+  try {
+    const [servicesResp, packagesResp, contractsResp] = await Promise.allSettled([
+      mbFetch("/sale/services", { method: "GET" }),
+      mbFetch("/sale/packages", { method: "GET" }),
+      mbFetch("/sale/contracts", { method: "GET" }),
+    ]);
+
+    const services =
+      servicesResp.status === "fulfilled" ? normalizeArray(servicesResp.value, ["Services", "services"]) : [];
+    const packages =
+      packagesResp.status === "fulfilled" ? normalizeArray(packagesResp.value, ["Packages", "packages"]) : [];
+    const contracts =
+      contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
+
+    const say = `I pulled pricing successfully. Ask me for drop-ins, intro offers, or memberships and I’ll read the exact options.`;
+
+    return ok(res, { say, text: say, offers: { services, packages, contracts }, timezone: STUDIO_TZ });
+  } catch (e) {
+    return fail(res, e?.message || "Server error");
+  }
+});
+
+// 4) BOOK (existing-client only in this version)
+app.all("/mb/book", async (req, res) => {
+  const params = getIncomingParams(req);
+
+  try {
+    const classId = params.class_id || params.classId;
+    if (!classId) return fail(res, "Missing class_id");
+
+    const clientId = params.client_id || params.clientId;
+    if (!clientId) return fail(res, "Missing client_id (existing client required)");
+
+    const bookResp = await mbFetch("/class/addclienttoclass", {
+      method: "POST",
+      body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
+    });
 
     return ok(res, {
-      say,
-      text: say,
-      date,
-      timezone: STUDIO_TZ,
+      say: "Booked successfully.",
+      text: "Booked successfully.",
+      booked: true,
+      clientId,
+      classId,
+      raw: DEBUG_MODE ? bookResp : undefined,
     });
   } catch (e) {
     return fail(res, e?.message || "Server error");
@@ -437,6 +519,7 @@ app.all("/mb/schedule", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
