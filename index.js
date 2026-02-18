@@ -20,49 +20,44 @@ app.use((req, res, next) => {
  * ============
  */
 const MINDBODY_BASE_URL =
-  process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
+  (process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6").trim();
 
 const siteId = (process.env.MINDBODY_SITE_ID || "").trim();
 const apiKey = (process.env.MINDBODY_API_KEY || "").trim();
 const sourceName = (process.env.MINDBODY_SOURCE_NAME || "").trim();
 const sourcePassword = (process.env.MINDBODY_SOURCE_PASSWORD || "").trim();
 
-const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "").trim();
+const DEFAULT_LOCATION_ID = (process.env.MINDBODY_DEFAULT_LOCATION_ID || "1").trim();
 const DEFAULT_LOCATION_IDS = (process.env.MINDBODY_DEFAULT_LOCATION_IDS || "").trim();
-const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 
+const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE (AGENCY VAULT COMPAT)
+ * RESPONSE (AGENCY VAULT COMPAT - STRICT)
  * ============
- * Return BOTH:
- * - top-level say/text  (many platforms only read top-level)
- * - results.say/results.text (your internal standard)
- *
- * Shape:
- * { success: true/false, say: string, text: string, results: { say, text, ... }, message?: string }
+ * ALWAYS return:
+ * { success: true/false, results: { say: string, text: string, ... } }
+ * - NEVER top-level say/text
+ * - NEVER results nested inside results
  */
 function ok(res, results = {}) {
   const say = typeof results.say === "string" ? results.say : "";
   const text = typeof results.text === "string" ? results.text : say;
-
-  return res.status(200).json({
-    success: true,
-    say,
-    text,
-    results: { ...results, say, text },
-  });
+  const merged = { ...results, say, text };
+  return res.status(200).json({ success: true, results: merged });
 }
 
 function fail(res, message, extra = {}) {
   return res.status(200).json({
     success: false,
     message: message || "Request failed",
-    say: "",
-    text: "",
-    results: { say: "", text: "", ...extra },
+    results: {
+      say: "",
+      text: "",
+      ...extra,
+    },
   });
 }
 
@@ -136,7 +131,6 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
   if (!s) return nowInTZDateString(tz);
 
   if (looksLikeYYYYMMDD(s)) return s;
-
   if (s === "today") return nowInTZDateString(tz);
   if (s === "tomorrow") return addDaysYYYYMMDD(nowInTZDateString(tz), 1);
 
@@ -159,6 +153,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
+  // try parse "Feb 21" / "February 21st, 2026"
   const cleaned = s0.replace(/(\d+)(st|nd|rd|th)/gi, "$1");
   const parsed = new Date(cleaned);
   if (!Number.isNaN(parsed.getTime())) {
@@ -175,6 +170,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     if (y && m && d) return `${y}-${m}-${d}`;
   }
 
+  // "the 17th" -> current month/year
   const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const today = nowInTZDateString(tz);
@@ -245,6 +241,7 @@ function localDayRange(dateStr) {
 }
 
 function resolveLocationQuery(params) {
+  // allow either LocationIds or single LocationId; mindbody expects LocationIds
   const locationId = (params.location_id || params.locationId || "").toString().trim();
   const locationIds = (params.location_ids || params.locationIds || "").toString().trim();
 
@@ -279,7 +276,6 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     "Api-Key": apiKey,
     SiteId: siteId,
     "Source-Name": sourceName,
-    Password: sourcePassword,
     SourcePassword: sourcePassword,
   };
 
@@ -302,6 +298,10 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
   return json ?? { raw: text };
 }
 
+/**
+ * AgencyVault sometimes sends args in different places.
+ * This merges query + body + toolCall arguments.
+ */
 function getIncomingParams(req) {
   const q = { ...(req.query || {}) };
   let b = req.body && typeof req.body === "object" ? { ...req.body } : {};
@@ -335,15 +335,16 @@ app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is run
 
 app.get("/health", (req, res) => {
   return ok(res, {
-    ok: true,
+    say: "ok",
+    text: "ok",
     envDetected: {
       hasSiteId: Boolean(siteId),
       hasApiKey: Boolean(apiKey),
       hasSourceName: Boolean(sourceName),
       hasSourcePassword: Boolean(sourcePassword),
+      baseUrl: MINDBODY_BASE_URL,
       hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
       hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
-      baseUrl: MINDBODY_BASE_URL,
       debugMode: DEBUG_MODE,
       tz: STUDIO_TZ,
     },
@@ -362,9 +363,10 @@ app.all("/mb/locations", async (req, res) => {
     const data = await mbFetch("/site/locations", { method: "GET" });
     const locations = normalizeArray(data, ["Locations", "locations"]);
 
+    const say = `Found ${locations.length} locations.`;
     return ok(res, {
-      say: `Found ${locations.length} locations.`,
-      text: `Found ${locations.length} locations.`,
+      say,
+      text: say,
       locations: locations.map((l) => ({
         id: l.Id ?? l.LocationId ?? null,
         name: l.Name ?? l.LocationName ?? null,
@@ -390,6 +392,7 @@ app.all("/mb/schedule", async (req, res) => {
 
     const { startLocal, endLocal } = localDayRange(date);
 
+    // IMPORTANT: match your Custom Action parameter name: time_range
     const wantTimeRange = toLowerClean(params.time_range || params.timeRange); // morning/afternoon/evening
     const wantType = toLowerClean(params.class_type || params.class_name);
     const wantInstructor = toLowerClean(params.instructor_name);
@@ -423,11 +426,13 @@ app.all("/mb/schedule", async (req, res) => {
       return { classId, name, startTimeLocal, instructor, bucket };
     });
 
+    // optional filters
     if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
     if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x.bucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
+    // group by bucket for cleaner speech
     const buckets = { morning: [], afternoon: [], evening: [] };
     for (const c of classes) {
       const b = c.bucket || "morning";
@@ -438,11 +443,8 @@ app.all("/mb/schedule", async (req, res) => {
     const formatItem = (c) =>
       `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`.trim();
 
-    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    const isOnlySay = onlySay === "1" || onlySay === "true";
-
-    const maxPerBucket = isOnlySay ? 6 : 999;
-
+    // keep speech short by default
+    const maxPerBucket = 6;
     const parts = [];
     const order = wantTimeRange ? [wantTimeRange] : ["morning", "afternoon", "evening"];
 
@@ -458,7 +460,13 @@ app.all("/mb/schedule", async (req, res) => {
         ? `No classes found for ${date}.`
         : `Classes for ${date}. ${parts.join(" ")}`;
 
-    return ok(res, { say, text: say, date, timezone: STUDIO_TZ });
+    // STRICT schema
+    return ok(res, {
+      say,
+      text: say,
+      date,
+      timezone: STUDIO_TZ,
+    });
   } catch (e) {
     return fail(res, e?.message || "Server error");
   }
@@ -480,9 +488,14 @@ app.all("/mb/pricing", async (req, res) => {
     const contracts =
       contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    const say = `I pulled pricing successfully. Ask me for drop-ins, intro offers, or memberships and I’ll read the exact options.`;
+    const say = "I pulled pricing successfully. Ask me for drop-ins, intro offers, or memberships and I’ll read the exact options.";
 
-    return ok(res, { say, text: say, offers: { services, packages, contracts }, timezone: STUDIO_TZ });
+    return ok(res, {
+      say,
+      text: say,
+      offers: { services, packages, contracts },
+      timezone: STUDIO_TZ,
+    });
   } catch (e) {
     return fail(res, e?.message || "Server error");
   }
@@ -517,8 +530,9 @@ app.all("/mb/book", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
