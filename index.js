@@ -10,6 +10,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -35,20 +36,28 @@ const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE (AGENCY VAULT COMPAT)
+ * RESPONSE SHAPE (AV-PROOF)
  * ============
- * Return ONLY:
- * { success: true/false, results: { say, text, ... } }
+ * DO NOT return { results: {...} } from your server.
+ * Return speak fields at TOP LEVEL:
+ *
+ * ✅ { success:true, say:"...", text:"..." }
+ *
+ * Agency Vault will wrap the response as `results`,
+ * so inside AV you can map output as:
+ * ✅ results.say
  */
-function ok(res, results = {}) {
-  return res.status(200).json({ success: true, results });
+function ok(res, payload = {}) {
+  return res.status(200).json({ success: true, ...payload });
 }
 
 function fail(res, message, extra = {}) {
   return res.status(200).json({
     success: false,
+    say: "",
+    text: "",
     message: message || "Request failed",
-    results: { say: "", text: "", ...extra },
+    ...extra,
   });
 }
 
@@ -58,23 +67,13 @@ function fail(res, message, extra = {}) {
  * ============
  */
 const WEEKDAY_MAP = {
-  sunday: 0,
-  sun: 0,
-  monday: 1,
-  mon: 1,
-  tuesday: 2,
-  tue: 2,
-  tues: 2,
-  wednesday: 3,
-  wed: 3,
-  thursday: 4,
-  thu: 4,
-  thur: 4,
-  thurs: 4,
-  friday: 5,
-  fri: 5,
-  saturday: 6,
-  sat: 6,
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3,
+  thursday: 4, thu: 4, thur: 4, thurs: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
 };
 
 function nowInTZDateString(tz = STUDIO_TZ) {
@@ -161,6 +160,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
     if (y && m && d) return `${y}-${m}-${d}`;
   }
 
+  // e.g. "the 17th"
   const m = s.match(/(?:the\s*)?(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const today = nowInTZDateString(tz);
@@ -194,6 +194,7 @@ function toLowerClean(x) {
   return (x ?? "").toString().toLowerCase().trim();
 }
 
+// Mindbody returns naive local times "2026-02-15T08:30:00"
 function parseNaiveISO(iso) {
   if (!iso || typeof iso !== "string") return null;
   const parts = iso.split("T");
@@ -329,6 +330,7 @@ app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is run
 app.get("/health", (req, res) => {
   return ok(res, {
     ok: true,
+    tz: STUDIO_TZ,
     envDetected: {
       hasSiteId: Boolean(siteId),
       hasApiKey: Boolean(apiKey),
@@ -338,7 +340,6 @@ app.get("/health", (req, res) => {
       hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
       hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
       debugMode: DEBUG_MODE,
-      tz: STUDIO_TZ,
     },
   });
 });
@@ -355,9 +356,11 @@ app.all("/mb/locations", async (req, res) => {
     const data = await mbFetch("/site/locations", { method: "GET" });
     const locations = normalizeArray(data, ["Locations", "locations"]);
 
+    const say = `Found ${locations.length} locations.`;
+
     return ok(res, {
-      say: `Found ${locations.length} locations.`,
-      text: `Found ${locations.length} locations.`,
+      say,
+      text: say,
       locations: locations.map((l) => ({
         id: l.Id ?? l.LocationId ?? null,
         name: l.Name ?? l.LocationName ?? null,
@@ -432,11 +435,12 @@ app.all("/mb/schedule", async (req, res) => {
     const formatItem = (c) =>
       `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`.trim();
 
-    // ✅ DEFAULT ONLYSAY = TRUE (so calls stay concise even if the action doesn't send onlySay)
+    // DEFAULT onlySay=true if not provided (keeps voice output short)
     const onlySayRaw = String(params.onlySay || params.only_say || "").trim().toLowerCase();
     const isOnlySay = onlySayRaw ? (onlySayRaw === "1" || onlySayRaw === "true") : true;
 
-    const maxPerBucket = isOnlySay ? 6 : 999;
+    // Control size (make it smaller)
+    const maxPerBucket = isOnlySay ? 5 : 999; // <= change to 4 if still too long
 
     const parts = [];
     const order = wantTimeRange ? [wantTimeRange] : ["morning", "afternoon", "evening"];
@@ -458,6 +462,10 @@ app.all("/mb/schedule", async (req, res) => {
       text: say,
       date,
       timezone: STUDIO_TZ,
+      appliedLocationFilter: locationQuery,
+      // keep classes out of response when onlySay (reduces payload size)
+      classes: isOnlySay ? undefined : classes,
+      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
     });
   } catch (e) {
     return fail(res, e?.message || "Server error");
@@ -525,6 +533,7 @@ app.all("/mb/book", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
