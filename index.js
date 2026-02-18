@@ -33,21 +33,28 @@ const DEBUG_MODE = String(process.env.DEBUG_MODE || "").toLowerCase() === "true"
 
 const STUDIO_TZ = "America/Vancouver";
 
-// 🔥 DEPLOY PROOF: if you don't see this exact line in Railway logs, you're not running this file.
-console.log("DEPLOY VERSION: NO_NESTED_RESULTS_v1");
-
 /**
  * ============
- * RESPONSE SHAPE (IMPORTANT)
+ * RESPONSE (AGENCY VAULT COMPAT)
  * ============
- * DO NOT return nested `results`.
- * Agency Vault wraps your response into `results.*` automatically.
+ * We return ONLY:
+ * { success: true/false, results: { say, text, ... } }
+ *
+ * IMPORTANT:
+ * - NO top-level say/text
+ * - NO nested results inside results
  */
-function sendSuccess(res, payload = {}) {
-  return res.status(200).json({ success: true, ...payload });
+function ok(res, results = {}) {
+  return res.status(200).json({ success: true, results });
 }
-function sendFail(res, message, extra = {}) {
-  return res.status(200).json({ success: false, message, ...extra });
+
+function fail(res, message, extra = {}) {
+  // do NOT put a fake "say" here; leave it empty so the agent knows it failed
+  return res.status(200).json({
+    success: false,
+    message: message || "Request failed",
+    results: { say: "", text: "", ...extra },
+  });
 }
 
 /**
@@ -55,6 +62,26 @@ function sendFail(res, message, extra = {}) {
  * TIME / DATE HELPERS
  * ============
  */
+const WEEKDAY_MAP = {
+  sunday: 0,
+  sun: 0,
+  monday: 1,
+  mon: 1,
+  tuesday: 2,
+  tue: 2,
+  tues: 2,
+  wednesday: 3,
+  wed: 3,
+  thursday: 4,
+  thu: 4,
+  thur: 4,
+  thurs: 4,
+  friday: 5,
+  fri: 5,
+  saturday: 6,
+  sat: 6,
+};
+
 function nowInTZDateString(tz = STUDIO_TZ) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
@@ -78,16 +105,6 @@ function addDaysYYYYMMDD(yyyyMmDd, daysToAdd) {
   const dd = String(dt.getUTCDate()).padStart(2, "0");
   return `${yy}-${mm}-${dd}`;
 }
-
-const WEEKDAY_MAP = {
-  sunday: 0, sun: 0,
-  monday: 1, mon: 1,
-  tuesday: 2, tue: 2, tues: 2,
-  wednesday: 3, wed: 3,
-  thursday: 4, thu: 4, thur: 4, thurs: 4,
-  friday: 5, fri: 5,
-  saturday: 6, sat: 6,
-};
 
 function tzWeekdayIndex(tz = STUDIO_TZ) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -129,6 +146,7 @@ function resolveDateInput(raw, tz = STUDIO_TZ) {
       if (delta === 0) delta = 7;
       else delta += 7;
     }
+
     return addDaysYYYYMMDD(nowInTZDateString(tz), delta);
   }
 
@@ -307,7 +325,7 @@ function getIncomingParams(req) {
 app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is running"));
 
 app.get("/health", (req, res) => {
-  return sendSuccess(res, {
+  return ok(res, {
     ok: true,
     envDetected: {
       hasSiteId: Boolean(siteId),
@@ -335,10 +353,9 @@ app.all("/mb/locations", async (req, res) => {
     const data = await mbFetch("/site/locations", { method: "GET" });
     const locations = normalizeArray(data, ["Locations", "locations"]);
 
-    return sendSuccess(res, {
+    return ok(res, {
       say: `Found ${locations.length} locations.`,
       text: `Found ${locations.length} locations.`,
-      count: locations.length,
       locations: locations.map((l) => ({
         id: l.Id ?? l.LocationId ?? null,
         name: l.Name ?? l.LocationName ?? null,
@@ -348,7 +365,7 @@ app.all("/mb/locations", async (req, res) => {
       })),
     });
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return fail(res, e?.message || "Server error");
   }
 });
 
@@ -360,17 +377,15 @@ app.all("/mb/schedule", async (req, res) => {
   try {
     const rawDateInput = params.date || params.day || params.requested_day || params.requestedDate;
     const date = resolveDateInput(rawDateInput, STUDIO_TZ);
-    if (!date) {
-      return sendSuccess(res, {
-        success: false,
-        say: "Sorry — I couldn’t understand that date. Could you say today, tomorrow, or a specific date?",
-        text: "Sorry — I couldn’t understand that date. Could you say today, tomorrow, or a specific date?",
-        received: { date: rawDateInput },
-      });
-    }
+    if (!date) return fail(res, "Could not understand the requested date.", { receivedDate: rawDateInput });
 
-    const wantTimeRange = toLowerClean(params.time_range);
     const { startLocal, endLocal } = localDayRange(date);
+
+    const wantTimeRange = toLowerClean(params.time_range || params.timeRange); // morning/afternoon/evening
+    const wantType = toLowerClean(params.class_type || params.class_name);
+    const wantInstructor = toLowerClean(params.instructor_name);
+    const wantTime = toLowerClean(params.time);
+
     const locationQuery = resolveLocationQuery(params);
 
     const data = await mbFetch("/class/classes", {
@@ -380,7 +395,6 @@ app.all("/mb/schedule", async (req, res) => {
 
     const classesRaw = normalizeArray(data, ["Classes", "classes"]);
 
-    // Normalize
     let classes = classesRaw.map((c) => {
       const classId = c.Id ?? c.ClassId ?? null;
       const name = c.ClassDescription?.Name ?? c.Name ?? "Class";
@@ -397,73 +411,60 @@ app.all("/mb/schedule", async (req, res) => {
       const startTimeLocal = st ? format12h(st.hour, st.minute) : null;
       const bucket = st ? timeBucketFromHour(st.hour) : null;
 
-      return { classId, name, startTimeLocal, instructor, _bucket: bucket };
+      return {
+        classId,
+        name,
+        startTimeLocal,
+        instructor,
+        bucket,
+      };
     });
 
-    // Optional time_range filter (morning/afternoon/evening)
-    if (wantTimeRange) {
-      classes = classes.filter((x) => toLowerClean(x._bucket) === wantTimeRange);
-    }
+    if (wantType) classes = classes.filter((x) => toLowerClean(x.name).includes(wantType));
+    if (wantInstructor) classes = classes.filter((x) => toLowerClean(x.instructor).includes(wantInstructor));
+    if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x.bucket) === wantTimeRange);
+    if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
-    // Build SHORT speech (this is what prevents muffled TTS / tool limits)
-    const byBucket = { morning: [], afternoon: [], evening: [] };
+    // group by bucket for smaller + cleaner speech
+    const buckets = { morning: [], afternoon: [], evening: [] };
     for (const c of classes) {
-      const b = c._bucket || "afternoon";
-      if (!byBucket[b]) byBucket[b] = [];
-      byBucket[b].push(c);
+      const b = c.bucket || "morning";
+      if (!buckets[b]) buckets[b] = [];
+      buckets[b].push(c);
     }
 
-    const maxPerBucket = 5; // keeps it short
-    const bucketOrder = wantTimeRange ? [wantTimeRange] : ["morning", "afternoon", "evening"];
+    const formatItem = (c) =>
+      `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`.trim();
+
+    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
+    const isOnlySay = onlySay === "1" || onlySay === "true";
+
+    // keep speech short
+    const maxPerBucket = isOnlySay ? 6 : 999;
 
     const parts = [];
-    for (const b of bucketOrder) {
-      const list = (byBucket[b] || []).slice(0, maxPerBucket);
+    const order = wantTimeRange ? [wantTimeRange] : ["morning", "afternoon", "evening"];
+
+    for (const b of order) {
+      const list = buckets[b] || [];
       if (list.length === 0) continue;
-      const label = b.charAt(0).toUpperCase() + b.slice(1);
-      const line = list
-        .map((c) => {
-          const t = c.startTimeLocal || "";
-          const n = c.name || "Class";
-          const ins = c.instructor ? ` with ${c.instructor}` : "";
-          return `${t} ${n}${ins}`.trim();
-        })
-        .join(" | ");
-      parts.push(`${label}: ${line}`);
+      const slice = list.slice(0, maxPerBucket).map(formatItem).join(" | ");
+      parts.push(`${b[0].toUpperCase() + b.slice(1)}: ${slice}`);
     }
 
     const say =
       parts.length === 0
         ? `No classes found for ${date}.`
-        : `Classes for ${date}. ${parts.join(". ")}`;
+        : `Classes for ${date}. ${parts.join(" ")}`;
 
-    // onlySay handling
-    const onlySay = String(params.onlySay || params.only_say || "").trim().toLowerCase();
-    const isOnlySay = onlySay === "1" || onlySay === "true";
-
-    if (isOnlySay) {
-      // ✅ Keep payload minimal (small response = more reliable)
-      return sendSuccess(res, {
-        say,
-        text: say,
-        date,
-        timezone: STUDIO_TZ,
-      });
-    }
-
-    // Full payload for debugging / booking flows
-    const cleanedClasses = classes.map(({ _bucket, ...rest }) => rest);
-    return sendSuccess(res, {
+    return ok(res, {
       say,
       text: say,
       date,
       timezone: STUDIO_TZ,
-      appliedLocationFilter: locationQuery,
-      classes: cleanedClasses,
-      debug: DEBUG_MODE ? { rawCount: classesRaw.length, receivedParams: params, rawDateInput } : undefined,
     });
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return fail(res, e?.message || "Server error");
   }
 });
 
@@ -483,47 +484,47 @@ app.all("/mb/pricing", async (req, res) => {
     const contracts =
       contractsResp.status === "fulfilled" ? normalizeArray(contractsResp.value, ["Contracts", "contracts"]) : [];
 
-    const say = "I pulled pricing successfully. I can share intro options, drop-ins, and memberships.";
-    return sendSuccess(res, {
+    const say = `I pulled pricing successfully. Ask me for drop-ins, intro offers, or memberships and I’ll read the exact options.`;
+
+    return ok(res, {
       say,
       text: say,
       offers: { services, packages, contracts },
+      timezone: STUDIO_TZ,
     });
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return fail(res, e?.message || "Server error");
   }
 });
 
 // 4) BOOK (existing-client only in this version)
 app.all("/mb/book", async (req, res) => {
   const params = getIncomingParams(req);
+
   try {
     const classId = params.class_id || params.classId;
-    if (!classId) return sendFail(res, "Missing class_id");
+    if (!classId) return fail(res, "Missing class_id");
 
     const clientId = params.client_id || params.clientId;
-    if (!clientId) return sendFail(res, "Missing client_id (existing client required)");
+    if (!clientId) return fail(res, "Missing client_id (existing client required)");
 
     const bookResp = await mbFetch("/class/addclienttoclass", {
       method: "POST",
       body: { ClientId: clientId, ClassId: classId, RequirePayment: false },
     });
 
-    return sendSuccess(res, {
+    return ok(res, {
+      say: "Booked successfully.",
+      text: "Booked successfully.",
       booked: true,
       clientId,
       classId,
-      say: "Booked successfully.",
-      text: "Booked successfully.",
       raw: DEBUG_MODE ? bookResp : undefined,
     });
   } catch (e) {
-    return sendFail(res, e?.message || "Server error");
+    return fail(res, e?.message || "Server error");
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
-
-
