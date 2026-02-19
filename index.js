@@ -26,85 +26,14 @@ function makeDebugId() {
   );
 }
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function isValidYMD(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || "").trim());
-}
-
-// ---- timezone-safe-ish day range helpers (no deps) ----
-// We convert "YYYY-MM-DD in America/Vancouver" into UTC ISO start/end
-function tzParts(timeZone, date) {
-  const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-
-  const parts = dtf.formatToParts(date);
-  const out = {};
-  for (const p of parts) {
-    if (p.type !== "literal") out[p.type] = p.value;
-  }
-  return out;
-}
-
-// Returns offset minutes between UTC and the timezone at the given instant
-function getTzOffsetMinutes(timeZone, date) {
-  // format the date as if in timeZone, then interpret that formatted time as UTC
-  const p = tzParts(timeZone, date);
-  const asIfUTC = Date.UTC(
-    Number(p.year),
-    Number(p.month) - 1,
-    Number(p.day),
-    Number(p.hour),
-    Number(p.minute),
-    Number(p.second)
-  );
-  return (asIfUTC - date.getTime()) / 60000;
-}
-
-function zonedStartOfDayUTC(ymd, timeZone) {
-  // Start with UTC midnight of that YMD, then shift by tz offset at that instant
-  const [Y, M, D] = ymd.split("-").map(Number);
-  const guess = new Date(Date.UTC(Y, M - 1, D, 0, 0, 0));
-  const offsetMin = getTzOffsetMinutes(timeZone, guess);
-  // If timezone is behind UTC (e.g. Vancouver), offsetMin is negative; subtracting moves to correct UTC instant
-  return new Date(guess.getTime() - offsetMin * 60000);
-}
-
-function zonedEndOfDayUTC(ymd, timeZone) {
-  const start = zonedStartOfDayUTC(ymd, timeZone);
-  // end = start + 24h - 1ms
-  return new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
-}
-
-function todayYMDInTZ(timeZone) {
-  const p = tzParts(timeZone, new Date());
-  return `${p.year}-${p.month}-${p.day}`;
-}
-
-// Cap: don’t let users ask > N days ahead
-function enforceMaxDaysAhead(targetYMD, timeZone, maxDaysAhead = 14) {
-  const todayYMD = todayYMDInTZ(timeZone);
-  const todayStart = zonedStartOfDayUTC(todayYMD, timeZone);
-  const targetStart = zonedStartOfDayUTC(targetYMD, timeZone);
-  const diffDays = Math.floor((targetStart.getTime() - todayStart.getTime()) / (24 * 60 * 60 * 1000));
-
-  if (diffDays < 0) return { ok: true, diffDays }; // allow past? you can choose to block, but leaving OK is harmless
-  if (diffDays > maxDaysAhead) return { ok: false, diffDays, maxDaysAhead };
-  return { ok: true, diffDays };
+function clampInt(n, min, max, fallback) {
+  const x = Number.parseInt(String(n), 10);
+  if (Number.isNaN(x)) return fallback;
+  return Math.min(max, Math.max(min, x));
 }
 
 // A small mocked schedule so your flows can keep moving even before parsing is done
-function buildMockSchedule({ studioKey, timezone, ymd }) {
+function buildMockSchedule({ studioKey, timezone, fromDate, toDate }) {
   const now = new Date();
   const plus1h = new Date(now.getTime() + 60 * 60 * 1000);
   const plus2h = new Date(now.getTime() + 2 * 60 * 60 * 1000);
@@ -112,7 +41,10 @@ function buildMockSchedule({ studioKey, timezone, ymd }) {
   return {
     studioKey,
     timezone,
-    date: ymd,
+    range: {
+      from: fromDate || now.toISOString(),
+      to: toDate || new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+    },
     classes: [
       {
         id: "mock_1",
@@ -126,7 +58,99 @@ function buildMockSchedule({ studioKey, timezone, ymd }) {
   };
 }
 
+// ---- Timezone helpers (no extra deps) ----
+// Returns offset minutes between UTC and the provided IANA timezone at a given instant.
+function getTimeZoneOffsetMinutes(date, timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  const parts = dtf.formatToParts(date);
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+
+  const asUTC = Date.UTC(
+    Number(map.year),
+    Number(map.month) - 1,
+    Number(map.day),
+    Number(map.hour),
+    Number(map.minute),
+    Number(map.second)
+  );
+
+  // Positive if timezone is ahead of UTC, negative if behind.
+  return (asUTC - date.getTime()) / 60000;
+}
+
+// Convert a "wall clock" datetime in a timezone into a UTC Date.
+// (Good enough for day-boundaries & DST; uses offset at a guess instant.)
+function zonedWallTimeToUtc({ year, month, day, hour = 0, minute = 0, second = 0 }, timeZone) {
+  const guessUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  const offsetMin = getTimeZoneOffsetMinutes(guessUtc, timeZone);
+  return new Date(guessUtc.getTime() - offsetMin * 60000);
+}
+
+// Build ISO range for a specific YYYY-MM-DD in a timezone:
+// from = start of that day (00:00:00.000) in tz, converted to UTC ISO
+// to   = end of that day (23:59:59.999) in tz, converted to UTC ISO
+function rangeForDateInTZ(dateStrYYYYMMDD, timeZone) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStrYYYYMMDD || "").trim());
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+
+  const startUtc = zonedWallTimeToUtc({ year, month, day, hour: 0, minute: 0, second: 0 }, timeZone);
+
+  // next day start in tz -> UTC, then subtract 1ms
+  const nextDay = new Date(Date.UTC(year, month - 1, day) + 24 * 60 * 60 * 1000);
+  const nextY = nextDay.getUTCFullYear();
+  const nextM = nextDay.getUTCMonth() + 1;
+  const nextD = nextDay.getUTCDate();
+
+  const nextStartUtc = zonedWallTimeToUtc({ year: nextY, month: nextM, day: nextD, hour: 0, minute: 0, second: 0 }, timeZone);
+  const endUtc = new Date(nextStartUtc.getTime() - 1);
+
+  return { fromDate: startUtc.toISOString(), toDate: endUtc.toISOString() };
+}
+
+// Default range: now -> +24h
+function defaultDateRangeISO() {
+  const from = new Date();
+  const to = new Date(from.getTime() + 24 * 60 * 60 * 1000);
+  return { fromDate: from.toISOString(), toDate: to.toISOString() };
+}
+
+// Cap: today -> today + N days (N <= 14)
+function rangeFromTodayDaysAhead(timeZone, daysAhead) {
+  const now = new Date();
+  // Get "today" in timezone by formatting, then build a range from that day's start.
+  const dtf = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
+  const todayStr = dtf.format(now); // YYYY-MM-DD
+  const startRange = rangeForDateInTZ(todayStr, timeZone);
+  if (!startRange) return defaultDateRangeISO();
+
+  // end = start of (today + daysAhead) day in tz, minus 1ms
+  const [y, m, d] = todayStr.split("-").map(Number);
+  const base = new Date(Date.UTC(y, m - 1, d));
+  const endDay = new Date(base.getTime() + daysAhead * 24 * 60 * 60 * 1000);
+  const endStr = `${endDay.getUTCFullYear()}-${String(endDay.getUTCMonth() + 1).padStart(2, "0")}-${String(endDay.getUTCDate()).padStart(2, "0")}`;
+
+  const endStart = rangeForDateInTZ(endStr, timeZone);
+  if (!endStart) return startRange;
+
+  return { fromDate: startRange.fromDate, toDate: new Date(new Date(endStart.fromDate).getTime() - 1).toISOString() };
+}
+
 // ---------------- widget fetch (web) ----------------
+// Uses Node 18+ built-in fetch + FormData (no new npm deps)
 async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
   const url = String(process.env.MINDBODY_WIDGET_URL || "").trim();
   const token = String(process.env.MINDBODY_WIDGET_TOKEN || "").trim();
@@ -145,102 +169,19 @@ async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
     method: "POST",
     body: form,
     headers: {
-      // Do NOT set content-type manually. fetch will set correct boundary.
       "User-Agent": `flowai-webhook/${debugId}`,
     },
   });
 
   const text = await res.text();
+
   console.log(`[${debugId}] widget_fetch <- status=${res.status} ok=${res.ok} length=${text.length}`);
 
-  return { status: res.status, ok: res.ok, text };
-}
-
-// --------- RSC extraction (best-effort, no deps) ---------
-// We look for JSON objects that start with {"id":"cinst_..."} and contain "type":"Class"
-function extractClassObjectsFromRsc(raw) {
-  const text = String(raw || "");
-  const results = [];
-
-  const starts = [];
-  let idx = 0;
-  while (true) {
-    const at = text.indexOf('{"id":"cinst_', idx);
-    if (at === -1) break;
-    starts.push(at);
-    idx = at + 10;
-  }
-
-  for (const start of starts) {
-    // try to find matching closing brace using a simple brace counter
-    let i = start;
-    let depth = 0;
-    let inStr = false;
-    let esc = false;
-
-    for (; i < text.length; i++) {
-      const ch = text[i];
-
-      if (inStr) {
-        if (esc) {
-          esc = false;
-        } else if (ch === "\\") {
-          esc = true;
-        } else if (ch === '"') {
-          inStr = false;
-        }
-        continue;
-      } else {
-        if (ch === '"') {
-          inStr = true;
-          continue;
-        }
-        if (ch === "{") depth++;
-        if (ch === "}") depth--;
-
-        if (depth === 0 && i > start) {
-          const candidate = text.slice(start, i + 1);
-          if (candidate.includes('"type":"Class"')) {
-            try {
-              const obj = JSON.parse(candidate);
-              results.push(obj);
-            } catch (_) {
-              // ignore parsing failures
-            }
-          }
-          break;
-        }
-      }
-    }
-  }
-
-  // de-dupe by id
-  const seen = new Set();
-  return results.filter((o) => {
-    if (!o?.id) return false;
-    if (seen.has(o.id)) return false;
-    seen.add(o.id);
-    return true;
-  });
-}
-
-function toCleanClasses(classObjs = []) {
-  return classObjs.map((c) => ({
-    id: c.id,
-    name: c.name,
-    startDateTime: c.startDateTime,
-    endDateTime: c.endDateTime,
-    duration: c.duration,
-    capacity: c.capacity,
-    numberRegistered: c.numberRegistered,
-    bookable: c.bookable,
-    waitlistable: c.waitlistable,
-    cancelled: c.cancelled,
-    instructor:
-      Array.isArray(c.staff) && c.staff[0] && typeof c.staff[0] === "object"
-        ? c.staff[0].displayLabel
-        : undefined,
-  }));
+  return {
+    status: res.status,
+    ok: res.ok,
+    text,
+  };
 }
 
 // ---------------- route ----------------
@@ -253,15 +194,16 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = pickFirst(req.body?.timezone, req.query?.timezone) || "America/Vancouver";
   const source = pickFirst(req.body?.source, req.query?.source);
 
-  // NEW: optional date param (YYYY-MM-DD)
-  const date = pickFirst(req.body?.date, req.query?.date);
+  // NEW: date + optional daysAhead
+  const date = pickFirst(req.body?.date, req.query?.date); // YYYY-MM-DD
+  const daysAhead = clampInt(pickFirst(req.body?.daysAhead, req.query?.daysAhead), 1, 14, 14);
 
   // Auth
   const incomingAuth = normalizeAuth(req.headers.authorization);
   const expectedSecret = String(process.env.GHL_SECRET || "").trim();
 
   // Mode
-  const mode = String(process.env.MINDBODY_MODE || "mock").trim().toLowerCase(); // mock | web
+  const mode = String(process.env.MINDBODY_MODE || "mock").trim().toLowerCase(); // mock | web | live (future)
 
   console.log("--------------------------------------------------");
   console.log(`[${debugId}] ${req.method} ${req.originalUrl}`);
@@ -273,59 +215,64 @@ app.post("/ghl/mindbody", async (req, res) => {
   });
   console.log(`[${debugId}] body:`, req.body);
   console.log(`[${debugId}] query:`, req.query);
-  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source, date });
+  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source, date, daysAhead });
 
   if (!expectedSecret) {
-    return res.status(500).json({ ok: false, debugId, error: "Server missing GHL_SECRET env var" });
+    return res.status(500).json({
+      ok: false,
+      debugId,
+      error: "Server missing GHL_SECRET env var",
+    });
   }
 
   if (!incomingAuth || incomingAuth !== expectedSecret) {
-    return res.status(401).json({ ok: false, debugId, error: "Unauthorized" });
+    return res.status(401).json({
+      ok: false,
+      debugId,
+      error: "Unauthorized",
+    });
   }
 
   if (!action) {
-    return res.status(400).json({ ok: false, debugId, error: "Missing action" });
+    return res.status(400).json({
+      ok: false,
+      debugId,
+      error: "Missing action (send in JSON body or query string)",
+    });
   }
 
   // Ping
   if (action === "ping") {
-    return res.status(200).json({ ok: true, action, studioKey, timezone, source, message: "pong", debugId });
-  }
-
-  // Helper to compute date range
-  function computeRange() {
-    const targetYMD = isValidYMD(date) ? date : todayYMDInTZ(timezone);
-
-    const gate = enforceMaxDaysAhead(targetYMD, timezone, 14);
-    if (!gate.ok) {
-      return {
-        ok: false,
-        targetYMD,
-        error: `Date is too far out. I can check up to ${gate.maxDaysAhead} days ahead.`,
-      };
-    }
-
-    const from = zonedStartOfDayUTC(targetYMD, timezone);
-    const to = zonedEndOfDayUTC(targetYMD, timezone);
-
-    return {
+    return res.status(200).json({
       ok: true,
-      targetYMD,
-      fromDate: from.toISOString(),
-      toDate: to.toISOString(),
-    };
+      action,
+      studioKey,
+      timezone,
+      source,
+      message: "pong",
+      debugId,
+    });
   }
 
-  // ---------------- get_schedule ----------------
-  if (action === "get_schedule") {
-    const r = computeRange();
-    if (!r.ok) {
-      return res.status(400).json({ ok: false, action, debugId, studioKey, timezone, source, error: r.error, date: r.targetYMD });
-    }
+  // Build range:
+  // - If date is provided: fetch THAT DAY (00:00 to 23:59:59.999 in timezone)
+  // - Else: fetch today -> today+daysAhead (cap 14)
+  const dateRange =
+    date ? rangeForDateInTZ(date, timezone) : rangeFromTodayDaysAhead(timezone, daysAhead);
 
-    // safe default: mock unless MINDBODY_MODE=web
+  if (!dateRange) {
+    return res.status(400).json({
+      ok: false,
+      debugId,
+      error: "Invalid date format. Use YYYY-MM-DD (example: 2026-02-21).",
+    });
+  }
+
+  // ---------------- get_schedule (mock by default) ----------------
+  if (action === "get_schedule") {
+    // stay safe: mock unless MINDBODY_MODE=web
     if (mode !== "web") {
-      const mock = buildMockSchedule({ studioKey, timezone, ymd: r.targetYMD });
+      const mock = buildMockSchedule({ studioKey, timezone, ...dateRange });
       return res.status(200).json({
         ok: true,
         action,
@@ -333,17 +280,17 @@ app.post("/ghl/mindbody", async (req, res) => {
         studioKey,
         timezone,
         source,
-        date: r.targetYMD,
+        date,
+        daysAhead,
+        range: dateRange,
         schedule: mock,
         debugId,
       });
     }
 
+    // If mode=web, use widget fetch
     try {
-      const result = await fetchMindbodyWidgetSchedule({ fromDate: r.fromDate, toDate: r.toDate, debugId });
-
-      const classesRaw = extractClassObjectsFromRsc(result.text);
-      const classes = toCleanClasses(classesRaw);
+      const result = await fetchMindbodyWidgetSchedule({ ...dateRange, debugId });
 
       return res.status(200).json({
         ok: true,
@@ -352,19 +299,14 @@ app.post("/ghl/mindbody", async (req, res) => {
         studioKey,
         timezone,
         source,
-        date: r.targetYMD,
+        date,
+        daysAhead,
+        range: dateRange,
         widget: {
           status: result.status,
           ok: result.ok,
           rawLength: result.text.length,
-        },
-        schedule: {
-          studioKey,
-          timezone,
-          date: r.targetYMD,
-          range: { fromDate: r.fromDate, toDate: r.toDate },
-          classes,
-          classCount: classes.length,
+          preview: result.text.slice(0, 500),
         },
         debugId,
       });
@@ -379,18 +321,10 @@ app.post("/ghl/mindbody", async (req, res) => {
     }
   }
 
-  // ---------------- get_schedule_web (FORCED web test) ----------------
+  // ---------------- get_schedule_web (FORCED web test, even if mode=mock) ----------------
   if (action === "get_schedule_web") {
-    const r = computeRange();
-    if (!r.ok) {
-      return res.status(400).json({ ok: false, action, debugId, studioKey, timezone, source, error: r.error, date: r.targetYMD });
-    }
-
     try {
-      const result = await fetchMindbodyWidgetSchedule({ fromDate: r.fromDate, toDate: r.toDate, debugId });
-
-      const classesRaw = extractClassObjectsFromRsc(result.text);
-      const classes = toCleanClasses(classesRaw);
+      const result = await fetchMindbodyWidgetSchedule({ ...dateRange, debugId });
 
       return res.status(200).json({
         ok: true,
@@ -399,19 +333,14 @@ app.post("/ghl/mindbody", async (req, res) => {
         studioKey,
         timezone,
         source,
-        date: r.targetYMD,
+        date,
+        daysAhead,
+        range: dateRange,
         widget: {
           status: result.status,
           ok: result.ok,
           rawLength: result.text.length,
-        },
-        schedule: {
-          studioKey,
-          timezone,
-          date: r.targetYMD,
-          range: { fromDate: r.fromDate, toDate: r.toDate },
-          classes,
-          classCount: classes.length,
+          preview: result.text.slice(0, 500),
         },
         debugId,
       });
@@ -449,6 +378,7 @@ app.post("/ghl/mindbody", async (req, res) => {
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
