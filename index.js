@@ -35,35 +35,45 @@ const STUDIO_TZ = "America/Vancouver";
 
 /**
  * ============
- * RESPONSE (AGENCY VAULT COMPAT)
+ * RESPONSE (AGENCY VAULT FRIENDLY)
  * ============
- * IMPORTANT: Return BOTH:
- * - top-level say/text  (some AV parsers expect this)
- * - nested results.say/results.text (others expect this)
+ * IMPORTANT:
+ * - Put `say` + `text` at TOP LEVEL (AV reads these more reliably)
+ * - Also include `results` as a mirror for backwards compatibility
  */
-function ok(res, results = {}) {
-  const say = (results?.say ?? results?.text ?? "").toString();
-  const text = (results?.text ?? results?.say ?? "").toString();
+function ok(res, payload = {}) {
+  const say = payload.say ?? payload.results?.say ?? "";
+  const text = payload.text ?? payload.results?.text ?? say ?? "";
 
-  return res.status(200).json({
+  const out = {
     success: true,
     say,
     text,
-    results: { ...results, say, text },
-  });
+    ...payload,
+    results: {
+      ...(payload.results || {}),
+      say: payload.results?.say ?? say,
+      text: payload.results?.text ?? text,
+    },
+  };
+
+  return res.status(200).json(out);
 }
 
 function fail(res, message, extra = {}) {
-  const say = "";
-  const text = "";
-
-  return res.status(200).json({
+  const out = {
     success: false,
     message: message || "Request failed",
-    say,
-    text,
-    results: { say, text, ...extra },
-  });
+    say: "",
+    text: "",
+    ...extra,
+    results: {
+      say: "",
+      text: "",
+      ...extra,
+    },
+  };
+  return res.status(200).json(out);
 }
 
 /**
@@ -72,23 +82,13 @@ function fail(res, message, extra = {}) {
  * ============
  */
 const WEEKDAY_MAP = {
-  sunday: 0,
-  sun: 0,
-  monday: 1,
-  mon: 1,
-  tuesday: 2,
-  tue: 2,
-  tues: 2,
-  wednesday: 3,
-  wed: 3,
-  thursday: 4,
-  thu: 4,
-  thur: 4,
-  thurs: 4,
-  friday: 5,
-  fri: 5,
-  saturday: 6,
-  sat: 6,
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3,
+  thursday: 4, thu: 4, thur: 4, thurs: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
 };
 
 function nowInTZDateString(tz = STUDIO_TZ) {
@@ -238,10 +238,7 @@ function timeBucketFromHour(hour) {
 }
 
 function localDayRange(dateStr) {
-  return {
-    startLocal: `${dateStr}T00:00:00`,
-    endLocal: `${dateStr}T23:59:59`,
-  };
+  return { startLocal: `${dateStr}T00:00:00`, endLocal: `${dateStr}T23:59:59` };
 }
 
 /**
@@ -289,20 +286,18 @@ async function mbFetch(path, { method = "GET", query, body } = {}) {
     SourcePassword: sourcePassword,
   };
 
-  const res = await fetch(url.toString(), {
+  const r = await fetch(url.toString(), {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  const text = await res.text();
+  const text = await r.text();
   const json = safeJsonParse(text);
 
-  if (!res.ok) {
+  if (!r.ok) {
     const detail = json || (text ? { raw: text.slice(0, 700) } : { raw: "(no response body)" });
-    throw new Error(
-      `Mindbody API error ${res.status} ${res.statusText} at ${path}: ${JSON.stringify(detail)}`
-    );
+    throw new Error(`Mindbody API error ${r.status} ${r.statusText} at ${path}: ${JSON.stringify(detail)}`);
   }
 
   return json ?? { raw: text };
@@ -342,7 +337,10 @@ app.get("/", (req, res) => res.status(200).send("Flow AI Mindbody webhook is run
 
 app.get("/health", (req, res) => {
   return ok(res, {
+    say: "OK",
+    text: "OK",
     ok: true,
+    tz: STUDIO_TZ,
     envDetected: {
       hasSiteId: Boolean(siteId),
       hasApiKey: Boolean(apiKey),
@@ -352,7 +350,6 @@ app.get("/health", (req, res) => {
       hasDefaultLocationId: Boolean(DEFAULT_LOCATION_ID),
       hasDefaultLocationIds: Boolean(DEFAULT_LOCATION_IDS),
       debugMode: DEBUG_MODE,
-      tz: STUDIO_TZ,
     },
   });
 });
@@ -435,7 +432,6 @@ app.all("/mb/schedule", async (req, res) => {
     if (wantTimeRange) classes = classes.filter((x) => toLowerClean(x.bucket) === wantTimeRange);
     if (wantTime) classes = classes.filter((x) => toLowerClean(x.startTimeLocal).includes(wantTime));
 
-    // Group by bucket for clean speech
     const buckets = { morning: [], afternoon: [], evening: [] };
     for (const c of classes) {
       const b = c.bucket || "morning";
@@ -446,7 +442,7 @@ app.all("/mb/schedule", async (req, res) => {
     const formatItem = (c) =>
       `${c.startTimeLocal || ""} ${c.name}${c.instructor ? ` with ${c.instructor}` : ""}`.trim();
 
-    // Default onlySay=true if not provided
+    // Default concise output unless onlySay explicitly false
     const onlySayRaw = String(params.onlySay || params.only_say || "").trim().toLowerCase();
     const isOnlySay = onlySayRaw ? (onlySayRaw === "1" || onlySayRaw === "true") : true;
 
@@ -463,9 +459,7 @@ app.all("/mb/schedule", async (req, res) => {
     }
 
     const say =
-      parts.length === 0
-        ? `No classes found for ${date}.`
-        : `Classes for ${date}. ${parts.join(" ")}`;
+      parts.length === 0 ? `No classes found for ${date}.` : `Classes for ${date}. ${parts.join(" ")}`;
 
     return ok(res, {
       say,
@@ -538,8 +532,12 @@ app.all("/mb/book", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+/**
+ * Railway prefers PORT=8080. Always default there.
+ */
+const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
