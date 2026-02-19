@@ -26,78 +26,34 @@ function makeDebugId() {
   );
 }
 
-// Decode things like "America%2FVancouver"
-function decodeMaybe(v) {
+function safeDecode(v) {
   const s = String(v ?? "").trim();
   if (!s) return "";
   try {
-    // decode once
-    const once = decodeURIComponent(s);
-    // sometimes it can be double-encoded in logs; decode twice safely
-    return once.includes("%2F") || once.includes("%3A") ? decodeURIComponent(once) : once;
+    // decode things like America%2FVancouver
+    return decodeURIComponent(s);
   } catch {
     return s;
   }
 }
 
-function isValidIanaTimeZone(tz) {
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: tz }).format(new Date());
-    return true;
-  } catch {
-    return false;
-  }
-}
+// ---------------- date parsing (supports natural phrases) ----------------
+// We cap requests to maxDaysAhead (default 14) to match your plan.
+function parseDatePhraseToISODate(datePhraseRaw, timezone, maxDaysAhead = 14) {
+  const phrase = String(datePhraseRaw || "").trim().toLowerCase();
+  if (!phrase) return null;
 
-function fmtDateInTZ(dateObj, tz) {
-  // en-CA gives YYYY-MM-DD
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(dateObj);
-}
+  // If already ISO date:
+  if (/^\d{4}-\d{2}-\d{2}$/.test(phrase)) return phrase;
 
-function fmtReadableDateInTZ(dateObj, tz) {
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-  }).format(dateObj);
-}
+  // We'll interpret relative phrases using "today in timezone"
+  const todayISO = getTodayISOInTZ(timezone); // YYYY-MM-DD
 
-function parseISODateOnly(s) {
-  // YYYY-MM-DD
-  const m = String(s).trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  if (!y || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
-  return { y, mo, d };
-}
+  if (phrase === "today") return todayISO;
+  if (phrase === "tomorrow") return addDaysISO(todayISO, 1);
 
-function dateOnlyToUtcNoon({ y, mo, d }) {
-  // UTC noon avoids DST edge weirdness
-  return new Date(Date.UTC(y, mo - 1, d, 12, 0, 0));
-}
-
-function addDays(dateObj, days) {
-  return new Date(dateObj.getTime() + days * 24 * 60 * 60 * 1000);
-}
-
-function clampDaysAhead(todayUtcNoon, targetUtcNoon, maxDaysAhead) {
-  const diffMs = targetUtcNoon.getTime() - todayUtcNoon.getTime();
-  const diffDays = Math.floor(diffMs / (24 * 60 * 60 * 1000));
-  return diffDays <= maxDaysAhead;
-}
-
-function weekdayIndex(name) {
-  const n = String(name).toLowerCase();
-  const map = {
+  // weekday parsing: "friday", "next friday", "this friday"
+  const weekdays = {
     sunday: 0,
     monday: 1,
     tuesday: 2,
@@ -106,173 +62,126 @@ function weekdayIndex(name) {
     friday: 5,
     saturday: 6,
   };
-  return map[n] ?? null;
-}
 
-function nextWeekdayUtcNoon(todayUtcNoon, tz, wantedIdx, forceNextWeek) {
-  // Determine today's weekday in TZ
-  const todayWeekdayName = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    weekday: "long",
-  }).format(todayUtcNoon);
-  const todayIdx = weekdayIndex(todayWeekdayName);
-  if (todayIdx === null) return null;
+  // normalize "next wednesday" etc
+  const m = phrase.match(/^(next|this)?\s*(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
+  if (m) {
+    const qualifier = m[1] || ""; // next|this|""
+    const dayName = m[2];
+    const targetDow = weekdays[dayName];
 
-  let delta = (wantedIdx - todayIdx + 7) % 7;
-  if (delta === 0 && forceNextWeek) delta = 7; // "next Friday"
-  return addDays(todayUtcNoon, delta);
-}
+    const base = new Date(todayISO + "T00:00:00Z"); // we'll compute offset by ISO arithmetic
+    const todayDow = dayOfWeekISO(todayISO); // 0-6 (Sun-Sat)
+    let delta = (targetDow - todayDow + 7) % 7;
 
-// Accepts: YYYY-MM-DD OR today/tomorrow OR weekday/next weekday OR "Feb 21" OR "14th"
-function resolveDateParamToUtcNoon({ dateParamRaw, tz }) {
-  const raw = String(dateParamRaw ?? "").trim();
-  if (!raw) return { ok: true, kind: "default_today" };
-
-  const lower = raw.toLowerCase();
-
-  // ISO date
-  const iso = parseISODateOnly(raw);
-  if (iso) return { ok: true, kind: "iso", utcNoon: dateOnlyToUtcNoon(iso) };
-
-  // today / tomorrow
-  if (lower === "today") return { ok: true, kind: "today" };
-  if (lower === "tomorrow") return { ok: true, kind: "tomorrow" };
-
-  // next <weekday> or <weekday>
-  const nextMatch = lower.match(/^next\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
-  if (nextMatch) return { ok: true, kind: "next_weekday", weekday: nextMatch[1], forceNextWeek: true };
-
-  const wdMatch = lower.match(/^(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
-  if (wdMatch) return { ok: true, kind: "weekday", weekday: wdMatch[1], forceNextWeek: false };
-
-  // "14th" / "14"
-  const dayOnly = lower.match(/^(\d{1,2})(st|nd|rd|th)?$/);
-  if (dayOnly) return { ok: true, kind: "day_of_month", day: Number(dayOnly[1]) };
-
-  // "Feb 21" / "February 21" / etc
-  // We’ll try parsing with current year, then next year if needed
-  return { ok: true, kind: "date_text", text: raw };
-}
-
-function computeRequestedDate({ tz, dateParamRaw, maxDaysAhead }) {
-  const now = new Date();
-  const todayStr = fmtDateInTZ(now, tz);
-  const todayParts = parseISODateOnly(todayStr);
-  const todayUtcNoon = dateOnlyToUtcNoon(todayParts);
-
-  const res = resolveDateParamToUtcNoon({ dateParamRaw, tz });
-  if (!res.ok) return { ok: false, error: "Could not read date" };
-
-  let targetUtcNoon = null;
-
-  if (res.kind === "default_today" || res.kind === "today") {
-    targetUtcNoon = todayUtcNoon;
-  } else if (res.kind === "tomorrow") {
-    targetUtcNoon = addDays(todayUtcNoon, 1);
-  } else if (res.kind === "weekday" || res.kind === "next_weekday") {
-    const idx = weekdayIndex(res.weekday);
-    targetUtcNoon = nextWeekdayUtcNoon(todayUtcNoon, tz, idx, !!res.forceNextWeek);
-  } else if (res.kind === "iso") {
-    targetUtcNoon = res.utcNoon;
-  } else if (res.kind === "day_of_month") {
-    // pick this month if within window, else next month (still within 14 days)
-    const y = todayParts.y;
-    const mo = todayParts.mo;
-    const d = res.day;
-
-    const try1 = dateOnlyToUtcNoon({ y, mo, d });
-    const try2 = dateOnlyToUtcNoon({
-      y: mo === 12 ? y + 1 : y,
-      mo: mo === 12 ? 1 : mo + 1,
-      d,
-    });
-
-    // choose the earliest future date
-    const candidates = [try1, try2].filter((x) => x.getTime() >= todayUtcNoon.getTime());
-    targetUtcNoon = candidates.sort((a, b) => a.getTime() - b.getTime())[0] || try2;
-  } else if (res.kind === "date_text") {
-    // Parse with current year if missing; if past, try next year
-    const y = todayParts.y;
-    let dt = new Date(Date.parse(`${res.text} ${y}`));
-    if (Number.isNaN(dt.getTime())) dt = new Date(Date.parse(res.text));
-    if (Number.isNaN(dt.getTime())) return { ok: false, error: `Unrecognized date: ${res.text}` };
-
-    // normalize to the date in TZ (strip time)
-    const dateStr = fmtDateInTZ(dt, tz);
-    const parts = parseISODateOnly(dateStr);
-    targetUtcNoon = dateOnlyToUtcNoon(parts);
-
-    if (targetUtcNoon.getTime() < todayUtcNoon.getTime()) {
-      // try next year
-      const dt2 = new Date(Date.parse(`${res.text} ${y + 1}`));
-      if (!Number.isNaN(dt2.getTime())) {
-        const dateStr2 = fmtDateInTZ(dt2, tz);
-        const parts2 = parseISODateOnly(dateStr2);
-        targetUtcNoon = dateOnlyToUtcNoon(parts2);
-      }
+    // If they said "friday" and it's friday today, delta would be 0 (today).
+    // Usually callers mean upcoming; keep delta=0 as today. If you want next occurrence, say "next friday".
+    if (qualifier === "next") {
+      delta = delta === 0 ? 7 : delta + 7;
     }
+    // "this friday" behaves like default.
+
+    const iso = addDaysISO(todayISO, delta);
+    return iso;
   }
 
-  if (!targetUtcNoon) return { ok: false, error: "Could not compute requested date" };
-
-  const requestedDate = fmtDateInTZ(targetUtcNoon, tz);
-  const daysAhead = Math.floor(
-    (targetUtcNoon.getTime() - todayUtcNoon.getTime()) / (24 * 60 * 60 * 1000)
-  );
-
-  if (daysAhead < 0) {
-    return { ok: false, error: "That date is in the past." };
-  }
-
-  if (!clampDaysAhead(todayUtcNoon, targetUtcNoon, maxDaysAhead)) {
-    return {
-      ok: false,
-      error: `I can only check schedules up to ${maxDaysAhead} days ahead.`,
-      daysAhead,
-      requestedDate,
-    };
-  }
-
-  return { ok: true, todayInTZ: todayStr, requestedDate, daysAhead, targetUtcNoon };
+  // simple "on the 14th" -> NOT supported without month context
+  // (Agent should pass a clearer phrase; server returns null and we fall back)
+  return null;
 }
 
-// A mocked schedule (14-day capable)
-function buildMockScheduleForDate({ studioKey, timezone, requestedDate }) {
-  // simple predictable mock
-  const classes = [
-    { time: "6:00 AM", name: "Hot Yoga" },
-    { time: "9:00 AM", name: "Hot Pilates" },
-    { time: "12:00 PM", name: "Warm Yin" },
-    { time: "5:30 PM", name: "Hot Yoga" },
-    { time: "7:00 PM", name: "Hot Sculpt" },
-  ];
+function addDaysISO(isoDate, days) {
+  const d = new Date(isoDate + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
+function dayOfWeekISO(isoDate) {
+  const d = new Date(isoDate + "T00:00:00Z");
+  return d.getUTCDay(); // 0=Sun .. 6=Sat
+}
+
+function getTodayISOInTZ(timezone) {
+  // Use Intl to get YYYY-MM-DD in the requested timezone
+  // timezone must be a valid IANA name (America/Vancouver)
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  const parts = fmt.formatToParts(new Date());
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const d = parts.find((p) => p.type === "day")?.value;
+  return `${y}-${m}-${d}`;
+}
+
+function daysBetweenISO(fromISO, toISO) {
+  const a = new Date(fromISO + "T00:00:00Z");
+  const b = new Date(toISO + "T00:00:00Z");
+  const diff = b.getTime() - a.getTime();
+  return Math.round(diff / (24 * 60 * 60 * 1000));
+}
+
+// ---------------- mocked schedule (date-aware) ----------------
+function buildMockSchedule({ studioKey, timezone, isoDate }) {
+  // Create a few believable classes (mock)
+  const base = `${isoDate}T`;
   return {
     studioKey,
     timezone,
-    date: requestedDate,
-    classes: classes.map((c, i) => ({
-      id: `mock_${requestedDate.replaceAll("-", "")}_${i + 1}`,
-      name: `${c.name} (Mock)`,
-      time: c.time,
-      instructor: "Mock Instructor",
-      bookable: true,
-    })),
+    range: {
+      from: `${isoDate}T00:00:00.000Z`,
+      to: `${isoDate}T23:59:59.000Z`,
+    },
+    classes: [
+      {
+        id: "mock_0600",
+        name: "Hot Yoga (Mock)",
+        startDateTime: `${base}06:00:00.000Z`,
+        endDateTime: `${base}07:00:00.000Z`,
+        instructor: "Mock Instructor",
+        bookable: true,
+      },
+      {
+        id: "mock_1200",
+        name: "Hot HIIT (Mock)",
+        startDateTime: `${base}12:00:00.000Z`,
+        endDateTime: `${base}13:00:00.000Z`,
+        instructor: "Mock Instructor",
+        bookable: true,
+      },
+      {
+        id: "mock_1800",
+        name: "Yin (Mock)",
+        startDateTime: `${base}18:00:00.000Z`,
+        endDateTime: `${base}19:00:00.000Z`,
+        instructor: "Mock Instructor",
+        bookable: true,
+      },
+    ],
   };
 }
 
-function buildScheduleSay({ requestedDateReadable, schedule }) {
-  if (!schedule?.classes?.length) {
-    return `I don’t see any classes listed for ${requestedDateReadable}.`;
+function buildSayFromSchedule(schedule, requestedPhrase, requestedISO) {
+  const list = (schedule?.classes || []).map((c) => {
+    // keep it simple: just show name + "start"
+    // (In real mode you’ll format local time)
+    const t = String(c.startDateTime || "").slice(11, 16);
+    return `${t} — ${c.name}`;
+  });
+
+  if (!list.length) {
+    return `I don’t see any classes listed for ${requestedPhrase || requestedISO || "that day"} right now.`;
   }
-  const list = schedule.classes
-    .map((c) => `${c.time} — ${c.name}`)
-    .join(", ");
-  return `Here are the classes for ${requestedDateReadable}: ${list}. Which class would you like to book?`;
+
+  return `Here are the classes for ${requestedPhrase || requestedISO}: ${list.join(", ")}.`;
 }
 
 // ---------------- widget fetch (web) ----------------
-// (kept for later; not required for mock)
+// (kept for later; you’re waiting on Production credentials)
 async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
   const url = String(process.env.MINDBODY_WIDGET_URL || "").trim();
   const token = String(process.env.MINDBODY_WIDGET_TOKEN || "").trim();
@@ -294,29 +203,33 @@ async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
 
   const text = await res.text();
 
-  return { status: res.status, ok: res.ok, text };
+  return {
+    status: res.status,
+    ok: res.ok,
+    text,
+  };
 }
 
 // ---------------- route ----------------
 app.post("/ghl/mindbody", async (req, res) => {
   const debugId = makeDebugId();
 
-  // Merge inputs from query + body (AgencyVault sends query params)
-  const action = pickFirst(req.body?.action, req.query?.action);
-  const studioKey = pickFirst(req.body?.studioKey, req.query?.studioKey);
+  const actionRaw = pickFirst(req.body?.action, req.query?.action);
+  const studioKeyRaw = pickFirst(req.body?.studioKey, req.query?.studioKey);
   const timezoneRaw = pickFirst(req.body?.timezone, req.query?.timezone);
-  const source = pickFirst(req.body?.source, req.query?.source);
-  const dateParamRaw = pickFirst(req.body?.date, req.query?.date);
+  const sourceRaw = pickFirst(req.body?.source, req.query?.source);
+  const dateRaw = pickFirst(req.body?.date, req.query?.date);
 
-  // Auth
+  const action = String(actionRaw || "").trim();
+  const studioKey = String(studioKeyRaw || "").trim();
+  const timezone = safeDecode(timezoneRaw || "America/Vancouver") || "America/Vancouver";
+  const source = String(sourceRaw || "").trim();
+  const datePhrase = String(dateRaw || "").trim();
+
   const incomingAuth = normalizeAuth(req.headers.authorization);
   const expectedSecret = String(process.env.GHL_SECRET || "").trim();
 
-  // Mode
-  const mode = String(process.env.MINDBODY_MODE || "mock").trim().toLowerCase(); // mock | web | live (future)
-
-  // Decode timezone safely
-  const timezone = decodeMaybe(timezoneRaw) || "America/Vancouver";
+  const mode = String(process.env.MINDBODY_MODE || "mock").trim().toLowerCase(); // mock | web
   const maxDaysAhead = Number(process.env.MAX_DAYS_AHEAD || 14);
 
   console.log("--------------------------------------------------");
@@ -329,12 +242,12 @@ app.post("/ghl/mindbody", async (req, res) => {
   });
   console.log(`[${debugId}] body:`, req.body);
   console.log(`[${debugId}] query:`, req.query);
-  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source, dateParamRaw });
+  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source, datePhrase, maxDaysAhead });
 
   if (!expectedSecret) {
     return res.status(500).json({
       success: false,
-      say: "Server is missing configuration.",
+      ok: false,
       debugId,
       error: "Server missing GHL_SECRET env var",
     });
@@ -343,7 +256,7 @@ app.post("/ghl/mindbody", async (req, res) => {
   if (!incomingAuth || incomingAuth !== expectedSecret) {
     return res.status(401).json({
       success: false,
-      say: "Unauthorized.",
+      ok: false,
       debugId,
       error: "Unauthorized",
     });
@@ -352,144 +265,142 @@ app.post("/ghl/mindbody", async (req, res) => {
   if (!action) {
     return res.status(400).json({
       success: false,
-      say: "Missing action.",
+      ok: false,
       debugId,
       error: "Missing action (send in JSON body or query string)",
     });
   }
 
-  if (!isValidIanaTimeZone(timezone)) {
-    return res.status(400).json({
-      success: false,
-      say: "Invalid timezone provided.",
-      debugId,
-      error: `Invalid time zone specified: ${timezone}`,
-    });
-  }
-
-  // Ping
   if (action === "ping") {
     return res.status(200).json({
       success: true,
+      ok: true,
+      action,
+      studioKey,
+      timezone,
+      source,
       say: "pong",
+      text: "pong",
       debugId,
-      data: { action, studioKey, timezone, source },
     });
   }
 
   // ---------------- get_schedule ----------------
   if (action === "get_schedule") {
-    const computed = computeRequestedDate({
-      tz: timezone,
-      dateParamRaw,
-      maxDaysAhead,
-    });
+    // Determine requested date
+    const todayInTZ = getTodayISOInTZ(timezone);
+    const requestedISO = parseDatePhraseToISODate(datePhrase || "today", timezone, maxDaysAhead);
 
-    if (!computed.ok) {
+    if (!requestedISO) {
       return res.status(200).json({
         success: false,
-        say: computed.error || "I couldn’t understand that date.",
-        debugId,
-        data: {
-          action,
-          studioKey,
-          timezone,
-          source,
-          dateParamRaw,
-          maxDaysAhead,
-          ...computed,
-        },
-      });
-    }
-
-    const requestedDateReadable = fmtReadableDateInTZ(computed.targetUtcNoon, timezone);
-
-    // mock schedule (default)
-    if (mode !== "web") {
-      const schedule = buildMockScheduleForDate({
+        ok: false,
+        action,
         studioKey,
         timezone,
-        requestedDate: computed.requestedDate,
-      });
-
-      return res.status(200).json({
-        success: true,
-        say: buildScheduleSay({ requestedDateReadable, schedule }),
+        source,
+        error: "Could not understand the requested date. Try 'today', 'tomorrow', 'friday', or 'YYYY-MM-DD'.",
         debugId,
-        data: {
-          action,
-          mode: "mock",
-          studioKey,
-          timezone,
-          source,
-          dateParamRaw,
-          requestedDate: computed.requestedDate,
-          todayInTZ: computed.todayInTZ,
-          daysAhead: computed.daysAhead,
-          maxDaysAhead,
-          schedule,
-        },
       });
     }
 
-    // web mode (kept for later; currently just shows widget preview)
-    try {
-      // If you want: use requestedDate -> requestedDate+1 to fetch a 24h window
-      const fromDate = `${computed.requestedDate}T00:00:00`;
-      const toDate = `${computed.requestedDate}T23:59:59`;
+    const daysAhead = daysBetweenISO(todayInTZ, requestedISO);
+    if (daysAhead < 0 || daysAhead > maxDaysAhead) {
+      return res.status(200).json({
+        success: false,
+        ok: false,
+        action,
+        studioKey,
+        timezone,
+        source,
+        error: `Date is outside the allowed range (0–${maxDaysAhead} days ahead).`,
+        debugId,
+      });
+    }
 
-      const result = await fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId });
+    // MOCK mode (your current plan while waiting on Mindbody Prod creds)
+    if (mode !== "web") {
+      const schedule = buildMockSchedule({ studioKey, timezone, isoDate: requestedISO });
+      const say = buildSayFromSchedule(schedule, datePhrase || requestedISO, requestedISO);
 
       return res.status(200).json({
         success: true,
-        say: `I pulled the schedule data for ${requestedDateReadable}.`,
+        ok: true,
+        action,
+        mode: "mock",
+        studioKey,
+        timezone,
+        source,
+        date: requestedISO,
+        say,
+        text: say,
+        results: { say, text: say }, // extra compatibility
+        schedule,
         debugId,
-        data: {
-          action,
-          mode: "web",
-          studioKey,
-          timezone,
-          source,
-          dateParamRaw,
-          requestedDate: computed.requestedDate,
-          todayInTZ: computed.todayInTZ,
-          daysAhead: computed.daysAhead,
-          maxDaysAhead,
-          widget: {
-            status: result.status,
-            ok: result.ok,
-            rawLength: result.text.length,
-            preview: result.text.slice(0, 500),
-          },
+      });
+    }
+
+    // WEB mode (optional, when you’re ready)
+    try {
+      const fromDate = new Date().toISOString();
+      const toDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const result = await fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId });
+
+      const say = result.ok
+        ? `I pulled the schedule successfully for ${requestedISO}.`
+        : `I couldn’t pull the schedule right now.`;
+
+      return res.status(200).json({
+        success: result.ok,
+        ok: result.ok,
+        action,
+        mode: "web",
+        studioKey,
+        timezone,
+        source,
+        date: requestedISO,
+        say,
+        text: say,
+        results: { say, text: say },
+        widget: {
+          status: result.status,
+          ok: result.ok,
+          rawLength: result.text.length,
+          preview: result.text.slice(0, 500),
         },
+        debugId,
       });
     } catch (err) {
-      return res.status(200).json({
+      return res.status(500).json({
         success: false,
-        say: "I couldn’t pull the live schedule right now.",
+        ok: false,
+        action,
+        mode: "web",
         debugId,
-        data: {
-          action,
-          mode: "web",
-          error: String(err?.message || err),
-        },
+        error: String(err?.message || err),
       });
     }
   }
 
-  // Placeholder for next actions
+  // Placeholder for booking later
   if (action === "book_class" || action === "cancel_class") {
     return res.status(200).json({
       success: true,
-      say: `${action} received (not implemented yet).`,
+      ok: true,
+      action,
+      studioKey,
+      timezone,
+      source,
+      say: `${action} received (not implemented yet)`,
+      text: `${action} received (not implemented yet)`,
+      results: { say: `${action} received (not implemented yet)`, text: `${action} received (not implemented yet)` },
       debugId,
-      data: { action, studioKey, timezone, source },
     });
   }
 
   return res.status(400).json({
     success: false,
-    say: "Unknown action.",
+    ok: false,
     debugId,
     error: `Unknown action: ${action}`,
     allowed: ["ping", "get_schedule", "book_class", "cancel_class"],
@@ -498,8 +409,6 @@ app.post("/ghl/mindbody", async (req, res) => {
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
-
 
 
 
