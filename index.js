@@ -1,166 +1,169 @@
-const express = require("express");
-const axios = require("axios");
+// index.js
+'use strict';
+
+const express = require('express');
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
 
-// -------------------------
-// Helpers
-// -------------------------
-function getAuthToken(req) {
-  // Accept either: "Bearer <token>" OR just "<token>"
-  const h = req.headers["authorization"] || "";
-  if (!h) return "";
-  return h.startsWith("Bearer ") ? h.slice(7).trim() : h.trim();
+// --- Config ---
+const PORT = process.env.PORT || 8080;
+const GHL_SECRET = process.env.GHL_SECRET || '';
+const TZ_DEFAULT = process.env.TZ || 'America/Vancouver';
+
+// Optional, but recommended for scaling
+let STUDIO_CONFIG = {};
+try {
+  if (process.env.STUDIO_CONFIG_JSON) {
+    STUDIO_CONFIG = JSON.parse(process.env.STUDIO_CONFIG_JSON);
+  }
+} catch (e) {
+  console.error('Invalid STUDIO_CONFIG_JSON:', e.message);
+  STUDIO_CONFIG = {};
 }
 
-function requireAuth(req, res, next) {
-  const incoming = getAuthToken(req);
-  const expected = (process.env.GHL_SECRET || "").trim();
+// Mindbody envs (some may be optional depending on which endpoints you use)
+const MINDBODY_API_KEY = process.env.MINDBODY_API_KEY || '';
+const MINDBODY_SITE_ID = process.env.MINDBODY_SITE_ID || '';
+const MINDBODY_DEFAULT_LOCATION_ID = process.env.MINDBODY_DEFAULT_LOCATION_ID || '';
+const MINDBODY_SOURCE_NAME = process.env.MINDBODY_SOURCE_NAME || '';
+const MINDBODY_SOURCE_PASSWORD = process.env.MINDBODY_SOURCE_PASSWORD || '';
 
-  if (!expected) {
-    return res.status(500).json({ error: "Server missing GHL_SECRET env var" });
+app.use(express.json({ limit: '1mb' }));
+
+// --- Health endpoints ---
+app.get('/', (req, res) => res.status(200).send('ok'));
+app.get('/health', (req, res) => res.status(200).send('ok'));
+
+// --- Auth middleware for GHL webhook ---
+function requireBearer(req, res, next) {
+  // If you ever want to temporarily allow local testing without auth,
+  // you can set ALLOW_NO_AUTH=true in Railway (not recommended for prod).
+  const allowNoAuth = (process.env.ALLOW_NO_AUTH || '').toLowerCase() === 'true';
+
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : '';
+
+  if (allowNoAuth) return next();
+
+  if (!GHL_SECRET) {
+    return res.status(500).json({ error: 'Server misconfigured: missing GHL_SECRET' });
   }
 
-  if (!incoming || incoming !== expected) {
-    return res.status(401).json({ error: "Unauthorized" });
+  if (!token) {
+    return res.status(401).json({ error: 'Missing Authorization header' });
+  }
+
+  if (token !== GHL_SECRET) {
+    return res.status(401).json({ error: 'Invalid Authorization token' });
   }
 
   next();
 }
 
-function loadStudioConfig(studioKey) {
-  // Preferred: a JSON map so you can scale to 174 studios without redeploying code.
-  // Example env var:
-  // STUDIO_CONFIG_JSON = {
-  //   "oxygen_roundhouse": { "siteId": 1, "timezone": "America/Vancouver" },
-  //   "oxygen_kelowna": { "siteId": 2, "timezone": "America/Vancouver" }
-  // }
-  const raw = process.env.STUDIO_CONFIG_JSON;
-
-  if (raw) {
-    try {
-      const map = JSON.parse(raw);
-      if (map && map[studioKey]) return map[studioKey];
-    } catch (e) {
-      // fall through to defaults
-      console.warn("STUDIO_CONFIG_JSON is not valid JSON");
-    }
-  }
-
-  // Fallback single-studio config (fine for pilot)
+// --- Helpers ---
+function getStudioConfig(studioKey) {
+  const studio = (studioKey && STUDIO_CONFIG && STUDIO_CONFIG[studioKey]) ? STUDIO_CONFIG[studioKey] : {};
   return {
-    siteId: process.env.MINDBODY_SITE_ID ? Number(process.env.MINDBODY_SITE_ID) : undefined,
-    timezone: process.env.DEFAULT_TIMEZONE || "America/Vancouver",
+    timezone: studio.timezone || TZ_DEFAULT,
+    siteId: studio.siteId || MINDBODY_SITE_ID,
+    locationId: studio.locationId || MINDBODY_DEFAULT_LOCATION_ID,
+    // You can also store per-studio source creds if needed later
   };
 }
 
-// -------------------------
-// Basic routes
-// -------------------------
-app.get("/", (req, res) => res.status(200).send("ok"));
-app.get("/health", (req, res) => res.status(200).send("ok"));
+function badRequest(res, message, extra = {}) {
+  return res.status(400).json({ error: message, ...extra });
+}
 
-// -------------------------
-// Webhook route (THIS is what GHL hits)
-// -------------------------
-app.post("/ghl/mindbody", requireAuth, async (req, res) => {
+// --- Main webhook endpoint ---
+app.post('/ghl/mindbody', requireBearer, async (req, res) => {
   try {
     const body = req.body || {};
+
     const action = body.action;
     const studioKey = body.studioKey;
-    const timezone = body.timezone;
 
-    if (!action) return res.status(400).json({ error: "Missing action" });
-    if (!studioKey) return res.status(400).json({ error: "Missing studioKey" });
-    if (!timezone) return res.status(400).json({ error: "Missing timezone" });
+    if (!action) return badRequest(res, 'Missing required field: action');
+    if (!studioKey) return badRequest(res, 'Missing required field: studioKey');
 
-    const studioCfg = loadStudioConfig(studioKey);
-    const siteId = studioCfg.siteId;
+    const studio = getStudioConfig(studioKey);
 
-    // 1) PING (for testing the wiring)
-    if (action === "ping") {
-      return res.json({
+    // Optional fields (GHL can pass these as fixed too, but config is better)
+    const timezone = body.timezone || studio.timezone;
+    const source = body.source || 'agencyvault';
+
+    // Basic validation for supported actions
+    const allowed = new Set(['ping', 'get_schedule', 'book_class', 'cancel_class']);
+    if (!allowed.has(action)) {
+      return badRequest(res, 'Unsupported action', { allowed: Array.from(allowed) });
+    }
+
+    // ---- Action handlers ----
+    if (action === 'ping') {
+      return res.status(200).json({
         ok: true,
         action,
         studioKey,
         timezone,
-        siteId: siteId ?? null,
-        message: "Webhook reachable + authorized",
+        source,
+        message: 'pong'
       });
     }
 
-    // 2) GET_SCHEDULE (example)
-    // IMPORTANT: Mindbody endpoints/auth can vary depending on your setup.
-    // This is a sane starting structure. We can adjust the exact Mindbody URL/params once you confirm which endpoint you use.
-    if (action === "get_schedule") {
-      if (!siteId) {
-        return res.status(500).json({ error: "Missing siteId for this studio (config not set)" });
-      }
+    // NOTE: The below are placeholders until you wire the exact Mindbody endpoints you want.
+    // They return structured responses so the agent can proceed safely.
 
-      // Expected inputs from GHL
-      // (You can add these as Custom Action parameters)
-      const startDate = body.startDate; // "2026-02-18"
-      const endDate = body.endDate;     // "2026-02-25"
-
-      if (!startDate || !endDate) {
-        return res.status(400).json({ error: "Missing startDate or endDate" });
-      }
-
-      const MINDBODY_API_KEY = process.env.MINDBODY_API_KEY; // your developer API key
-      if (!MINDBODY_API_KEY) {
-        return res.status(500).json({ error: "Server missing MINDBODY_API_KEY env var" });
-      }
-
-      const baseUrl = process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6";
-
-      // NOTE: This endpoint path may need to be adjusted depending on which Mindbody schedule endpoint you’re using.
-      // This code is built so we can swap the path/params easily without changing the overall architecture.
-      const url = `${baseUrl}/class/classes`;
-
-      const response = await axios.get(url, {
-        headers: {
-          "Api-Key": MINDBODY_API_KEY,
-          "SiteId": String(siteId),
-          "Content-Type": "application/json",
-        },
-        params: {
-          StartDateTime: `${startDate}T00:00:00`,
-          EndDateTime: `${endDate}T23:59:59`,
-        },
-        timeout: 15000,
-      });
-
-      return res.json({
+    if (action === 'get_schedule') {
+      // TODO: Replace with real Mindbody schedule call
+      return res.status(200).json({
         ok: true,
         action,
         studioKey,
         timezone,
-        siteId,
-        data: response.data,
+        source,
+        schedule: [],
+        note: 'Schedule endpoint not wired yet (placeholder).'
       });
     }
 
-    return res.status(400).json({ error: `Unknown action: ${action}` });
+    if (action === 'book_class') {
+      // Expect something like: classId, client info, etc.
+      // TODO: Replace with real Mindbody booking call
+      return res.status(200).json({
+        ok: true,
+        action,
+        studioKey,
+        timezone,
+        source,
+        booked: false,
+        note: 'Booking endpoint not wired yet (placeholder).'
+      });
+    }
+
+    if (action === 'cancel_class') {
+      // TODO: Replace with real Mindbody cancel call
+      return res.status(200).json({
+        ok: true,
+        action,
+        studioKey,
+        timezone,
+        source,
+        cancelled: false,
+        note: 'Cancel endpoint not wired yet (placeholder).'
+      });
+    }
+
+    // Should never reach here
+    return badRequest(res, 'Unhandled action');
+
   } catch (err) {
-    console.error("Webhook error:", err?.response?.data || err.message);
-    return res.status(500).json({
-      error: "Server error",
-      details: err?.response?.data || err.message,
-    });
+    console.error('Webhook error:', err);
+    return res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
-// -------------------------
-// Start server
-// -------------------------
-const PORT = process.env.PORT || 8080;
-const server = app.listen(PORT, () => {
+// --- Start server ---
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
   console.log(`Listening on PORT: ${PORT}`);
-});
-
-// Graceful shutdown (Railway sends SIGTERM on deploy/restart)
-process.on("SIGTERM", () => {
-  console.log("SIGTERM received, shutting down gracefully...");
-  server.close(() => process.exit(0));
 });
