@@ -1,13 +1,26 @@
 /**
- * FlowAI Mindbody Webhook (GHL Custom Action)
- * - Single endpoint: POST /ghl/mindbody
- * - Uses query params (GHL sends params in querystring)
- * - Supports mocked schedule with date parsing + 14-day cap
- * - Returns "say/text" in multiple locations to satisfy different wrappers:
- *   top-level say/text AND results.say/results.text
+ * FlowAI Mindbody Webhook (Mock Schedule)
+ * - Endpoint: POST /ghl/mindbody
+ * - Query params:
+ *    action: get_schedule (or get_schedule_web / get_schedule_by_date supported)
+ *    studioKey: oxygen_roundhouse (required)
+ *    timezone: America/Vancouver (required)  <-- handles encoded values too
+ *    source: agencyvault (optional)
+ *    date: any date phrase (optional) e.g. "tomorrow", "Friday", "2026-02-21", "February 20th, 2026"
+ *
+ * Returns:
+ *  {
+ *    success: true/false,
+ *    say: "...",
+ *    text: "...",
+ *    results: { say: "...", text: "..." },
+ *    debugId: "...",
+ *    data: { ...debug payload... }
+ *  }
  */
 
 const express = require("express");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -16,128 +29,268 @@ const PORT = process.env.PORT || 8080;
 
 // -------- Helpers --------
 
-function safeStr(v) {
-  if (v === undefined || v === null) return "";
-  return String(v);
+function makeDebugId() {
+  return crypto.randomBytes(6).toString("hex");
 }
 
-function decodeMaybeTwice(v) {
-  // Handles cases like America%252FVancouver (double-encoded)
-  let s = safeStr(v);
+// Some platforms send encoded timezone like America%2FVancouver
+function normalizeTimezone(tz) {
+  if (!tz) return null;
   try {
-    const once = decodeURIComponent(s);
-    try {
-      const twice = decodeURIComponent(once);
-      return twice;
-    } catch {
-      return once;
-    }
+    const decoded = decodeURIComponent(tz);
+    return decoded;
   } catch {
-    return s;
+    return tz;
   }
 }
 
-function isValidIanaTimeZone(tz) {
-  try {
-    // Will throw if invalid
-    Intl.DateTimeFormat("en-US", { timeZone: tz }).format(new Date());
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function ymdFromDateInTZ(date, timeZone) {
-  // Returns YYYY-MM-DD for "date" formatted in a given timezone
-  const parts = new Intl.DateTimeFormat("en-CA", {
+// Get "today" in a specific TZ as YYYY-MM-DD
+function getTodayYMDInTZ(timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-CA", {
     timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).formatToParts(date);
-
-  const y = parts.find((p) => p.type === "year")?.value;
-  const m = parts.find((p) => p.type === "month")?.value;
-  const d = parts.find((p) => p.type === "day")?.value;
-  return `${y}-${m}-${d}`;
+  });
+  // en-CA yields YYYY-MM-DD
+  return dtf.format(new Date());
 }
 
-function addDaysUTC(date, days) {
-  const d = new Date(date.getTime());
-  d.setUTCDate(d.getUTCDate() + days);
-  return d;
+function ymdToParts(ymd) {
+  const [y, m, d] = ymd.split("-").map((x) => parseInt(x, 10));
+  return { y, m, d };
 }
 
-function parseDatePhraseToYMD(datePhraseRaw, timeZone) {
-  // Goal: accept "tomorrow", "today", "Friday", "Feb 21", "2026-02-21", "the 14th", etc.
-  // For now: support
-  // - YYYY-MM-DD (direct)
-  // - today / tomorrow
-  // - anything Date.parse can handle (best effort)
-  const raw = safeStr(datePhraseRaw).trim();
-  if (!raw) return { ok: false, reason: "missing_date" };
+function partsToYMD({ y, m, d }) {
+  const mm = String(m).padStart(2, "0");
+  const dd = String(d).padStart(2, "0");
+  return `${y}-${mm}-${dd}`;
+}
 
-  // YYYY-MM-DD exact
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return { ok: true, ymd: raw, normalized: raw, method: "ymd" };
+// Add days to a YYYY-MM-DD safely (using UTC noon)
+function addDaysToYMD(ymd, daysToAdd) {
+  const { y, m, d } = ymdToParts(ymd);
+  const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0)); // noon UTC prevents day shift
+  dt.setUTCDate(dt.getUTCDate() + daysToAdd);
+  const yy = dt.getUTCFullYear();
+  const mm = dt.getUTCMonth() + 1;
+  const dd = dt.getUTCDate();
+  return partsToYMD({ y: yy, m: mm, d: dd });
+}
+
+function clampDaysAhead(daysAhead, maxDaysAhead) {
+  if (typeof daysAhead !== "number" || Number.isNaN(daysAhead)) return null;
+  if (daysAhead < 0) return null;
+  if (daysAhead > maxDaysAhead) return null;
+  return daysAhead;
+}
+
+// Parse a few date phrase types -> returns { requestedDateYMD, datePhraseRaw, daysAhead }
+function resolveDatePhraseToYMD({ datePhrase, timeZone, maxDaysAhead }) {
+  const datePhraseRaw = (datePhrase || "").trim();
+
+  const todayYMD = getTodayYMDInTZ(timeZone);
+
+  // default if missing: today
+  if (!datePhraseRaw) {
+    return {
+      requestedDateYMD: todayYMD,
+      datePhraseRaw: "",
+      daysAhead: 0,
+    };
   }
 
-  const lower = raw.toLowerCase();
+  // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(datePhraseRaw)) {
+    const requestedDateYMD = datePhraseRaw;
+    const daysAhead = diffDaysYMD(todayYMD, requestedDateYMD);
+    return { requestedDateYMD, datePhraseRaw, daysAhead };
+  }
 
-  const now = new Date();
-  // "today" and "tomorrow" are in studio TZ
+  const lower = datePhraseRaw.toLowerCase();
+
+  // today / tomorrow
   if (lower === "today") {
-    const ymd = ymdFromDateInTZ(now, timeZone);
-    return { ok: true, ymd, normalized: "today", method: "keyword" };
+    return { requestedDateYMD: todayYMD, datePhraseRaw, daysAhead: 0 };
   }
   if (lower === "tomorrow") {
-    // Add 1 day from "today in TZ"
-    // We approximate by adding 1 day UTC then formatting in TZ
-    const tomorrow = addDaysUTC(now, 1);
-    const ymd = ymdFromDateInTZ(tomorrow, timeZone);
-    return { ok: true, ymd, normalized: "tomorrow", method: "keyword" };
+    const requestedDateYMD = addDaysToYMD(todayYMD, 1);
+    return { requestedDateYMD, datePhraseRaw, daysAhead: 1 };
   }
 
-  // Best-effort Date.parse (works for "February 20th, 2026", "Feb 21 2026", etc.)
-  const parsedMs = Date.parse(raw);
-  if (!Number.isNaN(parsedMs)) {
-    const d = new Date(parsedMs);
-    const ymd = ymdFromDateInTZ(d, timeZone);
-    return { ok: true, ymd, normalized: raw, method: "dateparse" };
+  // Month name formats like "February 20th, 2026" or "Feb 20 2026"
+  // We’ll parse loosely and then render to YMD in TZ using Intl
+  const parsedFromMonthName = tryParseMonthNameDate(datePhraseRaw, timeZone);
+  if (parsedFromMonthName) {
+    const requestedDateYMD = parsedFromMonthName;
+    const daysAhead = diffDaysYMD(todayYMD, requestedDateYMD);
+    return { requestedDateYMD, datePhraseRaw, daysAhead };
   }
 
-  // If it's something like "Friday" we can't safely resolve without a real NLP lib.
-  // We'll return not ok and let the agent ask "this Friday or next Friday?"
-  return { ok: false, reason: "unresolved_phrase", phrase: raw };
+  // Weekday phrases: "friday", "this friday", "next friday"
+  const weekdayResult = tryParseWeekday(datePhraseRaw, timeZone);
+  if (weekdayResult) {
+    const requestedDateYMD = weekdayResult;
+    const daysAhead = diffDaysYMD(todayYMD, requestedDateYMD);
+    return { requestedDateYMD, datePhraseRaw, daysAhead };
+  }
+
+  // If we can’t parse it, treat as failure
+  return {
+    requestedDateYMD: null,
+    datePhraseRaw,
+    daysAhead: null,
+    error: `Unable to parse date phrase: "${datePhraseRaw}"`,
+  };
 }
 
-function diffDaysYMD(fromYMD, toYMD) {
-  // diff in whole days: to - from
-  const [fy, fm, fd] = fromYMD.split("-").map(Number);
-  const [ty, tm, td] = toYMD.split("-").map(Number);
-  const from = Date.UTC(fy, fm - 1, fd);
-  const to = Date.UTC(ty, tm - 1, td);
-  return Math.round((to - from) / (1000 * 60 * 60 * 24));
+// Difference in days between two YYYY-MM-DD (end - start), using UTC noon
+function diffDaysYMD(startYMD, endYMD) {
+  const a = ymdToParts(startYMD);
+  const b = ymdToParts(endYMD);
+  const dtA = new Date(Date.UTC(a.y, a.m - 1, a.d, 12, 0, 0));
+  const dtB = new Date(Date.UTC(b.y, b.m - 1, b.d, 12, 0, 0));
+  const ms = dtB.getTime() - dtA.getTime();
+  return Math.round(ms / (24 * 60 * 60 * 1000));
 }
 
-function mockClassesForDay(ymd) {
-  // Simple deterministic mock (same times every day)
-  // You can swap this later for real Mindbody calls.
-  const classes = [
-    { id: `mock_${ymd.replace(/-/g, "")}_1`, name: "Hot Yoga (Mock)", time: "6:00 AM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${ymd.replace(/-/g, "")}_2`, name: "Hot Pilates (Mock)", time: "9:00 AM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${ymd.replace(/-/g, "")}_3`, name: "Warm Yin (Mock)", time: "12:00 PM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${ymd.replace(/-/g, "")}_4`, name: "Hot Yoga (Mock)", time: "5:30 PM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${ymd.replace(/-/g, "")}_5`, name: "Hot Sculpt (Mock)", time: "7:00 PM", instructor: "Mock Instructor", bookable: true },
-  ];
-  return classes;
+function tryParseMonthNameDate(input, timeZone) {
+  // Examples:
+  // "February 20th, 2026"
+  // "Feb 20, 2026"
+  // "Feb 20 2026"
+  const cleaned = input
+    .replace(/(\d+)(st|nd|rd|th)/gi, "$1")
+    .replace(/,/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Try Date.parse on cleaned
+  const ms = Date.parse(cleaned);
+  if (Number.isNaN(ms)) return null;
+
+  // Render that moment into YMD in the target TZ
+  const dtf = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return dtf.format(new Date(ms));
 }
 
-function buildScheduleSay(ymd, timeZone, datePhraseRaw) {
-  // Convert ymd -> a nice spoken date label
-  const [y, m, d] = ymd.split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  const spoken = new Intl.DateTimeFormat("en-US", {
+function tryParseWeekday(input, timeZone) {
+  const lower = input.toLowerCase().trim();
+
+  const weekdayMap = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+  };
+
+  // normalize prefixes
+  let mode = "next"; // default: next occurrence (including if today is that weekday -> next week)
+  let word = lower;
+
+  if (lower.startsWith("this ")) {
+    mode = "this";
+    word = lower.replace(/^this\s+/, "");
+  } else if (lower.startsWith("next ")) {
+    mode = "next";
+    word = lower.replace(/^next\s+/, "");
+  }
+
+  // accept "fri" etc? (optional) — keep strict for now
+  if (!(word in weekdayMap)) return null;
+
+  const target = weekdayMap[word];
+
+  // Determine today weekday in TZ
+  const dtf = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "long" });
+  const todayName = dtf.format(new Date()).toLowerCase();
+  const today = weekdayMap[todayName];
+
+  // Start from todayYMD in TZ
+  const todayYMD = getTodayYMDInTZ(timeZone);
+
+  // offset calculation
+  let delta = (target - today + 7) % 7;
+
+  if (mode === "this") {
+    // If caller says "this friday" and today is Friday, we treat it as today (delta 0)
+    // If today passed it (delta 0 means today), fine.
+    // If today is after target, delta wraps to next week; that’s okay for "this" only if it’s still upcoming.
+    // BUT "this friday" when today is Saturday -> delta becomes 6 days ahead (next Friday), which is okay.
+    // We’ll accept.
+  } else {
+    // "friday" (default) / "next friday": if today is Friday, they mean next week
+    if (delta === 0) delta = 7;
+    if (mode === "next") {
+      // If it's already a non-zero delta, "next friday" could mean +7 beyond upcoming Friday.
+      // For simplicity: if delta > 0, add 7.
+      // Example: today Monday, "next Friday" => upcoming Friday is 4 days; next Friday is 11 days.
+      delta = delta + 7;
+    }
+  }
+
+  return addDaysToYMD(todayYMD, delta);
+}
+
+function buildMockSchedule({ requestedDateYMD }) {
+  // You can swap class mix later; keep stable for testing
+  return {
+    date: requestedDateYMD,
+    classes: [
+      {
+        id: `mock_${requestedDateYMD.replace(/-/g, "")}_1`,
+        name: "Hot Yoga (Mock)",
+        time: "6:00 AM",
+        instructor: "Mock Instructor",
+        bookable: true,
+      },
+      {
+        id: `mock_${requestedDateYMD.replace(/-/g, "")}_2`,
+        name: "Hot Pilates (Mock)",
+        time: "9:00 AM",
+        instructor: "Mock Instructor",
+        bookable: true,
+      },
+      {
+        id: `mock_${requestedDateYMD.replace(/-/g, "")}_3`,
+        name: "Warm Yin (Mock)",
+        time: "12:00 PM",
+        instructor: "Mock Instructor",
+        bookable: true,
+      },
+      {
+        id: `mock_${requestedDateYMD.replace(/-/g, "")}_4`,
+        name: "Hot Yoga (Mock)",
+        time: "5:30 PM",
+        instructor: "Mock Instructor",
+        bookable: true,
+      },
+      {
+        id: `mock_${requestedDateYMD.replace(/-/g, "")}_5`,
+        name: "Hot Sculpt (Mock)",
+        time: "7:00 PM",
+        instructor: "Mock Instructor",
+        bookable: true,
+      },
+    ],
+  };
+}
+
+function buildScheduleSay({ requestedDateYMD, timeZone, schedule }) {
+  // IMPORTANT FIX:
+  // Use UTC NOON for the requested YMD so timeZone conversion can’t roll the day backward.
+  const { y, m, d } = ymdToParts(requestedDateYMD);
+  const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0)); // <-- FIX
+
+  const spokenDate = new Intl.DateTimeFormat("en-US", {
     timeZone,
     weekday: "long",
     year: "numeric",
@@ -145,255 +298,188 @@ function buildScheduleSay(ymd, timeZone, datePhraseRaw) {
     day: "numeric",
   }).format(dt);
 
-  const classes = mockClassesForDay(ymd);
-  const line = classes
-    .map((c) => `${c.time} — ${c.name}`)
-    .join(", ");
+  const items = (schedule?.classes || []).map((c) => `${c.time} — ${c.name}`);
+  const list = items.length ? items.join(", ") : "No classes found.";
 
-  return {
-    spokenDate: spoken,
-    say: `Here are the classes for ${spoken}: ${line}. Which class would you like to book?`,
-    classes,
-    datePhraseRaw,
-  };
-}
-
-// Standard response wrapper (IMPORTANT)
-function respondOK(res, payload) {
-  res.status(200);
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.send(JSON.stringify(payload));
-}
-
-function respondFail(res, message, data = {}) {
-  const payload = {
-    success: false,
-    say: message || "",
-    text: message || "",
-    results: {
-      say: message || "",
-      text: message || "",
-    },
-    data,
-  };
-  respondOK(res, payload);
+  return `Here are the classes for ${spokenDate}: ${list}. Which class would you like to book?`;
 }
 
 // -------- Route --------
 
-app.post("/ghl/mindbody", (req, res) => {
-  // GHL sends params in querystring; allow body fallback too
+app.post("/ghl/mindbody", async (req, res) => {
+  const debugId = makeDebugId();
+
   const q = req.query || {};
-  const b = req.body || {};
+  const body = req.body || {};
 
-  const action = safeStr(q.action || b.action || "").trim();
-  const studioKey = safeStr(q.studioKey || b.studioKey || "").trim();
-  const source = safeStr(q.source || b.source || "").trim();
+  // normalize incoming values
+  const action = String(q.action || body.action || "").trim() || "get_schedule";
+  const studioKey = String(q.studioKey || body.studioKey || "").trim();
+  const source = String(q.source || body.source || "").trim() || "agencyvault";
+  const timeZoneRaw = String(q.timezone || body.timezone || "").trim();
+  const timeZone = normalizeTimezone(timeZoneRaw);
 
-  // Decode timezone safely (handles double encoding)
-  const timezoneRaw = q.timezone || b.timezone || "America/Vancouver";
-  const timezone = decodeMaybeTwice(timezoneRaw);
+  const datePhrase = String(q.date || body.date || "").trim();
 
-  const dateParamRaw = q.date || b.date || "";
-  const datePhraseRaw = safeStr(dateParamRaw).trim();
+  const maxDaysAhead = 14;
 
-  const debugId = Math.random().toString(16).slice(2);
-
-  // Log inbound
-  console.log("--------------------------------------------------");
-  console.log(`[${debugId}] POST /ghl/mindbody`);
+  // Log a concise snapshot (Railway logs)
+  console.log(`[${debugId}] POST /ghl/mindbody?action=${action}&studioKey=${studioKey}&timezone=${encodeURIComponent(timeZone || "")}&source=${source}&date=${encodeURIComponent(datePhrase)}`);
   console.log(`[${debugId}] headers:`, {
     "content-type": req.headers["content-type"],
-    authorization: req.headers["authorization"] ? "[present]" : "[missing]",
+    authorization: req.headers.authorization ? "[present]" : "[missing]",
     "user-agent": req.headers["user-agent"],
   });
-  console.log(`[${debugId}] query:`, q);
-  console.log(`[${debugId}] body:`, b);
 
-  if (!action) {
-    return respondFail(res, "Missing action parameter.", { debugId });
-  }
-
-  // Validate timezone (fallback to America/Vancouver if invalid)
-  let tz = timezone;
-  if (!isValidIanaTimeZone(tz)) {
-    console.log(`[${debugId}] Invalid timezone received:`, timezone, "-> fallback America/Vancouver");
-    tz = "America/Vancouver";
-  }
-
-  // ---- Actions ----
-
-  if (action === "get_schedule") {
-    // Enforce 14-day cap
-    const maxDaysAhead = 14;
-
-    const todayInTZ = ymdFromDateInTZ(new Date(), tz);
-
-    const parsed = parseDatePhraseToYMD(datePhraseRaw, tz);
-    console.log(`[${debugId}] parsed:`, {
-      action,
-      studioKey,
-      timezone: tz,
-      source,
-      datePhrase: datePhraseRaw,
-      todayInTZ,
-      parsed,
-      maxDaysAhead,
-    });
-
-    if (!parsed.ok) {
-      // If ambiguous like "Friday", return a message the agent will read
-      const msg =
-        parsed.reason === "unresolved_phrase"
-          ? `I can pull schedules for a specific date. Just to confirm—did you mean this ${parsed.phrase} or next ${parsed.phrase}?`
-          : "I didn’t catch the date you wanted. What day should I check?";
-      return respondOK(res, {
-        success: true,
-        say: msg,
-        text: msg,
-        results: { say: msg, text: msg },
-        debugId,
-        data: {
-          action,
-          mode: "mock",
-          studioKey,
-          timezone: tz,
-          source,
-          datePhraseRaw,
-          todayInTZ,
-          maxDaysAhead,
-          parsed,
-        },
-      });
-    }
-
-    const requestedYMD = parsed.ymd;
-    const daysAhead = diffDaysYMD(todayInTZ, requestedYMD);
-
-    if (daysAhead < 0) {
-      return respondOK(res, {
-        success: true,
-        say: `I can help with upcoming classes. What future day would you like to check?`,
-        text: `I can help with upcoming classes. What future day would you like to check?`,
-        results: {
-          say: `I can help with upcoming classes. What future day would you like to check?`,
-          text: `I can help with upcoming classes. What future day would you like to check?`,
-        },
-        debugId,
-        data: {
-          action,
-          mode: "mock",
-          studioKey,
-          timezone: tz,
-          source,
-          datePhraseRaw,
-          todayInTZ,
-          requestedDate: requestedYMD,
-          daysAhead,
-          maxDaysAhead,
-        },
-      });
-    }
-
-    if (daysAhead > maxDaysAhead) {
-      const msg = `I can only pull schedules up to ${maxDaysAhead} days ahead. What day within the next ${maxDaysAhead} days would you like?`;
-      return respondOK(res, {
-        success: true,
-        say: msg,
-        text: msg,
-        results: { say: msg, text: msg },
-        debugId,
-        data: {
-          action,
-          mode: "mock",
-          studioKey,
-          timezone: tz,
-          source,
-          datePhraseRaw,
-          todayInTZ,
-          requestedDate: requestedYMD,
-          daysAhead,
-          maxDaysAhead,
-        },
-      });
-    }
-
-    const built = buildScheduleSay(requestedYMD, tz, datePhraseRaw);
-
-    const payload = {
-      success: true,
-
-      // IMPORTANT: Provide these at top-level AND results.*
-      say: built.say,
-      text: built.say,
-      results: {
-        say: built.say,
-        text: built.say,
-      },
-
+  // Validate required
+  if (!studioKey) {
+    return res.status(200).json({
+      success: false,
+      say: "",
+      text: "",
+      results: { say: "", text: "" },
       debugId,
+      error: "Missing studioKey",
+      data: { action, studioKey, timeZone, source, datePhraseRaw: datePhrase },
+    });
+  }
 
-      // Extra data the agent doesn't need, but useful for debugging
+  if (!timeZone) {
+    return res.status(200).json({
+      success: false,
+      say: "",
+      text: "",
+      results: { say: "", text: "" },
+      debugId,
+      error: "Missing timezone",
+      data: { action, studioKey, timeZone, source, datePhraseRaw: datePhrase },
+    });
+  }
+
+  // Validate timezone early (prevents Intl crash)
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
+  } catch (e) {
+    return res.status(200).json({
+      success: false,
+      say: "",
+      text: "",
+      results: { say: "", text: "" },
+      debugId,
+      error: `Invalid timezone: ${timeZone}`,
+      data: { action, studioKey, timeZone, source, datePhraseRaw: datePhrase },
+    });
+  }
+
+  // Support multiple action names, but treat them the same for now
+  const supported = new Set(["get_schedule", "get_schedule_web", "get_schedule_by_date"]);
+  if (!supported.has(action)) {
+    return res.status(200).json({
+      success: false,
+      say: "",
+      text: "",
+      results: { say: "", text: "" },
+      debugId,
+      error: `Unsupported action: ${action}`,
+      data: { action, studioKey, timeZone, source, datePhraseRaw: datePhrase },
+    });
+  }
+
+  // Resolve date phrase -> YMD
+  const resolved = resolveDatePhraseToYMD({
+    datePhrase,
+    timeZone,
+    maxDaysAhead,
+  });
+
+  if (!resolved.requestedDateYMD) {
+    return res.status(200).json({
+      success: false,
+      say: "",
+      text: "",
+      results: { say: "", text: "" },
+      debugId,
+      error: resolved.error || "Unable to resolve date",
       data: {
         action,
         mode: "mock",
         studioKey,
-        timezone: tz,
+        timeZone,
         source,
-        datePhraseRaw,
-        requestedDate: requestedYMD,
-        todayInTZ,
-        daysAhead,
+        datePhraseRaw: resolved.datePhraseRaw,
+        requestedDate: null,
+        todayInTZ: getTodayYMDInTZ(timeZone),
+        daysAhead: resolved.daysAhead,
         maxDaysAhead,
-        schedule: {
-          studioKey,
-          timezone: tz,
-          date: requestedYMD,
-          spokenDate: built.spokenDate,
-          classes: built.classes,
-        },
       },
-    };
-
-    console.log(`[${debugId}] response success=true (say length=${payload.say.length})`);
-    return respondOK(res, payload);
-  }
-
-  if (action === "get_pricing_offers") {
-    const msg = "Pricing is currently in setup mode. Please hold one moment while I connect you with the front desk.";
-    return respondOK(res, {
-      success: true,
-      say: msg,
-      text: msg,
-      results: { say: msg, text: msg },
-      debugId,
-      data: { action, mode: "mock", studioKey, timezone: tz, source },
     });
   }
 
-  if (action === "book_class") {
-    const msg = "Booking is still being finalized. I can connect you with the front desk to book you in right now—do you want me to connect you?";
-    return respondOK(res, {
-      success: true,
-      say: msg,
-      text: msg,
-      results: { say: msg, text: msg },
+  // Enforce maxDaysAhead (14)
+  const clamped = clampDaysAhead(resolved.daysAhead, maxDaysAhead);
+  if (clamped === null) {
+    return res.status(200).json({
+      success: false,
+      say: "",
+      text: "",
+      results: { say: "", text: "" },
       debugId,
-      data: { action, mode: "mock", studioKey, timezone: tz, source, received: { query: q, body: b } },
+      error: `Date is out of range. Please request within ${maxDaysAhead} days.`,
+      data: {
+        action,
+        mode: "mock",
+        studioKey,
+        timeZone,
+        source,
+        datePhraseRaw: resolved.datePhraseRaw,
+        requestedDate: resolved.requestedDateYMD,
+        todayInTZ: getTodayYMDInTZ(timeZone),
+        daysAhead: resolved.daysAhead,
+        maxDaysAhead,
+      },
     });
   }
 
-  return respondFail(res, `Unknown action: ${action}`, { debugId, action });
+  // Mock schedule
+  const schedule = buildMockSchedule({ requestedDateYMD: resolved.requestedDateYMD });
+
+  const say = buildScheduleSay({
+    requestedDateYMD: resolved.requestedDateYMD,
+    timeZone,
+    schedule,
+  });
+
+  const response = {
+    success: true,
+    say,
+    text: say,
+    results: { say, text: say },
+    debugId,
+    data: {
+      action,
+      mode: "mock",
+      studioKey,
+      timeZone,
+      source,
+      datePhraseRaw: resolved.datePhraseRaw,
+      requestedDate: resolved.requestedDateYMD,
+      todayInTZ: getTodayYMDInTZ(timeZone),
+      daysAhead: clamped,
+      maxDaysAhead,
+      schedule,
+    },
+  };
+
+  return res.status(200).json(response);
 });
 
-app.get("/health", (_req, res) => {
-  res.status(200).send("ok");
-});
+// Health
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
 app.listen(PORT, () => {
   console.log(`Server listening on ${PORT}`);
 });
-
 
 
 
