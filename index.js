@@ -1,5 +1,4 @@
 const express = require("express");
-const axios = require("axios");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -11,9 +10,7 @@ function normalizeAuth(authHeaderRaw = "") {
   const raw = String(authHeaderRaw || "").trim();
   if (!raw) return "";
   // Accept either "token" or "Bearer token"
-  return raw.toLowerCase().startsWith("bearer ")
-    ? raw.slice(7).trim()
-    : raw;
+  return raw.toLowerCase().startsWith("bearer ") ? raw.slice(7).trim() : raw;
 }
 
 function pickFirst(...vals) {
@@ -50,47 +47,81 @@ function isoPlusDays(days) {
   return d.toISOString();
 }
 
-function requireEnv(name) {
-  const v = String(process.env[name] || "").trim();
-  if (!v) throw new Error(`Missing ${name}`);
-  return v;
+function dateOnlyISO(d) {
+  // yyyy-mm-dd in local time
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-// --- Mindbody: Classes endpoint ---
-async function mindbodyGetClasses({ startDateTime, endDateTime }) {
-  const baseUrl = String(process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6")
-    .trim()
-    .replace(/\/+$/, "");
-
-  const apiKey = requireEnv("MINDBODY_API_KEY");
-  const siteId = requireEnv("MINDBODY_SITE_ID");
-
-  const url = `${baseUrl}/class/classes`;
-
-  const headers = {
-    "Api-Key": apiKey,
-    "SiteId": siteId,
-    "Content-Type": "application/json",
-  };
-
-  // Mindbody expects StartDateTime / EndDateTime
-  const params = {
-    StartDateTime: startDateTime,
-    EndDateTime: endDateTime,
-  };
-
-  const resp = await axios.get(url, { headers, params, timeout: 20000 });
-  return resp.data;
+function parseDateOnly(s) {
+  // expects YYYY-MM-DD
+  const m = String(s || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const d = Number(m[3]);
+  const dt = new Date(y, mo, d, 0, 0, 0);
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt;
 }
 
-// --- routes ---
-app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+// --- mock schedule generator ---
+function buildMockSchedule({ studioKey, timezone, fromDate, toDate }) {
+  // Simple predictable classes for flow testing
+  // fromDate/toDate are Date objects (local)
+  const classes = [];
+  const names = ["Hot Yoga", "Yin", "Sculpt", "Power Flow", "Pilates"];
 
-app.post("/ghl/mindbody", async (req, res) => {
+  let cur = new Date(fromDate.getTime());
+  let idx = 0;
+
+  while (cur <= toDate) {
+    const day = dateOnlyISO(cur);
+
+    // 3 classes per day at fixed times
+    const times = ["06:00", "12:00", "18:00"];
+    for (const t of times) {
+      const [hh, mm] = t.split(":").map(Number);
+
+      const start = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), hh, mm, 0);
+      const end = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), hh + 1, mm, 0);
+
+      classes.push({
+        id: `mock-${day}-${t.replace(":", "")}`,
+        name: names[idx % names.length],
+        startLocal: `${day}T${t}:00`,
+        endLocal: `${day}T${String(hh + 1).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`,
+        timezone,
+        instructor: ["Jess", "Alex", "Sam", "Taylor"][idx % 4],
+        spotsRemaining: 2 + (idx % 10),
+        level: "All Levels",
+        location: studioKey,
+      });
+
+      idx++;
+    }
+
+    cur.setDate(cur.getDate() + 1);
+  }
+
+  return {
+    studioKey,
+    timezone,
+    range: {
+      from: dateOnlyISO(fromDate),
+      to: dateOnlyISO(toDate),
+    },
+    classes,
+  };
+}
+
+// --- route ---
+app.post("/ghl/mindbody", (req, res) => {
   const debugId = makeDebugId();
 
-  // Merge inputs from query + body (AgencyVault often sends query params)
+  // Merge inputs from query + body (AgencyVault is sending query params)
   const action = pickFirst(req.body?.action, req.query?.action);
   const studioKey = pickFirst(req.body?.studioKey, req.query?.studioKey);
   const timezoneRaw = pickFirst(req.body?.timezone, req.query?.timezone);
@@ -101,8 +132,12 @@ app.post("/ghl/mindbody", async (req, res) => {
   const incomingAuth = normalizeAuth(req.headers.authorization);
   const expectedSecret = String(process.env.GHL_SECRET || "").trim();
 
+  // Mode
+  const mode = String(process.env.MINDBODY_MODE || "mock").trim().toLowerCase(); // "mock" or "live"
+
   console.log("--------------------------------------------------");
   console.log(`[${debugId}] ${req.method} ${req.originalUrl}`);
+  console.log(`[${debugId}] mode: ${mode}`);
   console.log(`[${debugId}] headers:`, {
     "content-type": req.headers["content-type"],
     authorization: req.headers.authorization ? "[present]" : "[missing]",
@@ -136,7 +171,7 @@ app.post("/ghl/mindbody", async (req, res) => {
     });
   }
 
-  // --- action: ping ---
+  // Ping
   if (action === "ping") {
     return res.status(200).json({
       ok: true,
@@ -144,22 +179,33 @@ app.post("/ghl/mindbody", async (req, res) => {
       studioKey,
       timezone,
       source,
+      mode,
       message: "pong",
       debugId,
     });
   }
 
-  // --- action: get_schedule (Mindbody classes) ---
+  // Step: get_schedule (MOCK now, LIVE later)
   if (action === "get_schedule") {
-    try {
-      // You can pass these in the custom action (body or query).
-      // If you don’t, we default to NOW -> +7 days.
-      const startDateTime = pickFirst(req.body?.startDateTime, req.query?.startDateTime) || isoNow();
-      const endDateTime =
-        pickFirst(req.body?.endDateTime, req.query?.endDateTime) ||
-        isoPlusDays(pickFirst(req.body?.days, req.query?.days) || 7);
+    // Inputs you can test later from the AI:
+    // from=YYYY-MM-DD, to=YYYY-MM-DD, OR days=7
+    const fromStr = pickFirst(req.body?.from, req.query?.from);
+    const toStr = pickFirst(req.body?.to, req.query?.to);
+    const days = Number(pickFirst(req.body?.days, req.query?.days) || 7);
 
-      const data = await mindbodyGetClasses({ startDateTime, endDateTime });
+    const today = new Date();
+    const fromDate = parseDateOnly(fromStr) || today;
+    const toDate =
+      parseDateOnly(toStr) ||
+      new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate() + days, 0, 0, 0);
+
+    if (mode === "mock") {
+      const mock = buildMockSchedule({
+        studioKey: studioKey || "unknown_studio",
+        timezone: timezone || "America/Vancouver",
+        fromDate,
+        toDate,
+      });
 
       return res.status(200).json({
         ok: true,
@@ -167,33 +213,26 @@ app.post("/ghl/mindbody", async (req, res) => {
         studioKey,
         timezone,
         source,
-        range: { startDateTime, endDateTime },
-        mindbody: data,
+        mode,
+        schedule: mock,
         debugId,
-      });
-    } catch (err) {
-      console.log(`[${debugId}] get_schedule error:`, err?.message || err);
-
-      // axios error helpers
-      const status = err?.response?.status;
-      const mbData = err?.response?.data;
-
-      return res.status(500).json({
-        ok: false,
-        action,
-        studioKey,
-        timezone,
-        source,
-        debugId,
-        error: "get_schedule failed",
-        detail: err?.message || String(err),
-        mindbodyStatus: status || null,
-        mindbodyError: mbData || null,
       });
     }
+
+    // LIVE mode placeholder (we will wire this when you have production credentials)
+    return res.status(501).json({
+      ok: false,
+      action,
+      studioKey,
+      timezone,
+      source,
+      mode,
+      debugId,
+      error: "Live Mindbody mode not enabled yet (waiting on production credentials).",
+    });
   }
 
-  // placeholders for later
+  // Placeholders for later
   if (action === "book_class" || action === "cancel_class") {
     return res.status(200).json({
       ok: true,
@@ -201,7 +240,8 @@ app.post("/ghl/mindbody", async (req, res) => {
       studioKey,
       timezone,
       source,
-      message: `${action} received (not implemented yet)`,
+      mode,
+      message: `${action} received (mock stub)`,
       debugId,
     });
   }
@@ -214,5 +254,9 @@ app.post("/ghl/mindbody", async (req, res) => {
   });
 });
 
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
