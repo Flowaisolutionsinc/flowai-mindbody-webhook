@@ -26,6 +26,17 @@ function makeDebugId() {
   );
 }
 
+function safeStr(x) {
+  return String(x ?? "").trim();
+}
+
+function redactLong(s, keepStart = 6, keepEnd = 4) {
+  const str = safeStr(s);
+  if (!str) return "";
+  if (str.length <= keepStart + keepEnd + 6) return "[present]";
+  return `${str.slice(0, keepStart)}…${str.slice(-keepEnd)}`;
+}
+
 // A small mocked schedule so your flows can keep moving even before parsing is done
 function buildMockSchedule({ studioKey, timezone }) {
   const now = new Date();
@@ -61,8 +72,8 @@ function defaultDateRangeISO() {
 // ---------------- widget fetch (web) ----------------
 // Uses Node 18+ built-in fetch + FormData (no new npm deps)
 async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
-  const url = String(process.env.MINDBODY_WIDGET_URL || "").trim();
-  const token = String(process.env.MINDBODY_WIDGET_TOKEN || "").trim();
+  const url = safeStr(process.env.MINDBODY_WIDGET_URL);
+  const token = safeStr(process.env.MINDBODY_WIDGET_TOKEN);
 
   if (!url) throw new Error("Missing MINDBODY_WIDGET_URL env var");
   if (!token) throw new Error("Missing MINDBODY_WIDGET_TOKEN env var");
@@ -73,6 +84,10 @@ async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
   const form = new FormData();
   form.append("1", token);
   form.append("0", JSON.stringify(["$@1", { fromDate, toDate }]));
+
+  console.log(`[${debugId}] widget_fetch -> POST ${url}`);
+  console.log(`[${debugId}] widget_fetch -> token: ${redactLong(token)}`);
+  console.log(`[${debugId}] widget_fetch -> range:`, { fromDate, toDate });
 
   const res = await fetch(url, {
     method: "POST",
@@ -85,6 +100,10 @@ async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
 
   const text = await res.text();
 
+  console.log(`[${debugId}] widget_fetch <- status=${res.status} ok=${res.ok}`);
+  console.log(`[${debugId}] widget_fetch <- length=${text.length}`);
+  console.log(`[${debugId}] widget_fetch <- head=${JSON.stringify(text.slice(0, 180))}`);
+
   return {
     status: res.status,
     ok: res.ok,
@@ -95,6 +114,7 @@ async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
 // ---------------- route ----------------
 app.post("/ghl/mindbody", async (req, res) => {
   const debugId = makeDebugId();
+  const startedAt = Date.now();
 
   // Merge inputs from query + body (AgencyVault sends query params)
   const action = pickFirst(req.body?.action, req.query?.action);
@@ -102,12 +122,16 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = pickFirst(req.body?.timezone, req.query?.timezone);
   const source = pickFirst(req.body?.source, req.query?.source);
 
+  // Optional date overrides (useful for widget tests)
+  const fromDate = pickFirst(req.body?.fromDate, req.query?.fromDate);
+  const toDate = pickFirst(req.body?.toDate, req.query?.toDate);
+
   // Auth
   const incomingAuth = normalizeAuth(req.headers.authorization);
-  const expectedSecret = String(process.env.GHL_SECRET || "").trim();
+  const expectedSecret = safeStr(process.env.GHL_SECRET);
 
   // Mode
-  const mode = String(process.env.MINDBODY_MODE || "mock").trim().toLowerCase(); // mock | web | live (future)
+  const mode = safeStr(process.env.MINDBODY_MODE || "mock").toLowerCase(); // mock | web | live (future)
 
   console.log("--------------------------------------------------");
   console.log(`[${debugId}] ${req.method} ${req.originalUrl}`);
@@ -119,26 +143,24 @@ app.post("/ghl/mindbody", async (req, res) => {
   });
   console.log(`[${debugId}] body:`, req.body);
   console.log(`[${debugId}] query:`, req.query);
-  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source });
+  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source, fromDate, toDate });
+
+  function finish(status, payload) {
+    const ms = Date.now() - startedAt;
+    console.log(`[${debugId}] response -> status=${status} (${ms}ms)`);
+    return res.status(status).json(payload);
+  }
 
   if (!expectedSecret) {
-    return res.status(500).json({
-      ok: false,
-      debugId,
-      error: "Server missing GHL_SECRET env var",
-    });
+    return finish(500, { ok: false, debugId, error: "Server missing GHL_SECRET env var" });
   }
 
   if (!incomingAuth || incomingAuth !== expectedSecret) {
-    return res.status(401).json({
-      ok: false,
-      debugId,
-      error: "Unauthorized",
-    });
+    return finish(401, { ok: false, debugId, error: "Unauthorized" });
   }
 
   if (!action) {
-    return res.status(400).json({
+    return finish(400, {
       ok: false,
       debugId,
       error: "Missing action (send in JSON body or query string)",
@@ -147,7 +169,7 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   // Ping
   if (action === "ping") {
-    return res.status(200).json({
+    return finish(200, {
       ok: true,
       action,
       studioKey,
@@ -163,7 +185,7 @@ app.post("/ghl/mindbody", async (req, res) => {
     // stay safe: mock unless MINDBODY_MODE=web
     if (mode !== "web") {
       const mock = buildMockSchedule({ studioKey, timezone });
-      return res.status(200).json({
+      return finish(200, {
         ok: true,
         action,
         mode: "mock",
@@ -177,10 +199,17 @@ app.post("/ghl/mindbody", async (req, res) => {
 
     // If mode=web, use widget fetch
     try {
-      const { fromDate, toDate } = defaultDateRangeISO();
-      const result = await fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId });
+      const range = defaultDateRangeISO();
+      const usedFrom = fromDate || range.fromDate;
+      const usedTo = toDate || range.toDate;
 
-      return res.status(200).json({
+      const result = await fetchMindbodyWidgetSchedule({
+        fromDate: usedFrom,
+        toDate: usedTo,
+        debugId,
+      });
+
+      return finish(200, {
         ok: true,
         action,
         mode: "web",
@@ -191,13 +220,13 @@ app.post("/ghl/mindbody", async (req, res) => {
           status: result.status,
           ok: result.ok,
           rawLength: result.text.length,
-          // we keep preview short so logs/responses don't explode
           preview: result.text.slice(0, 500),
         },
         debugId,
       });
     } catch (err) {
-      return res.status(500).json({
+      console.log(`[${debugId}] ERROR get_schedule(web):`, err);
+      return finish(500, {
         ok: false,
         action,
         mode: "web",
@@ -210,10 +239,17 @@ app.post("/ghl/mindbody", async (req, res) => {
   // ---------------- get_schedule_web (FORCED web test, even if mode=mock) ----------------
   if (action === "get_schedule_web") {
     try {
-      const { fromDate, toDate } = defaultDateRangeISO();
-      const result = await fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId });
+      const range = defaultDateRangeISO();
+      const usedFrom = fromDate || range.fromDate;
+      const usedTo = toDate || range.toDate;
 
-      return res.status(200).json({
+      const result = await fetchMindbodyWidgetSchedule({
+        fromDate: usedFrom,
+        toDate: usedTo,
+        debugId,
+      });
+
+      return finish(200, {
         ok: true,
         action,
         mode: "web_test",
@@ -229,7 +265,8 @@ app.post("/ghl/mindbody", async (req, res) => {
         debugId,
       });
     } catch (err) {
-      return res.status(500).json({
+      console.log(`[${debugId}] ERROR get_schedule_web:`, err);
+      return finish(500, {
         ok: false,
         action,
         mode: "web_test",
@@ -241,7 +278,7 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   // Placeholder for next actions
   if (action === "book_class" || action === "cancel_class") {
-    return res.status(200).json({
+    return finish(200, {
       ok: true,
       action,
       studioKey,
@@ -252,7 +289,7 @@ app.post("/ghl/mindbody", async (req, res) => {
     });
   }
 
-  return res.status(400).json({
+  return finish(400, {
     ok: false,
     debugId,
     error: `Unknown action: ${action}`,
@@ -262,6 +299,7 @@ app.post("/ghl/mindbody", async (req, res) => {
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
 
