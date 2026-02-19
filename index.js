@@ -2,46 +2,28 @@ import express from "express";
 
 const app = express();
 
-// Parse JSON and form bodies
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Use your Railway variable GHL_SECRET
+// PUBLIC health routes (must be ABOVE auth middleware)
+app.get("/", (req, res) => res.status(200).send("ok"));
+app.get("/health", (req, res) => res.status(200).send("ok"));
+
 const SHARED_SECRET = process.env.GHL_SECRET || "CHANGE_THIS_SECRET";
 
-// ============================
-// HEALTHCHECK ROUTE (Railway-friendly)
-// ============================
-app.get("/", (req, res) => {
-  res.status(200).send("ok");
-});
-
-// ============================
-// AUTH MIDDLEWARE (protect everything below)
-// ============================
+// AUTH middleware (protect everything else)
 app.use((req, res, next) => {
   const authHeader = req.headers.authorization;
 
-  if (!authHeader) {
-    return res.status(401).json({ error: "Missing Authorization header" });
-  }
-
-  if (authHeader !== `Bearer ${SHARED_SECRET}`) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (!authHeader) return res.status(401).json({ error: "Missing Authorization header" });
+  if (authHeader !== `Bearer ${SHARED_SECRET}`) return res.status(401).json({ error: "Unauthorized" });
 
   next();
 });
 
-// ============================
-// MAIN WEBHOOK ROUTE
-// ============================
 app.post("/ghl/mindbody", async (req, res) => {
   try {
-    // Accept action from body OR query (Agency Vault testers can be inconsistent)
-    const action =
-      (req.body && req.body.action) ||
-      (req.query && req.query.action);
+    const action = (req.body && req.body.action) || (req.query && req.query.action);
 
     if (!action) {
       return res.status(400).json({
@@ -54,9 +36,6 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     }
 
-    // ============================
-    // TEST MODE
-    // ============================
     if (action === "ping") {
       return res.json({
         ok: true,
@@ -70,16 +49,10 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     }
 
-    // ============================
-    // PLACEHOLDER FOR FUTURE LOGIC
-    // ============================
     return res.json({
       ok: true,
       action,
-      received: {
-        body: req.body || null,
-        query: req.query || null,
-      },
+      received: { body: req.body || null, query: req.query || null },
     });
   } catch (err) {
     console.error("Webhook error:", err);
@@ -87,12 +60,9 @@ app.post("/ghl/mindbody", async (req, res) => {
   }
 });
 
-// ============================
-// SERVER START (bind to 0.0.0.0 for Railway)
-// ============================
 const PORT = Number(process.env.PORT || 8080);
+console.log("Listening on PORT:", PORT);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });
-
