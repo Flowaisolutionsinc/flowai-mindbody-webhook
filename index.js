@@ -26,17 +26,6 @@ function makeDebugId() {
   );
 }
 
-function safeStr(x) {
-  return String(x ?? "").trim();
-}
-
-function redactLong(s, keepStart = 6, keepEnd = 4) {
-  const str = safeStr(s);
-  if (!str) return "";
-  if (str.length <= keepStart + keepEnd + 6) return "[present]";
-  return `${str.slice(0, keepStart)}…${str.slice(-keepEnd)}`;
-}
-
 // A small mocked schedule so your flows can keep moving even before parsing is done
 function buildMockSchedule({ studioKey, timezone }) {
   const now = new Date();
@@ -63,31 +52,101 @@ function buildMockSchedule({ studioKey, timezone }) {
   };
 }
 
-function defaultDateRangeISO() {
-  const from = new Date();
-  const to = new Date(from.getTime() + 24 * 60 * 60 * 1000);
-  return { fromDate: from.toISOString(), toDate: to.toISOString() };
+/**
+ * Compute timezone offset (minutes) for a given Date instant in a given IANA tz.
+ * Positive means tz is ahead of UTC.
+ */
+function getTimeZoneOffsetMinutes(date, timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  const parts = dtf.formatToParts(date);
+  const map = {};
+  for (const p of parts) {
+    if (p.type !== "literal") map[p.type] = p.value;
+  }
+
+  // This "asUTC" treats the formatted local time as if it were UTC.
+  const asUTC = Date.UTC(
+    Number(map.year),
+    Number(map.month) - 1,
+    Number(map.day),
+    Number(map.hour),
+    Number(map.minute),
+    Number(map.second)
+  );
+
+  // Offset = (local-as-UTC) - actual UTC
+  return (asUTC - date.getTime()) / 60000;
+}
+
+/**
+ * Returns { fromDate, toDate } where:
+ * - fromDate = start of "today" in the given timezone, expressed as UTC ISO string (Z)
+ * - toDate   = end of "today" (23:59:59.999 local), expressed as UTC ISO string (Z)
+ *
+ * This matches what Mindbody's widget payload expects (midnight boundaries).
+ */
+function defaultDateRangeISO(timeZone) {
+  const tz = timeZone || "America/Vancouver";
+
+  // Get today's Y/M/D in the target timezone
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  const parts = dtf.formatToParts(new Date());
+  const map = {};
+  for (const p of parts) {
+    if (p.type !== "literal") map[p.type] = p.value;
+  }
+  const y = Number(map.year);
+  const m = Number(map.month);
+  const d = Number(map.day);
+
+  // Start-of-day LOCAL -> convert to UTC instant
+  // Start by creating an approximate UTC midnight, then correct by tz offset at that instant
+  const approxUtcMidnight = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+  const offsetMin = getTimeZoneOffsetMinutes(approxUtcMidnight, tz);
+  const startUtc = new Date(approxUtcMidnight.getTime() - offsetMin * 60000);
+
+  // End-of-day = start of next day minus 1 ms (in that timezone)
+  const approxUtcNextMidnight = new Date(Date.UTC(y, m - 1, d + 1, 0, 0, 0, 0));
+  const offsetMinNext = getTimeZoneOffsetMinutes(approxUtcNextMidnight, tz);
+  const nextStartUtc = new Date(
+    approxUtcNextMidnight.getTime() - offsetMinNext * 60000
+  );
+  const endUtc = new Date(nextStartUtc.getTime() - 1);
+
+  return { fromDate: startUtc.toISOString(), toDate: endUtc.toISOString() };
 }
 
 // ---------------- widget fetch (web) ----------------
 // Uses Node 18+ built-in fetch + FormData (no new npm deps)
 async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
-  const url = safeStr(process.env.MINDBODY_WIDGET_URL);
-  const token = safeStr(process.env.MINDBODY_WIDGET_TOKEN);
+  const url = String(process.env.MINDBODY_WIDGET_URL || "").trim();
+  const token = String(process.env.MINDBODY_WIDGET_TOKEN || "").trim();
 
   if (!url) throw new Error("Missing MINDBODY_WIDGET_URL env var");
   if (!token) throw new Error("Missing MINDBODY_WIDGET_TOKEN env var");
 
-  // This matches what you saw in Chrome devtools payload:
+  // Matches Chrome payload:
   // field "1" = token string
   // field "0" = ["$@1",{"fromDate":"...","toDate":"..."}]
   const form = new FormData();
   form.append("1", token);
   form.append("0", JSON.stringify(["$@1", { fromDate, toDate }]));
-
-  console.log(`[${debugId}] widget_fetch -> POST ${url}`);
-  console.log(`[${debugId}] widget_fetch -> token: ${redactLong(token)}`);
-  console.log(`[${debugId}] widget_fetch -> range:`, { fromDate, toDate });
 
   const res = await fetch(url, {
     method: "POST",
@@ -100,10 +159,6 @@ async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
 
   const text = await res.text();
 
-  console.log(`[${debugId}] widget_fetch <- status=${res.status} ok=${res.ok}`);
-  console.log(`[${debugId}] widget_fetch <- length=${text.length}`);
-  console.log(`[${debugId}] widget_fetch <- head=${JSON.stringify(text.slice(0, 180))}`);
-
   return {
     status: res.status,
     ok: res.ok,
@@ -114,7 +169,6 @@ async function fetchMindbodyWidgetSchedule({ fromDate, toDate, debugId }) {
 // ---------------- route ----------------
 app.post("/ghl/mindbody", async (req, res) => {
   const debugId = makeDebugId();
-  const startedAt = Date.now();
 
   // Merge inputs from query + body (AgencyVault sends query params)
   const action = pickFirst(req.body?.action, req.query?.action);
@@ -122,16 +176,14 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = pickFirst(req.body?.timezone, req.query?.timezone);
   const source = pickFirst(req.body?.source, req.query?.source);
 
-  // Optional date overrides (useful for widget tests)
-  const fromDate = pickFirst(req.body?.fromDate, req.query?.fromDate);
-  const toDate = pickFirst(req.body?.toDate, req.query?.toDate);
-
   // Auth
   const incomingAuth = normalizeAuth(req.headers.authorization);
-  const expectedSecret = safeStr(process.env.GHL_SECRET);
+  const expectedSecret = String(process.env.GHL_SECRET || "").trim();
 
   // Mode
-  const mode = safeStr(process.env.MINDBODY_MODE || "mock").toLowerCase(); // mock | web | live (future)
+  const mode = String(process.env.MINDBODY_MODE || "mock")
+    .trim()
+    .toLowerCase(); // mock | web | live (future)
 
   console.log("--------------------------------------------------");
   console.log(`[${debugId}] ${req.method} ${req.originalUrl}`);
@@ -143,24 +195,26 @@ app.post("/ghl/mindbody", async (req, res) => {
   });
   console.log(`[${debugId}] body:`, req.body);
   console.log(`[${debugId}] query:`, req.query);
-  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source, fromDate, toDate });
-
-  function finish(status, payload) {
-    const ms = Date.now() - startedAt;
-    console.log(`[${debugId}] response -> status=${status} (${ms}ms)`);
-    return res.status(status).json(payload);
-  }
+  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source });
 
   if (!expectedSecret) {
-    return finish(500, { ok: false, debugId, error: "Server missing GHL_SECRET env var" });
+    return res.status(500).json({
+      ok: false,
+      debugId,
+      error: "Server missing GHL_SECRET env var",
+    });
   }
 
   if (!incomingAuth || incomingAuth !== expectedSecret) {
-    return finish(401, { ok: false, debugId, error: "Unauthorized" });
+    return res.status(401).json({
+      ok: false,
+      debugId,
+      error: "Unauthorized",
+    });
   }
 
   if (!action) {
-    return finish(400, {
+    return res.status(400).json({
       ok: false,
       debugId,
       error: "Missing action (send in JSON body or query string)",
@@ -169,7 +223,7 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   // Ping
   if (action === "ping") {
-    return finish(200, {
+    return res.status(200).json({
       ok: true,
       action,
       studioKey,
@@ -185,7 +239,7 @@ app.post("/ghl/mindbody", async (req, res) => {
     // stay safe: mock unless MINDBODY_MODE=web
     if (mode !== "web") {
       const mock = buildMockSchedule({ studioKey, timezone });
-      return finish(200, {
+      return res.status(200).json({
         ok: true,
         action,
         mode: "mock",
@@ -199,17 +253,33 @@ app.post("/ghl/mindbody", async (req, res) => {
 
     // If mode=web, use widget fetch
     try {
-      const range = defaultDateRangeISO();
-      const usedFrom = fromDate || range.fromDate;
-      const usedTo = toDate || range.toDate;
+      const range = defaultDateRangeISO(timezone);
+      console.log(`[${debugId}] widget_fetch -> range:`, {
+        timezone: timezone || "America/Vancouver",
+        ...range,
+      });
+      console.log(
+        `[${debugId}] widget_fetch -> POST ${String(
+          process.env.MINDBODY_WIDGET_URL || ""
+        ).trim()}`
+      );
 
       const result = await fetchMindbodyWidgetSchedule({
-        fromDate: usedFrom,
-        toDate: usedTo,
+        ...range,
         debugId,
       });
 
-      return finish(200, {
+      console.log(
+        `[${debugId}] widget_fetch <- status=${result.status} ok=${result.ok} length=${result.text.length}`
+      );
+      if (!result.ok) {
+        console.log(
+          `[${debugId}] widget_fetch <- head=`,
+          result.text.slice(0, 300)
+        );
+      }
+
+      return res.status(200).json({
         ok: true,
         action,
         mode: "web",
@@ -225,8 +295,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         debugId,
       });
     } catch (err) {
-      console.log(`[${debugId}] ERROR get_schedule(web):`, err);
-      return finish(500, {
+      return res.status(500).json({
         ok: false,
         action,
         mode: "web",
@@ -239,17 +308,33 @@ app.post("/ghl/mindbody", async (req, res) => {
   // ---------------- get_schedule_web (FORCED web test, even if mode=mock) ----------------
   if (action === "get_schedule_web") {
     try {
-      const range = defaultDateRangeISO();
-      const usedFrom = fromDate || range.fromDate;
-      const usedTo = toDate || range.toDate;
+      const range = defaultDateRangeISO(timezone);
+      console.log(`[${debugId}] widget_fetch -> range:`, {
+        timezone: timezone || "America/Vancouver",
+        ...range,
+      });
+      console.log(
+        `[${debugId}] widget_fetch -> POST ${String(
+          process.env.MINDBODY_WIDGET_URL || ""
+        ).trim()}`
+      );
 
       const result = await fetchMindbodyWidgetSchedule({
-        fromDate: usedFrom,
-        toDate: usedTo,
+        ...range,
         debugId,
       });
 
-      return finish(200, {
+      console.log(
+        `[${debugId}] widget_fetch <- status=${result.status} ok=${result.ok} length=${result.text.length}`
+      );
+      if (!result.ok) {
+        console.log(
+          `[${debugId}] widget_fetch <- head=`,
+          result.text.slice(0, 300)
+        );
+      }
+
+      return res.status(200).json({
         ok: true,
         action,
         mode: "web_test",
@@ -265,8 +350,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         debugId,
       });
     } catch (err) {
-      console.log(`[${debugId}] ERROR get_schedule_web:`, err);
-      return finish(500, {
+      return res.status(500).json({
         ok: false,
         action,
         mode: "web_test",
@@ -278,7 +362,7 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   // Placeholder for next actions
   if (action === "book_class" || action === "cancel_class") {
-    return finish(200, {
+    return res.status(200).json({
       ok: true,
       action,
       studioKey,
@@ -289,7 +373,7 @@ app.post("/ghl/mindbody", async (req, res) => {
     });
   }
 
-  return finish(400, {
+  return res.status(400).json({
     ok: false,
     debugId,
     error: `Unknown action: ${action}`,
@@ -299,8 +383,5 @@ app.post("/ghl/mindbody", async (req, res) => {
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
-
-
 
 
