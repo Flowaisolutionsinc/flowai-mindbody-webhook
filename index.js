@@ -9,8 +9,13 @@ const PORT = process.env.PORT || 8080;
 function normalizeAuth(authHeaderRaw = "") {
   const raw = String(authHeaderRaw || "").trim();
   if (!raw) return "";
-  // Accept either "token" or "Bearer token"
-  return raw.toLowerCase().startsWith("bearer ") ? raw.slice(7).trim() : raw;
+  // Accept either:
+  // "braydentj"
+  // "Bearer braydentj"
+  // "bearer braydentj"
+  return raw.toLowerCase().startsWith("bearer ")
+    ? raw.slice(7).trim()
+    : raw;
 }
 
 function pickFirst(...vals) {
@@ -20,16 +25,6 @@ function pickFirst(...vals) {
   return undefined;
 }
 
-function decodeMaybe(v) {
-  if (v === undefined || v === null) return v;
-  const s = String(v);
-  try {
-    return s.includes("%") ? decodeURIComponent(s) : s;
-  } catch {
-    return s;
-  }
-}
-
 function makeDebugId() {
   return (
     Math.random().toString(16).slice(2, 10) +
@@ -37,103 +32,101 @@ function makeDebugId() {
   );
 }
 
-function isoNow() {
-  return new Date().toISOString();
+// Build ISO window for “today” (or N days) in a timezone without extra libs.
+// We’ll keep it simple: if caller passes fromDate/toDate, we use them.
+// Otherwise default: now -> +24h in UTC (good enough for testing).
+function defaultDateWindowISO() {
+  const now = new Date();
+  const from = new Date(now);
+  const to = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  return { fromDate: from.toISOString(), toDate: to.toISOString() };
 }
 
-function isoPlusDays(days) {
-  const d = new Date();
-  d.setDate(d.getDate() + Number(days || 0));
-  return d.toISOString();
-}
+// Try to extract a JSON-ish chunk from the widget response (often returns "text/x-component").
+// We’ll return both raw and best-effort extracted data.
+function tryExtractJsonLike(rawText) {
+  if (!rawText || typeof rawText !== "string") return { extracted: null };
 
-function dateOnlyISO(d) {
-  // yyyy-mm-dd in local time
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function parseDateOnly(s) {
-  // expects YYYY-MM-DD
-  const m = String(s || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]) - 1;
-  const d = Number(m[3]);
-  const dt = new Date(y, mo, d, 0, 0, 0);
-  if (Number.isNaN(dt.getTime())) return null;
-  return dt;
-}
-
-// --- mock schedule generator ---
-function buildMockSchedule({ studioKey, timezone, fromDate, toDate }) {
-  // Simple predictable classes for flow testing
-  // fromDate/toDate are Date objects (local)
-  const classes = [];
-  const names = ["Hot Yoga", "Yin", "Sculpt", "Power Flow", "Pilates"];
-
-  let cur = new Date(fromDate.getTime());
-  let idx = 0;
-
-  while (cur <= toDate) {
-    const day = dateOnlyISO(cur);
-
-    // 3 classes per day at fixed times
-    const times = ["06:00", "12:00", "18:00"];
-    for (const t of times) {
-      const [hh, mm] = t.split(":").map(Number);
-
-      const start = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), hh, mm, 0);
-      const end = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), hh + 1, mm, 0);
-
-      classes.push({
-        id: `mock-${day}-${t.replace(":", "")}`,
-        name: names[idx % names.length],
-        startLocal: `${day}T${t}:00`,
-        endLocal: `${day}T${String(hh + 1).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`,
-        timezone,
-        instructor: ["Jess", "Alex", "Sam", "Taylor"][idx % 4],
-        spotsRemaining: 2 + (idx % 10),
-        level: "All Levels",
-        location: studioKey,
-      });
-
-      idx++;
+  // Common case: response contains a big JSON-ish array starting with '['
+  const firstBracket = rawText.indexOf("[");
+  const lastBracket = rawText.lastIndexOf("]");
+  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    const candidate = rawText.slice(firstBracket, lastBracket + 1);
+    try {
+      const parsed = JSON.parse(candidate);
+      return { extracted: parsed };
+    } catch (_e) {
+      // Not valid JSON, but still useful to return candidate snippet
+      return { extracted: null, candidateSnippet: candidate.slice(0, 4000) };
     }
-
-    cur.setDate(cur.getDate() + 1);
   }
 
-  return {
-    studioKey,
-    timezone,
-    range: {
-      from: dateOnlyISO(fromDate),
-      to: dateOnlyISO(toDate),
+  return { extracted: null };
+}
+
+async function fetchScheduleFromWidget({ debugId, fromDate, toDate }) {
+  const widgetUrl = String(process.env.MINDBODY_WIDGET_URL || "").trim();
+  const widgetToken = String(process.env.MINDBODY_WIDGET_TOKEN || "").trim();
+
+  if (!widgetUrl) {
+    throw new Error("Missing MINDBODY_WIDGET_URL env var");
+  }
+  if (!widgetToken) {
+    throw new Error("Missing MINDBODY_WIDGET_TOKEN env var");
+  }
+
+  // Node 18+ has fetch + FormData globally
+  const form = new FormData();
+
+  // This matches what you captured:
+  // name="1" -> a long quoted token string
+  // name="0" -> ["$@1",{"fromDate":"...","toDate":"..."}]
+  form.append("1", widgetToken);
+  form.append("0", JSON.stringify(["$@1", { fromDate, toDate }]));
+
+  const resp = await fetch(widgetUrl, {
+    method: "POST",
+    body: form,
+    // IMPORTANT: do NOT manually set Content-Type for FormData.
+    // fetch will set boundary correctly.
+    headers: {
+      // These are “safe” defaults; the widget endpoint usually accepts them.
+      // If we later find it requires additional headers, we’ll add them.
+      "accept": "*/*",
     },
-    classes,
+  });
+
+  const text = await resp.text();
+
+  return {
+    status: resp.status,
+    okHttp: resp.ok,
+    contentType: resp.headers.get("content-type"),
+    raw: text,
+    jsonGuess: tryExtractJsonLike(text),
+    debugId,
   };
 }
 
 // --- route ---
-app.post("/ghl/mindbody", (req, res) => {
+app.post("/ghl/mindbody", async (req, res) => {
   const debugId = makeDebugId();
 
   // Merge inputs from query + body (AgencyVault is sending query params)
   const action = pickFirst(req.body?.action, req.query?.action);
   const studioKey = pickFirst(req.body?.studioKey, req.query?.studioKey);
-  const timezoneRaw = pickFirst(req.body?.timezone, req.query?.timezone);
+  const timezone = pickFirst(req.body?.timezone, req.query?.timezone);
   const source = pickFirst(req.body?.source, req.query?.source);
-  const timezone = decodeMaybe(timezoneRaw);
+
+  // Optional date window (for schedule)
+  const fromDate = pickFirst(req.body?.fromDate, req.query?.fromDate);
+  const toDate = pickFirst(req.body?.toDate, req.query?.toDate);
 
   // Auth
   const incomingAuth = normalizeAuth(req.headers.authorization);
   const expectedSecret = String(process.env.GHL_SECRET || "").trim();
 
-  // Mode
-  const mode = String(process.env.MINDBODY_MODE || "mock").trim().toLowerCase(); // "mock" or "live"
+  const mode = String(process.env.MINDBODY_MODE || "mock").trim().toLowerCase();
 
   console.log("--------------------------------------------------");
   console.log(`[${debugId}] ${req.method} ${req.originalUrl}`);
@@ -145,7 +138,7 @@ app.post("/ghl/mindbody", (req, res) => {
   });
   console.log(`[${debugId}] body:`, req.body);
   console.log(`[${debugId}] query:`, req.query);
-  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source });
+  console.log(`[${debugId}] parsed:`, { action, studioKey, timezone, source, fromDate, toDate });
 
   if (!expectedSecret) {
     return res.status(500).json({
@@ -179,60 +172,96 @@ app.post("/ghl/mindbody", (req, res) => {
       studioKey,
       timezone,
       source,
-      mode,
       message: "pong",
       debugId,
     });
   }
 
-  // Step: get_schedule (MOCK now, LIVE later)
+  // ---- SCHEDULE ----
+  // get_schedule (main action)
+  // - if MINDBODY_MODE=mock -> mocked response
+  // - if MINDBODY_MODE=web  -> calls widget endpoint
+  // - if MINDBODY_MODE=live -> (later) Mindbody v6
   if (action === "get_schedule") {
-    // Inputs you can test later from the AI:
-    // from=YYYY-MM-DD, to=YYYY-MM-DD, OR days=7
-    const fromStr = pickFirst(req.body?.from, req.query?.from);
-    const toStr = pickFirst(req.body?.to, req.query?.to);
-    const days = Number(pickFirst(req.body?.days, req.query?.days) || 7);
-
-    const today = new Date();
-    const fromDate = parseDateOnly(fromStr) || today;
-    const toDate =
-      parseDateOnly(toStr) ||
-      new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate() + days, 0, 0, 0);
-
-    if (mode === "mock") {
-      const mock = buildMockSchedule({
-        studioKey: studioKey || "unknown_studio",
-        timezone: timezone || "America/Vancouver",
-        fromDate,
-        toDate,
-      });
-
-      return res.status(200).json({
-        ok: true,
-        action,
-        studioKey,
-        timezone,
-        source,
-        mode,
-        schedule: mock,
-        debugId,
-      });
+    if (mode === "web") {
+      const win = fromDate && toDate ? { fromDate, toDate } : defaultDateWindowISO();
+      try {
+        const result = await fetchScheduleFromWidget({ debugId, ...win });
+        return res.status(result.okHttp ? 200 : 502).json({
+          ok: result.okHttp,
+          action,
+          mode,
+          studioKey,
+          timezone,
+          source,
+          fromDate: win.fromDate,
+          toDate: win.toDate,
+          httpStatus: result.status,
+          contentType: result.contentType,
+          // Keep raw small so responses don’t explode:
+          rawPreview: result.raw.slice(0, 4000),
+          // Best-effort extraction:
+          extractedJson: result.jsonGuess.extracted || null,
+          extractedSnippet: result.jsonGuess.candidateSnippet || null,
+          debugId,
+        });
+      } catch (e) {
+        return res.status(500).json({
+          ok: false,
+          action,
+          mode,
+          error: String(e?.message || e),
+          debugId,
+        });
+      }
     }
 
-    // LIVE mode placeholder (we will wire this when you have production credentials)
-    return res.status(501).json({
-      ok: false,
+    // MOCK mode default
+    return res.status(200).json({
+      ok: true,
       action,
+      mode: "mock",
       studioKey,
       timezone,
       source,
-      mode,
+      message: "mock schedule (not implemented yet)",
       debugId,
-      error: "Live Mindbody mode not enabled yet (waiting on production credentials).",
     });
   }
 
-  // Placeholders for later
+  // Explicit web action (so you can test it directly even if mode is mock)
+  if (action === "get_schedule_web") {
+    const win = fromDate && toDate ? { fromDate, toDate } : defaultDateWindowISO();
+    try {
+      const result = await fetchScheduleFromWidget({ debugId, ...win });
+      return res.status(result.okHttp ? 200 : 502).json({
+        ok: result.okHttp,
+        action,
+        mode: "web",
+        studioKey,
+        timezone,
+        source,
+        fromDate: win.fromDate,
+        toDate: win.toDate,
+        httpStatus: result.status,
+        contentType: result.contentType,
+        rawPreview: result.raw.slice(0, 4000),
+        extractedJson: result.jsonGuess.extracted || null,
+        extractedSnippet: result.jsonGuess.candidateSnippet || null,
+        debugId,
+      });
+    } catch (e) {
+      return res.status(500).json({
+        ok: false,
+        action,
+        mode: "web",
+        error: String(e?.message || e),
+        debugId,
+      });
+    }
+  }
+
+  // Placeholder for booking actions
   if (action === "book_class" || action === "cancel_class") {
     return res.status(200).json({
       ok: true,
@@ -240,8 +269,7 @@ app.post("/ghl/mindbody", (req, res) => {
       studioKey,
       timezone,
       source,
-      mode,
-      message: `${action} received (mock stub)`,
+      message: `${action} received (not implemented yet)`,
       debugId,
     });
   }
@@ -250,13 +278,12 @@ app.post("/ghl/mindbody", (req, res) => {
     ok: false,
     debugId,
     error: `Unknown action: ${action}`,
-    allowed: ["ping", "get_schedule", "book_class", "cancel_class"],
+    allowed: ["ping", "get_schedule", "get_schedule_web", "book_class", "cancel_class"],
   });
 });
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/health", (_req, res) => res.status(200).send("ok"));
-
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
 
