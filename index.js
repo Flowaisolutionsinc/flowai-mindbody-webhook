@@ -1,10 +1,21 @@
 /**
- * Flow AI – Mindbody Webhook (Mock Mode)
+ * Flow AI – Mindbody Webhook (Production Mode)
  * - POST /ghl/mindbody
- * - Accepts query params (or body) for:
- *    action, studioKey, timezone, source, date
- * - Always returns a response that voice agent platforms reliably surface:
- *    { success, say, text, results: { say, text }, data: {...} }
+ * - Supports actions:
+ *    - ping
+ *    - get_schedule
+ *
+ * Expects env vars (set in Railway in Step 2):
+ *   MINDBODY_CLIENT_ID
+ *   MINDBODY_CLIENT_SECRET
+ *   MINDBODY_SITE_ID=5744527
+ *   MINDBODY_BASE_URL=https://api.mindbodyonline.com/public/v6
+ *   (optional but commonly needed)
+ *   MINDBODY_USERNAME
+ *   MINDBODY_PASSWORD
+ *
+ * Returns voice-agent-friendly payload:
+ *  { success, say, text, results:{say,text}, data:{...} }
  */
 
 const express = require("express");
@@ -25,10 +36,8 @@ function safeString(v) {
 }
 
 function decodeMaybe(v) {
-  // Handles values like "America%2FVancouver" or "February%2020th%2C%202026"
   const s = safeString(v);
   try {
-    // also converts "+" into spaces if it came from querystring encoding
     return decodeURIComponent(s.replace(/\+/g, " "));
   } catch {
     return s.replace(/\+/g, " ");
@@ -44,7 +53,6 @@ function getTodayISOInTZ(timeZone) {
     month: "2-digit",
     day: "2-digit",
   });
-  // en-CA gives YYYY-MM-DD ordering when formatted, but to be safe use parts:
   const parts = dtf.formatToParts(new Date());
   const y = parts.find((p) => p.type === "year")?.value;
   const m = parts.find((p) => p.type === "month")?.value;
@@ -63,12 +71,7 @@ function addDaysISO(iso, days) {
   return `${yy}-${mm}-${dd}`;
 }
 
-// Very forgiving date phrase parser for MOCK mode.
-// Supports:
-// - "today", "tomorrow"
-// - "YYYY-MM-DD"
-// - "February 20th, 2026" (or without comma)
-// - weekday names ("friday") => next occurrence
+// Parse date phrases to ISO date
 function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
   const todayISO = getTodayISOInTZ(tz);
@@ -85,7 +88,6 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
 
   // YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(phrase)) {
-    // compute daysAhead roughly (UTC-based, fine for mock gating)
     const daysAhead = Math.round(
       (Date.parse(phrase + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
     );
@@ -96,25 +98,22 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const weekdays = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
   const wdIndex = weekdays.indexOf(phrase);
   if (wdIndex !== -1) {
-    // find next occurrence of that weekday from today in tz
     const now = new Date();
     const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
     const todayName = dtf.format(now).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
 
     let delta = (wdIndex - todayIdx + 7) % 7;
-    if (delta === 0) delta = 7; // "friday" means next friday, not today
+    if (delta === 0) delta = 7;
     const requestedDate = addDaysISO(todayISO, delta);
     return { ok: true, requestedDate, todayISO, daysAhead: delta };
   }
 
   // Natural date parsing (e.g., "February 20th, 2026")
-  // Strip ordinal suffixes: 1st, 2nd, 3rd, 4th...
   const cleaned = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1");
   const parsed = Date.parse(cleaned);
   if (!Number.isNaN(parsed)) {
     const dt = new Date(parsed);
-    // Convert parsed date into an ISO date (YYYY-MM-DD)
     const yy = dt.getFullYear();
     const mm = String(dt.getMonth() + 1).padStart(2, "0");
     const dd = String(dt.getDate()).padStart(2, "0");
@@ -130,28 +129,10 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   return { ok: false, reason: `unrecognized date phrase: "${datePhraseRaw}"` };
 }
 
-function buildMockSchedule(requestedDate) {
-  // predictable mock classes based on date
-  // (same set each day; you can randomize later)
-  return [
-    { id: `mock_${requestedDate.replaceAll("-", "")}_1`, name: "Hot Yoga (Mock)", time: "6:00 AM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${requestedDate.replaceAll("-", "")}_2`, name: "Hot Pilates (Mock)", time: "9:00 AM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${requestedDate.replaceAll("-", "")}_3`, name: "Warm Yin (Mock)", time: "12:00 PM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${requestedDate.replaceAll("-", "")}_4`, name: "Hot Yoga (Mock)", time: "5:30 PM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${requestedDate.replaceAll("-", "")}_5`, name: "Hot Sculpt (Mock)", time: "7:00 PM", instructor: "Mock Instructor", bookable: true },
-  ];
-}
-
-function buildScheduleSay(spokenDateLabel, classes) {
-  const parts = classes.map((c) => `${c.time} — ${c.name}`);
-  return `Here are the classes for ${spokenDateLabel}: ${parts.join(", ")}. Which class would you like to book?`;
-}
-
 function buildSpokenDateLabel(dateISO, timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
-  // Format dateISO as long weekday/month/day/year in TZ
-  // Build a Date from ISO in UTC and then format in TZ (good enough for label)
-  const dt = new Date(dateISO + "T00:00:00Z");
+  // Use noon UTC to avoid timezone-shift label bugs (your earlier “Thursday” issue)
+  const dt = new Date(dateISO + "T12:00:00Z");
   return new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
     weekday: "long",
@@ -161,17 +142,219 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
+function buildScheduleSay(spokenDateLabel, classes) {
+  if (!classes || classes.length === 0) {
+    return `I couldn’t find any classes for ${spokenDateLabel}. Would you like a different date?`;
+  }
+  const parts = classes.map((c) => `${c.time} — ${c.name}`);
+  return `Here are the classes for ${spokenDateLabel}: ${parts.join(", ")}. Which class would you like to book?`;
+}
+
 function respondJSON(res, payload) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.status(200).send(JSON.stringify(payload));
 }
 
 // ---------------------------
+// Mindbody v6 (Production)
+// ---------------------------
+
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) return null;
+  return String(v).trim();
+}
+
+function getMindbodyConfig() {
+  const clientId = requireEnv("MINDBODY_CLIENT_ID");
+  const clientSecret = requireEnv("MINDBODY_CLIENT_SECRET");
+  const siteId = requireEnv("MINDBODY_SITE_ID") || "5744527";
+  const baseUrl = requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
+
+  const username = requireEnv("MINDBODY_USERNAME");
+  const password = requireEnv("MINDBODY_PASSWORD");
+
+  return { clientId, clientSecret, siteId, baseUrl, username, password };
+}
+
+// simple in-memory token cache
+let TOKEN_CACHE = {
+  accessToken: null,
+  expiresAtMs: 0,
+};
+
+// Issues a token if username/password are provided.
+// If your Mindbody setup uses a different auth flow, we’ll adjust after Step 2 once we see the live error.
+async function getMindbodyAccessToken(cfg) {
+  const now = Date.now();
+  if (TOKEN_CACHE.accessToken && TOKEN_CACHE.expiresAtMs - 30_000 > now) {
+    return TOKEN_CACHE.accessToken;
+  }
+
+  if (!cfg.username || !cfg.password) {
+    throw new Error(
+      "Missing MINDBODY_USERNAME / MINDBODY_PASSWORD. Add them in Railway (Step 2) so we can request a live access token."
+    );
+  }
+
+  const url = `${cfg.baseUrl.replace(/\/$/, "")}/usertoken/issue`;
+
+  const body = {
+    Username: cfg.username,
+    Password: cfg.password,
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Api-Key": cfg.clientId,
+      "SiteId": cfg.siteId,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+
+  if (!resp.ok) {
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    throw new Error(`Mindbody token error: ${msg}`);
+  }
+
+  const accessToken =
+    json?.AccessToken || json?.access_token || json?.token || json?.Token || null;
+
+  const expiresIn =
+    Number(json?.ExpiresIn || json?.expires_in || 0) || 0;
+
+  if (!accessToken) {
+    throw new Error(`Mindbody token response missing AccessToken. Raw: ${text.slice(0, 500)}`);
+  }
+
+  TOKEN_CACHE.accessToken = accessToken;
+  TOKEN_CACHE.expiresAtMs = Date.now() + (expiresIn ? expiresIn * 1000 : 20 * 60 * 1000);
+
+  return accessToken;
+}
+
+function toMindbodyTimeWindow(dateISO) {
+  // We request classes for the full day.
+  // Mindbody generally expects ISO-ish strings; this is good enough for schedule pulls.
+  return {
+    start: `${dateISO}T00:00:00`,
+    end: `${dateISO}T23:59:59`,
+  };
+}
+
+function normalizeMindbodyClasses(rawClasses) {
+  // Best-effort mapping for Mindbody class objects.
+  // We’ll refine after we see the real payload for Oxygen.
+  const out = [];
+
+  for (const c of rawClasses || []) {
+    const name =
+      c?.ClassDescription?.Name ||
+      c?.ClassDescription?.Description ||
+      c?.Name ||
+      c?.Description ||
+      "Class";
+
+    const startDateTime =
+      c?.StartDateTime ||
+      c?.startDateTime ||
+      c?.StartTime ||
+      c?.startTime ||
+      null;
+
+    let time = "";
+    if (startDateTime) {
+      const dt = new Date(startDateTime);
+      if (!Number.isNaN(dt.getTime())) {
+        time = new Intl.DateTimeFormat("en-US", {
+          hour: "numeric",
+          minute: "2-digit",
+        }).format(dt);
+      } else {
+        time = String(startDateTime);
+      }
+    }
+
+    const instructor =
+      c?.Staff?.Name ||
+      c?.Staff?.FirstName ||
+      c?.InstructorName ||
+      "";
+
+    const id =
+      c?.Id ||
+      c?.ClassId ||
+      c?.ClassScheduleId ||
+      c?.ClassInstanceId ||
+      `class_${Math.random().toString(16).slice(2)}`;
+
+    const bookable =
+      typeof c?.IsAvailable === "boolean" ? c.IsAvailable :
+      typeof c?.Bookable === "boolean" ? c.Bookable :
+      true;
+
+    out.push({
+      id,
+      name,
+      time: time || "Time TBD",
+      instructor: instructor || "",
+      bookable,
+    });
+  }
+
+  // sort by time string not perfect; good enough until we refine
+  return out;
+}
+
+async function fetchMindbodyScheduleForDate(cfg, dateISO) {
+  const token = await getMindbodyAccessToken(cfg);
+  const { start, end } = toMindbodyTimeWindow(dateISO);
+
+  const url = new URL(`${cfg.baseUrl.replace(/\/$/, "")}/class/classes`);
+  url.searchParams.set("StartDateTime", start);
+  url.searchParams.set("EndDateTime", end);
+
+  const resp = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      "Api-Key": cfg.clientId,
+      "SiteId": cfg.siteId,
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+
+  if (!resp.ok) {
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    throw new Error(`Mindbody schedule error: ${msg}`);
+  }
+
+  const rawClasses =
+    json?.Classes ||
+    json?.classes ||
+    json?.Items ||
+    json?.items ||
+    json ||
+    [];
+
+  return { raw: json, classes: normalizeMindbodyClasses(rawClasses) };
+}
+
+// ---------------------------
 // Route
 // ---------------------------
 
-app.post("/ghl/mindbody", (req, res) => {
-  // Merge query + body (support both)
+app.post("/ghl/mindbody", async (req, res) => {
   const q = req.query || {};
   const b = req.body || {};
 
@@ -180,11 +363,9 @@ app.post("/ghl/mindbody", (req, res) => {
   const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
 
-  // IMPORTANT: date might be "tomorrow" OR "February 20th, 2026" OR "2026-02-21"
   const dateParamRaw = q.date ?? b.date ?? q.dateParam ?? b.dateParam ?? q.datePhrase ?? b.datePhrase;
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
 
-  // basic logs (Railway)
   console.log("--------------------------------------------------");
   console.log("POST /ghl/mindbody");
   console.log("headers:", {
@@ -206,10 +387,8 @@ app.post("/ghl/mindbody", (req, res) => {
   }
 
   if (action === "get_schedule" || action === "get_schedule_web" || action === "get_schedule_by_date") {
-    // For mock mode gating
-    const maxDaysAhead = 14;
-
     const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
+
     console.log("parsed:", {
       action,
       studioKey,
@@ -217,7 +396,6 @@ app.post("/ghl/mindbody", (req, res) => {
       source,
       datePhrase: datePhraseRaw,
       ...resolved,
-      maxDaysAhead,
     });
 
     if (!resolved.ok) {
@@ -231,52 +409,82 @@ app.post("/ghl/mindbody", (req, res) => {
       });
     }
 
-    if (resolved.daysAhead > maxDaysAhead) {
+    const cfg = getMindbodyConfig();
+
+    // Hard fail (clear message) until Step 2 env vars are set.
+    if (!cfg.clientId || !cfg.clientSecret || !cfg.siteId || !cfg.baseUrl) {
       return respondJSON(res, {
         success: false,
         say: "",
         text: "",
         results: { say: "", text: "" },
-        error: `Date is too far ahead for mock mode (max ${maxDaysAhead} days).`,
-        data: { action, studioKey, timezone, source, datePhraseRaw, ...resolved, maxDaysAhead },
+        error:
+          "Mindbody Production is not configured yet. Set Railway env vars: MINDBODY_CLIENT_ID, MINDBODY_CLIENT_SECRET, MINDBODY_SITE_ID=5744527, MINDBODY_BASE_URL.",
+        data: {
+          action: "get_schedule",
+          mode: "live_unconfigured",
+          studioKey,
+          timezone,
+          source,
+          requestedDate: resolved.requestedDate,
+        },
       });
     }
 
-    const requestedDate = resolved.requestedDate;
-    const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
-    const classes = buildMockSchedule(requestedDate);
+    try {
+      const requestedDate = resolved.requestedDate;
+      const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
 
-    const say = buildScheduleSay(spokenDate, classes);
+      const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
+      const classes = schedule.classes;
 
-    return respondJSON(res, {
-      success: true,
-      say,
-      text: say,
-      // VERY IMPORTANT: many platforms expose only "results"
-      results: { say, text: say },
-      data: {
-        action: "get_schedule",
-        mode: "mock",
-        studioKey,
-        timezone,
-        source,
-        datePhraseRaw,
-        requestedDate,
-        todayInTZ: resolved.todayISO,
-        daysAhead: resolved.daysAhead,
-        maxDaysAhead,
-        schedule: {
+      const say = buildScheduleSay(spokenDate, classes);
+
+      return respondJSON(res, {
+        success: true,
+        say,
+        text: say,
+        results: { say, text: say },
+        data: {
+          action: "get_schedule",
+          mode: "live",
           studioKey,
           timezone,
-          date: requestedDate,
-          spokenDate,
-          classes,
+          source,
+          datePhraseRaw,
+          requestedDate,
+          todayInTZ: resolved.todayISO,
+          daysAhead: resolved.daysAhead,
+          schedule: {
+            studioKey,
+            timezone,
+            date: requestedDate,
+            spokenDate,
+            classes,
+          },
         },
-      },
-    });
+      });
+    } catch (err) {
+      console.log("Mindbody live error:", err?.message || err);
+
+      return respondJSON(res, {
+        success: false,
+        say: "",
+        text: "",
+        results: { say: "", text: "" },
+        error: err?.message || "Mindbody live error",
+        data: {
+          action: "get_schedule",
+          mode: "live_error",
+          studioKey,
+          timezone,
+          source,
+          datePhraseRaw,
+        },
+      });
+    }
   }
 
-  // Unknown action
   return respondJSON(res, {
     success: false,
     say: "",
@@ -292,7 +500,6 @@ app.get("/", (_req, res) => res.status(200).send("ok"));
 app.listen(PORT, () => {
   console.log(`Server listening on ${PORT}`);
 });
-
 
 
 
