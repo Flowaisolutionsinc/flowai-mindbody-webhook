@@ -5,14 +5,12 @@
  *    - ping
  *    - get_schedule
  *
- * Expects env vars (set in Railway in Step 2):
- *   MINDBODY_CLIENT_ID
- *   MINDBODY_CLIENT_SECRET
+ * Expects Railway env vars:
+ *   MINDBODY_API_KEY
  *   MINDBODY_SITE_ID=5744527
  *   MINDBODY_BASE_URL=https://api.mindbodyonline.com/public/v6
- *   (optional but commonly needed)
- *   MINDBODY_USERNAME
- *   MINDBODY_PASSWORD
+ *   MINDBODY_USERNAME   (Oxygen staff login - required for live token)
+ *   MINDBODY_PASSWORD   (Oxygen staff login - required for live token)
  *
  * Returns voice-agent-friendly payload:
  *  { success, say, text, results:{say,text}, data:{...} }
@@ -44,7 +42,6 @@ function decodeMaybe(v) {
   }
 }
 
-// Get YYYY-MM-DD "today" in a given IANA timezone using Intl parts
 function getTodayISOInTZ(timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
   const dtf = new Intl.DateTimeFormat("en-CA", {
@@ -60,7 +57,6 @@ function getTodayISOInTZ(timeZone) {
   return `${y}-${m}-${d}`;
 }
 
-// Add N days to a YYYY-MM-DD string
 function addDaysISO(iso, days) {
   const [y, m, d] = iso.split("-").map((x) => parseInt(x, 10));
   const dt = new Date(Date.UTC(y, m - 1, d));
@@ -71,7 +67,6 @@ function addDaysISO(iso, days) {
   return `${yy}-${mm}-${dd}`;
 }
 
-// Parse date phrases to ISO date
 function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
   const todayISO = getTodayISOInTZ(tz);
@@ -86,7 +81,6 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     return { ok: true, requestedDate: addDaysISO(todayISO, 1), todayISO, daysAhead: 1 };
   }
 
-  // YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(phrase)) {
     const daysAhead = Math.round(
       (Date.parse(phrase + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
@@ -94,7 +88,6 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     return { ok: true, requestedDate: phrase, todayISO, daysAhead };
   }
 
-  // Weekday handling
   const weekdays = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
   const wdIndex = weekdays.indexOf(phrase);
   if (wdIndex !== -1) {
@@ -109,7 +102,6 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     return { ok: true, requestedDate, todayISO, daysAhead: delta };
   }
 
-  // Natural date parsing (e.g., "February 20th, 2026")
   const cleaned = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1");
   const parsed = Date.parse(cleaned);
   if (!Number.isNaN(parsed)) {
@@ -131,8 +123,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
 
 function buildSpokenDateLabel(dateISO, timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
-  // Use noon UTC to avoid timezone-shift label bugs (your earlier “Thursday” issue)
-  const dt = new Date(dateISO + "T12:00:00Z");
+  const dt = new Date(dateISO + "T12:00:00Z"); // noon UTC avoids label drift
   return new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
     weekday: "long",
@@ -166,25 +157,16 @@ function requireEnv(name) {
 }
 
 function getMindbodyConfig() {
-  const clientId = requireEnv("MINDBODY_CLIENT_ID");
-  const clientSecret = requireEnv("MINDBODY_CLIENT_SECRET");
+  const apiKey = requireEnv("MINDBODY_API_KEY");
   const siteId = requireEnv("MINDBODY_SITE_ID") || "5744527";
   const baseUrl = requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
-
   const username = requireEnv("MINDBODY_USERNAME");
   const password = requireEnv("MINDBODY_PASSWORD");
-
-  return { clientId, clientSecret, siteId, baseUrl, username, password };
+  return { apiKey, siteId, baseUrl, username, password };
 }
 
-// simple in-memory token cache
-let TOKEN_CACHE = {
-  accessToken: null,
-  expiresAtMs: 0,
-};
+let TOKEN_CACHE = { accessToken: null, expiresAtMs: 0 };
 
-// Issues a token if username/password are provided.
-// If your Mindbody setup uses a different auth flow, we’ll adjust after Step 2 once we see the live error.
 async function getMindbodyAccessToken(cfg) {
   const now = Date.now();
   if (TOKEN_CACHE.accessToken && TOKEN_CACHE.expiresAtMs - 30_000 > now) {
@@ -192,26 +174,19 @@ async function getMindbodyAccessToken(cfg) {
   }
 
   if (!cfg.username || !cfg.password) {
-    throw new Error(
-      "Missing MINDBODY_USERNAME / MINDBODY_PASSWORD. Add them in Railway (Step 2) so we can request a live access token."
-    );
+    throw new Error("Missing MINDBODY_USERNAME / MINDBODY_PASSWORD (Oxygen staff login required).");
   }
 
   const url = `${cfg.baseUrl.replace(/\/$/, "")}/usertoken/issue`;
-
-  const body = {
-    Username: cfg.username,
-    Password: cfg.password,
-  };
 
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Api-Key": cfg.clientId,
+      "Api-Key": cfg.apiKey,
       "SiteId": cfg.siteId,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ Username: cfg.username, Password: cfg.password }),
   });
 
   const text = await resp.text();
@@ -223,11 +198,8 @@ async function getMindbodyAccessToken(cfg) {
     throw new Error(`Mindbody token error: ${msg}`);
   }
 
-  const accessToken =
-    json?.AccessToken || json?.access_token || json?.token || json?.Token || null;
-
-  const expiresIn =
-    Number(json?.ExpiresIn || json?.expires_in || 0) || 0;
+  const accessToken = json?.AccessToken || json?.access_token || json?.token || json?.Token || null;
+  const expiresIn = Number(json?.ExpiresIn || json?.expires_in || 0) || 0;
 
   if (!accessToken) {
     throw new Error(`Mindbody token response missing AccessToken. Raw: ${text.slice(0, 500)}`);
@@ -240,50 +212,30 @@ async function getMindbodyAccessToken(cfg) {
 }
 
 function toMindbodyTimeWindow(dateISO) {
-  // We request classes for the full day.
-  // Mindbody generally expects ISO-ish strings; this is good enough for schedule pulls.
-  return {
-    start: `${dateISO}T00:00:00`,
-    end: `${dateISO}T23:59:59`,
-  };
+  return { start: `${dateISO}T00:00:00`, end: `${dateISO}T23:59:59` };
 }
 
 function normalizeMindbodyClasses(rawClasses) {
-  // Best-effort mapping for Mindbody class objects.
-  // We’ll refine after we see the real payload for Oxygen.
   const out = [];
 
   for (const c of rawClasses || []) {
     const name =
       c?.ClassDescription?.Name ||
-      c?.ClassDescription?.Description ||
       c?.Name ||
-      c?.Description ||
       "Class";
 
-    const startDateTime =
-      c?.StartDateTime ||
-      c?.startDateTime ||
-      c?.StartTime ||
-      c?.startTime ||
-      null;
+    const startDateTime = c?.StartDateTime || c?.startDateTime || null;
 
     let time = "";
     if (startDateTime) {
       const dt = new Date(startDateTime);
-      if (!Number.isNaN(dt.getTime())) {
-        time = new Intl.DateTimeFormat("en-US", {
-          hour: "numeric",
-          minute: "2-digit",
-        }).format(dt);
-      } else {
-        time = String(startDateTime);
-      }
+      time = !Number.isNaN(dt.getTime())
+        ? new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(dt)
+        : String(startDateTime);
     }
 
     const instructor =
       c?.Staff?.Name ||
-      c?.Staff?.FirstName ||
       c?.InstructorName ||
       "";
 
@@ -294,21 +246,15 @@ function normalizeMindbodyClasses(rawClasses) {
       c?.ClassInstanceId ||
       `class_${Math.random().toString(16).slice(2)}`;
 
-    const bookable =
-      typeof c?.IsAvailable === "boolean" ? c.IsAvailable :
-      typeof c?.Bookable === "boolean" ? c.Bookable :
-      true;
-
     out.push({
       id,
       name,
       time: time || "Time TBD",
       instructor: instructor || "",
-      bookable,
+      bookable: true,
     });
   }
 
-  // sort by time string not perfect; good enough until we refine
   return out;
 }
 
@@ -323,7 +269,7 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
   const resp = await fetch(url.toString(), {
     method: "GET",
     headers: {
-      "Api-Key": cfg.clientId,
+      "Api-Key": cfg.apiKey,
       "SiteId": cfg.siteId,
       "Authorization": `Bearer ${token}`,
       "Content-Type": "application/json",
@@ -339,15 +285,8 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
     throw new Error(`Mindbody schedule error: ${msg}`);
   }
 
-  const rawClasses =
-    json?.Classes ||
-    json?.classes ||
-    json?.Items ||
-    json?.items ||
-    json ||
-    [];
-
-  return { raw: json, classes: normalizeMindbodyClasses(rawClasses) };
+  const rawClasses = json?.Classes || json?.classes || json?.Items || json?.items || json || [];
+  return normalizeMindbodyClasses(rawClasses);
 }
 
 // ---------------------------
@@ -368,11 +307,6 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   console.log("--------------------------------------------------");
   console.log("POST /ghl/mindbody");
-  console.log("headers:", {
-    "content-type": req.headers["content-type"],
-    authorization: req.headers["authorization"] ? "[present]" : "[missing]",
-    "user-agent": req.headers["user-agent"],
-  });
   console.log("query:", q);
   console.log("body:", b);
 
@@ -389,15 +323,6 @@ app.post("/ghl/mindbody", async (req, res) => {
   if (action === "get_schedule" || action === "get_schedule_web" || action === "get_schedule_by_date") {
     const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
 
-    console.log("parsed:", {
-      action,
-      studioKey,
-      timezone,
-      source,
-      datePhrase: datePhraseRaw,
-      ...resolved,
-    });
-
     if (!resolved.ok) {
       return respondJSON(res, {
         success: false,
@@ -411,23 +336,15 @@ app.post("/ghl/mindbody", async (req, res) => {
 
     const cfg = getMindbodyConfig();
 
-    // Hard fail (clear message) until Step 2 env vars are set.
-    if (!cfg.clientId || !cfg.clientSecret || !cfg.siteId || !cfg.baseUrl) {
+    if (!cfg.apiKey || !cfg.siteId || !cfg.baseUrl) {
       return respondJSON(res, {
         success: false,
         say: "",
         text: "",
         results: { say: "", text: "" },
         error:
-          "Mindbody Production is not configured yet. Set Railway env vars: MINDBODY_CLIENT_ID, MINDBODY_CLIENT_SECRET, MINDBODY_SITE_ID=5744527, MINDBODY_BASE_URL.",
-        data: {
-          action: "get_schedule",
-          mode: "live_unconfigured",
-          studioKey,
-          timezone,
-          source,
-          requestedDate: resolved.requestedDate,
-        },
+          "Mindbody Production not configured. Set: MINDBODY_API_KEY, MINDBODY_SITE_ID=5744527, MINDBODY_BASE_URL.",
+        data: { action: "get_schedule", mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
 
@@ -435,9 +352,7 @@ app.post("/ghl/mindbody", async (req, res) => {
       const requestedDate = resolved.requestedDate;
       const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
 
-      const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
-      const classes = schedule.classes;
-
+      const classes = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       const say = buildScheduleSay(spokenDate, classes);
 
       return respondJSON(res, {
@@ -451,36 +366,19 @@ app.post("/ghl/mindbody", async (req, res) => {
           studioKey,
           timezone,
           source,
-          datePhraseRaw,
           requestedDate,
-          todayInTZ: resolved.todayISO,
-          daysAhead: resolved.daysAhead,
-          schedule: {
-            studioKey,
-            timezone,
-            date: requestedDate,
-            spokenDate,
-            classes,
-          },
+          spokenDate,
+          classes,
         },
       });
     } catch (err) {
-      console.log("Mindbody live error:", err?.message || err);
-
       return respondJSON(res, {
         success: false,
         say: "",
         text: "",
         results: { say: "", text: "" },
         error: err?.message || "Mindbody live error",
-        data: {
-          action: "get_schedule",
-          mode: "live_error",
-          studioKey,
-          timezone,
-          source,
-          datePhraseRaw,
-        },
+        data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source },
       });
     }
   }
@@ -497,9 +395,6 @@ app.post("/ghl/mindbody", async (req, res) => {
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
-
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
 
 
