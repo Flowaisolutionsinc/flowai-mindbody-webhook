@@ -4,15 +4,19 @@
  *
  * Actions:
  *   - ping
- *   - get_schedule
+ *   - get_schedule | get_schedule_web | get_schedule_by_date
  *   - book_class
- *   - (stubbed) cancel_class
+ *   - cancel_class
  *
  * ENV expected (Railway):
  *   MINDBODY_MODE=mock|live
  *   MINDBODY_API_KEY               (Mindbody "Api-Key" header)
  *   MINDBODY_SITE_ID               (e.g. 5744527 for Roundhouse)
  *   MINDBODY_BASE_URL              (default: https://api.mindbodyonline.com/public/v6)
+ *
+ * Optional (booking/cancel requires token in most Mindbody setups):
+ *   MINDBODY_TOKEN_USERNAME
+ *   MINDBODY_TOKEN_PASSWORD
  *
  * Optional (future multi-studio):
  *   STUDIO_CONFIG_JSON             (map studioKey -> siteId, timezone, etc)
@@ -49,6 +53,24 @@ function decodeMaybe(v) {
 function respondJSON(res, payload) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.status(200).send(JSON.stringify(payload));
+}
+
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) return null;
+  return String(v).trim();
+}
+
+function getMindbodyConfig() {
+  const mode = (requireEnv("MINDBODY_MODE") || "mock").toLowerCase();
+  const apiKey = requireEnv("MINDBODY_API_KEY");
+  const siteId = requireEnv("MINDBODY_SITE_ID");
+  const baseUrl = requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
+
+  const tokenUsername = requireEnv("MINDBODY_TOKEN_USERNAME");
+  const tokenPassword = requireEnv("MINDBODY_TOKEN_PASSWORD");
+
+  return { mode, apiKey, siteId, baseUrl, tokenUsername, tokenPassword };
 }
 
 // Get YYYY-MM-DD "today" in a given IANA timezone using Intl parts
@@ -170,22 +192,8 @@ function buildMockSchedule(requestedDate) {
 }
 
 // ---------------------------
-// Mindbody LIVE
+// Mindbody LIVE helpers
 // ---------------------------
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) return null;
-  return String(v).trim();
-}
-
-function getMindbodyConfig() {
-  const mode = (requireEnv("MINDBODY_MODE") || "mock").toLowerCase();
-  const apiKey = requireEnv("MINDBODY_API_KEY"); // your Railway MINDBODY_API_KEY
-  const siteId = requireEnv("MINDBODY_SITE_ID"); // per-location site id
-  const baseUrl = requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
-  return { mode, apiKey, siteId, baseUrl };
-}
-
 function toMindbodyTimeWindow(dateISO) {
   return {
     start: `${dateISO}T00:00:00`,
@@ -221,12 +229,7 @@ function normalizeMindbodyClasses(rawClasses) {
     }
 
     const instructor = c?.Staff?.Name || c?.Staff?.FirstName || c?.InstructorName || "";
-    const id =
-      c?.Id ||
-      c?.ClassId ||
-      c?.ClassScheduleId ||
-      c?.ClassInstanceId ||
-      `class_${Math.random().toString(16).slice(2)}`;
+    const id = c?.Id || c?.ClassId || c?.ClassScheduleId || c?.ClassInstanceId || `class_${Math.random().toString(16).slice(2)}`;
 
     const bookable =
       typeof c?.IsAvailable === "boolean" ? c.IsAvailable :
@@ -236,15 +239,6 @@ function normalizeMindbodyClasses(rawClasses) {
     out.push({ id: String(id), name, time: time || "Time TBD", instructor: instructor || "", bookable });
   }
   return out;
-}
-
-async function fetchJsonOrText(resp) {
-  const text = await resp.text();
-  try {
-    return { ok: resp.ok, status: resp.status, json: JSON.parse(text), text };
-  } catch {
-    return { ok: resp.ok, status: resp.status, json: null, text };
-  }
 }
 
 async function fetchMindbodyScheduleForDate(cfg, dateISO) {
@@ -263,27 +257,34 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
     },
   });
 
-  const parsed = await fetchJsonOrText(resp);
-  if (!parsed.ok) {
-    const msg = parsed?.json?.Error?.Message || parsed?.json?.Message || parsed.text || `HTTP ${parsed.status}`;
-    throw new Error(`Mindbody schedule error (${parsed.status}): ${msg}`);
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+
+  if (!resp.ok) {
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    throw new Error(`Mindbody schedule error (${resp.status}): ${msg}`);
   }
 
-  const raw =
-    parsed.json?.Classes ||
-    parsed.json?.classes ||
-    parsed.json?.Items ||
-    parsed.json?.items ||
-    parsed.json ||
-    [];
-
-  return { raw: parsed.json, classes: normalizeMindbodyClasses(raw) };
+  const rawClasses = json?.Classes || json?.classes || json?.Items || json?.items || json || [];
+  return { raw: json, classes: normalizeMindbodyClasses(rawClasses) };
 }
 
-// Client add (creates if new; if duplicate, Mindbody may error — we handle by surfacing cleanly)
-async function addClient(cfg, { firstName, lastName, email, phone }) {
-  const url = `${cfg.baseUrl.replace(/\/$/, "")}/client/addclient`;
+// ---------------------------
+// Token + booking/cancel (requires UserToken in most setups)
+// ---------------------------
+let tokenCache = { value: null, expiresAt: 0 };
 
+async function getMindbodyUserToken(cfg) {
+  // 5 min safety buffer
+  const now = Date.now();
+  if (tokenCache.value && tokenCache.expiresAt > now + 5 * 60 * 1000) return tokenCache.value;
+
+  if (!cfg.tokenUsername || !cfg.tokenPassword) {
+    return null;
+  }
+
+  const url = `${cfg.baseUrl.replace(/\/$/, "")}/usertoken/issue`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -291,51 +292,139 @@ async function addClient(cfg, { firstName, lastName, email, phone }) {
       "SiteId": cfg.siteId,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      FirstName: firstName,
-      LastName: lastName,
-      Email: email,
-      MobilePhone: phone || "",
-    }),
+    body: JSON.stringify({ Username: cfg.tokenUsername, Password: cfg.tokenPassword }),
   });
 
-  const parsed = await fetchJsonOrText(resp);
-  if (!parsed.ok) {
-    const msg = parsed?.json?.Error?.Message || parsed?.json?.Message || parsed.text || `HTTP ${parsed.status}`;
-    throw new Error(`Mindbody addclient error (${parsed.status}): ${msg}`);
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+
+  if (!resp.ok) {
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    throw new Error(`Mindbody token error (${resp.status}): ${msg}`);
   }
 
-  const clientId = parsed?.json?.Clients?.[0]?.Id || parsed?.json?.Client?.Id || null;
-  if (!clientId) {
-    throw new Error(`Mindbody addclient response missing client id.`);
-  }
+  const accessToken = json?.AccessToken || json?.access_token || json?.Token || json?.token;
+  const expiresIn = Number(json?.ExpiresIn || json?.expires_in || 3600);
+  if (!accessToken) throw new Error("Mindbody token error: missing AccessToken in response");
 
-  return { clientId, raw: parsed.json };
+  tokenCache.value = accessToken;
+  tokenCache.expiresAt = Date.now() + expiresIn * 1000;
+  return accessToken;
 }
 
-async function addClientToClass(cfg, { clientId, classId }) {
-  const url = `${cfg.baseUrl.replace(/\/$/, "")}/class/addclienttoclass`;
+async function mbGet(cfg, path, token, paramsObj = {}) {
+  const url = new URL(`${cfg.baseUrl.replace(/\/$/, "")}${path}`);
+  for (const [k, v] of Object.entries(paramsObj)) {
+    if (v !== undefined && v !== null && String(v).trim() !== "") url.searchParams.set(k, String(v));
+  }
+
+  const headers = {
+    "Api-Key": cfg.apiKey,
+    "SiteId": cfg.siteId,
+    "Content-Type": "application/json",
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const resp = await fetch(url.toString(), { method: "GET", headers });
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+
+  if (!resp.ok) {
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    throw new Error(`Mindbody GET ${path} error (${resp.status}): ${msg}`);
+  }
+  return json;
+}
+
+async function mbPost(cfg, path, token, bodyObj = {}) {
+  const url = `${cfg.baseUrl.replace(/\/$/, "")}${path}`;
+
+  const headers = {
+    "Api-Key": cfg.apiKey,
+    "SiteId": cfg.siteId,
+    "Content-Type": "application/json",
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      "Api-Key": cfg.apiKey,
-      "SiteId": cfg.siteId,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      ClientId: Number(clientId),
-      ClassId: Number(classId),
-    }),
+    headers,
+    body: JSON.stringify(bodyObj),
   });
 
-  const parsed = await fetchJsonOrText(resp);
-  if (!parsed.ok) {
-    const msg = parsed?.json?.Error?.Message || parsed?.json?.Message || parsed.text || `HTTP ${parsed.status}`;
-    throw new Error(`Mindbody booking error (${parsed.status}): ${msg}`);
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+
+  if (!resp.ok) {
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    throw new Error(`Mindbody POST ${path} error (${resp.status}): ${msg}`);
+  }
+  return json;
+}
+
+function normalizePhone(phoneRaw) {
+  const p = decodeMaybe(phoneRaw).trim();
+  if (!p) return "";
+  // keep + and digits
+  const cleaned = p.replace(/[^\d+]/g, "");
+  return cleaned;
+}
+
+async function findClientId(cfg, token, email, phone) {
+  // Mindbody search text can often match email/phone/name
+  const searchText = email || phone || "";
+  if (!searchText) return null;
+
+  const json = await mbGet(cfg, "/client/clients", token, { SearchText: searchText, Limit: 10, Offset: 0 });
+  const clients = json?.Clients || json?.clients || [];
+  if (!Array.isArray(clients) || clients.length === 0) return null;
+
+  // Prefer exact email match if provided
+  if (email) {
+    const exact = clients.find((c) => (c?.Email || c?.email || "").toLowerCase() === email.toLowerCase());
+    if (exact?.Id) return String(exact.Id);
   }
 
-  return { raw: parsed.json };
+  // Otherwise first result
+  const first = clients[0];
+  if (first?.Id) return String(first.Id);
+  return null;
+}
+
+async function createClient(cfg, token, firstName, lastName, email, phone) {
+  const payload = {
+    FirstName: firstName,
+    LastName: lastName,
+  };
+  if (email) payload.Email = email;
+  if (phone) payload.MobilePhone = phone;
+
+  const json = await mbPost(cfg, "/client/addclient", token, payload);
+  const client = json?.Client || json?.client || json;
+  const id = client?.Id || client?.ClientId || client?.id;
+  if (!id) throw new Error("Client created but no client ID returned.");
+  return String(id);
+}
+
+async function bookClientIntoClass(cfg, token, clientId, classId) {
+  const payload = {
+    ClientId: clientId,
+    ClassId: Number(classId), // Mindbody often expects numeric
+  };
+  const json = await mbPost(cfg, "/class/addclienttoclass", token, payload);
+  return json;
+}
+
+async function cancelClientFromClass(cfg, token, clientId, classId) {
+  const payload = {
+    ClientId: clientId,
+    ClassId: Number(classId),
+  };
+  const json = await mbPost(cfg, "/class/removeclientfromclass", token, payload);
+  return json;
 }
 
 // ---------------------------
@@ -349,8 +438,17 @@ app.post("/ghl/mindbody", async (req, res) => {
   const studioKey = decodeMaybe(q.studioKey ?? b.studioKey).trim() || "oxygen_roundhouse";
   const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
+
   const dateParamRaw = q.date ?? b.date ?? q.dateParam ?? b.dateParam ?? q.datePhrase ?? b.datePhrase;
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
+
+  // Booking params
+  const classId = decodeMaybe(q.classId ?? b.classId).trim();
+  const firstName = decodeMaybe(q.firstName ?? b.firstName).trim();
+  const lastName = decodeMaybe(q.lastName ?? b.lastName).trim();
+  const email = decodeMaybe(q.email ?? b.email).trim();
+  const phone = normalizePhone(q.phone ?? b.phone);
+  const isNewClientRaw = decodeMaybe(q.isNewClient ?? b.isNewClient).trim().toLowerCase();
 
   console.log("--------------------------------------------------");
   console.log("POST /ghl/mindbody");
@@ -358,7 +456,6 @@ app.post("/ghl/mindbody", async (req, res) => {
   console.log("query:", q);
   console.log("body:", b);
 
-  // PING
   if (action === "ping") {
     return respondJSON(res, {
       success: true,
@@ -369,7 +466,14 @@ app.post("/ghl/mindbody", async (req, res) => {
     });
   }
 
+  const cfg = getMindbodyConfig();
+
+  // Guard for live env config
+  const liveConfigured = cfg.apiKey && cfg.siteId && cfg.baseUrl;
+
+  // ---------------------------
   // GET SCHEDULE
+  // ---------------------------
   if (action === "get_schedule" || action === "get_schedule_web" || action === "get_schedule_by_date") {
     const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
     if (!resolved.ok) {
@@ -383,9 +487,7 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     }
 
-    const cfg = getMindbodyConfig();
-
-    // MOCK mode
+    // MOCK
     if (cfg.mode !== "live") {
       const requestedDate = resolved.requestedDate;
       const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
@@ -409,8 +511,8 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     }
 
-    // LIVE mode
-    if (!cfg.apiKey || !cfg.siteId || !cfg.baseUrl) {
+    // LIVE
+    if (!liveConfigured) {
       return respondJSON(res, {
         success: false,
         say: "",
@@ -446,70 +548,97 @@ app.post("/ghl/mindbody", async (req, res) => {
         },
       });
     } catch (err) {
-      console.log("Mindbody live error:", err?.message || err);
+      console.log("Mindbody live schedule error:", err?.message || err);
       return respondJSON(res, {
         success: false,
         say: "",
         text: "",
         results: { say: "", text: "" },
-        error: err?.message || "Mindbody live error",
+        error: err?.message || "Mindbody live schedule error",
         data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw },
       });
     }
   }
 
-  // BOOK CLASS (LIVE)
+  // ---------------------------
+  // BOOK CLASS
+  // ---------------------------
   if (action === "book_class") {
-    const cfg = getMindbodyConfig();
-
     if (cfg.mode !== "live") {
       return respondJSON(res, {
         success: false,
-        say: "Booking is not available in mock mode.",
-        text: "Booking is not available in mock mode.",
-        results: { say: "Booking is not available in mock mode.", text: "Booking is not available in mock mode." },
-        data: { action, mode: cfg.mode },
+        say: "Booking is only available in live mode.",
+        text: "Booking is only available in live mode.",
+        results: { say: "Booking is only available in live mode.", text: "Booking is only available in live mode." },
+        data: { action, mode: cfg.mode, studioKey, timezone, source },
       });
     }
 
-    if (!cfg.apiKey || !cfg.siteId || !cfg.baseUrl) {
+    if (!liveConfigured) {
       return respondJSON(res, {
         success: false,
-        say: "",
-        text: "",
-        results: { say: "", text: "" },
-        error: "Mindbody LIVE not configured. Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
-        data: { action: "book_class", mode: "live_unconfigured" },
+        say: "Mindbody live is not configured yet.",
+        text: "Mindbody live is not configured yet.",
+        results: { say: "Mindbody live is not configured yet.", text: "Mindbody live is not configured yet." },
+        error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
+        data: { action, mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
 
-    // Inputs (from custom action variables)
-    const classId = decodeMaybe(q.classId ?? b.classId).trim();
-    const firstName = decodeMaybe(q.firstName ?? b.firstName).trim();
-    const lastName = decodeMaybe(q.lastName ?? b.lastName).trim();
-    const email = decodeMaybe(q.email ?? b.email).trim();
-    const phone = decodeMaybe(q.phone ?? b.phone).trim();
-
-    // Required for clean booking
-    if (!classId || !firstName || !lastName || !email) {
+    if (!classId) {
       return respondJSON(res, {
         success: false,
-        say: "",
-        text: "",
-        results: { say: "", text: "" },
-        error: "Missing required booking fields (classId, firstName, lastName, email).",
-        data: { classId, firstName, lastName, email, phone },
+        say: "I’m missing the class selection.",
+        text: "I’m missing the class selection.",
+        results: { say: "I’m missing the class selection.", text: "I’m missing the class selection." },
+        error: "Missing classId",
+        data: { action, studioKey, timezone, source },
       });
     }
 
+    // Most Mindbody setups require a user token for booking/cancel :contentReference[oaicite:2]{index=2}
     try {
-      // 1) Add client (new client path). If Mindbody rejects duplicates, we will surface the error cleanly.
-      const client = await addClient(cfg, { firstName, lastName, email, phone });
+      const token = await getMindbodyUserToken(cfg);
+      if (!token) {
+        return respondJSON(res, {
+          success: false,
+          say: "Booking isn’t enabled yet on our side.",
+          text: "Booking isn’t enabled yet on our side.",
+          results: { say: "Booking isn’t enabled yet on our side.", text: "Booking isn’t enabled yet on our side." },
+          error: "Booking requires Mindbody user token credentials. Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
+          data: { action, mode: "live_missing_token_creds", studioKey, timezone, source, classId },
+        });
+      }
 
-      // 2) Add client to class
-      const booking = await addClientToClass(cfg, { clientId: client.clientId, classId });
+      // Determine new/existing
+      const isNewClient =
+        isNewClientRaw === "true" || isNewClientRaw === "yes" || isNewClientRaw === "1";
 
-      const say = `You're booked! I've reserved your spot. You'll receive a confirmation email shortly.`;
+      // Find or create client
+      let clientId = await findClientId(cfg, token, email, phone);
+
+      let created = false;
+      if (!clientId) {
+        // Need enough info to create
+        if (!firstName || !lastName) {
+          return respondJSON(res, {
+            success: false,
+            say: "I just need your first and last name to complete the booking.",
+            text: "I just need your first and last name to complete the booking.",
+            results: { say: "I just need your first and last name to complete the booking.", text: "I just need your first and last name to complete the booking." },
+            error: "No existing client found; missing firstName/lastName to create new client.",
+            data: { action, studioKey, timezone, source, classId, email, phone },
+          });
+        }
+        clientId = await createClient(cfg, token, firstName, lastName, email, phone);
+        created = true;
+      }
+
+      await bookClientIntoClass(cfg, token, clientId, classId);
+
+      const say = created || isNewClient
+        ? "You’re booked! I’ll also send you a waiver link right after this call to complete before class."
+        : "You’re booked! Anything else I can help you with?";
 
       return respondJSON(res, {
         success: true,
@@ -517,49 +646,132 @@ app.post("/ghl/mindbody", async (req, res) => {
         text: say,
         results: { say, text: say },
         data: {
-          action: "book_class",
+          action,
           mode: "live",
           studioKey,
           timezone,
           source,
-          classId,
-          clientId: client.clientId,
-          clientRaw: client.raw,
-          bookingRaw: booking.raw,
+          booking: {
+            classId: String(classId),
+            clientId: String(clientId),
+            createdClient: created,
+            email,
+            phone,
+          },
         },
       });
     } catch (err) {
-      console.log("Mindbody booking error:", err?.message || err);
+      console.log("Mindbody book_class error:", err?.message || err);
       return respondJSON(res, {
         success: false,
-        say: "",
-        text: "",
-        results: { say: "", text: "" },
-        error: err?.message || "Booking failed.",
-        data: { action: "book_class", mode: "live_error", studioKey, timezone, source, classId, email },
+        say: "I couldn’t complete that booking right now.",
+        text: "I couldn’t complete that booking right now.",
+        results: { say: "I couldn’t complete that booking right now.", text: "I couldn’t complete that booking right now." },
+        error: err?.message || "Mindbody booking error",
+        data: { action, mode: "live_error", studioKey, timezone, source, classId, email, phone },
       });
     }
   }
 
-  // CANCEL CLASS (stub for now)
+  // ---------------------------
+  // CANCEL CLASS
+  // ---------------------------
   if (action === "cancel_class") {
-    return respondJSON(res, {
-      success: false,
-      say: "Cancel is not enabled yet.",
-      text: "Cancel is not enabled yet.",
-      results: { say: "Cancel is not enabled yet.", text: "Cancel is not enabled yet." },
-      data: { action, studioKey, timezone, source },
-    });
+    if (cfg.mode !== "live") {
+      return respondJSON(res, {
+        success: false,
+        say: "Canceling is only available in live mode.",
+        text: "Canceling is only available in live mode.",
+        results: { say: "Canceling is only available in live mode.", text: "Canceling is only available in live mode." },
+        data: { action, mode: cfg.mode, studioKey, timezone, source },
+      });
+    }
+
+    if (!liveConfigured) {
+      return respondJSON(res, {
+        success: false,
+        say: "Mindbody live is not configured yet.",
+        text: "Mindbody live is not configured yet.",
+        results: { say: "Mindbody live is not configured yet.", text: "Mindbody live is not configured yet." },
+        error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
+        data: { action, mode: "live_unconfigured", studioKey, timezone, source },
+      });
+    }
+
+    if (!classId) {
+      return respondJSON(res, {
+        success: false,
+        say: "I’m missing the class selection to cancel.",
+        text: "I’m missing the class selection to cancel.",
+        results: { say: "I’m missing the class selection to cancel.", text: "I’m missing the class selection to cancel." },
+        error: "Missing classId",
+        data: { action, studioKey, timezone, source },
+      });
+    }
+
+    try {
+      const token = await getMindbodyUserToken(cfg);
+      if (!token) {
+        return respondJSON(res, {
+          success: false,
+          say: "Canceling isn’t enabled yet on our side.",
+          text: "Canceling isn’t enabled yet on our side.",
+          results: { say: "Canceling isn’t enabled yet on our side.", text: "Canceling isn’t enabled yet on our side." },
+          error: "Canceling requires Mindbody user token credentials. Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
+          data: { action, mode: "live_missing_token_creds", studioKey, timezone, source, classId },
+        });
+      }
+
+      // Need clientId — we derive via email/phone
+      const clientId = await findClientId(cfg, token, email, phone);
+      if (!clientId) {
+        return respondJSON(res, {
+          success: false,
+          say: "I couldn’t find your account to cancel that booking.",
+          text: "I couldn’t find your account to cancel that booking.",
+          results: { say: "I couldn’t find your account to cancel that booking.", text: "I couldn’t find your account to cancel that booking." },
+          error: "No client found for provided email/phone.",
+          data: { action, studioKey, timezone, source, classId, email, phone },
+        });
+      }
+
+      await cancelClientFromClass(cfg, token, clientId, classId);
+
+      const say = "Done — you’re canceled. Want me to book you into a different class instead?";
+      return respondJSON(res, {
+        success: true,
+        say,
+        text: say,
+        results: { say, text: say },
+        data: {
+          action,
+          mode: "live",
+          studioKey,
+          timezone,
+          source,
+          cancel: { classId: String(classId), clientId: String(clientId), email, phone },
+        },
+      });
+    } catch (err) {
+      console.log("Mindbody cancel_class error:", err?.message || err);
+      return respondJSON(res, {
+        success: false,
+        say: "I couldn’t cancel that right now.",
+        text: "I couldn’t cancel that right now.",
+        results: { say: "I couldn’t cancel that right now.", text: "I couldn’t cancel that right now." },
+        error: err?.message || "Mindbody cancel error",
+        data: { action, mode: "live_error", studioKey, timezone, source, classId, email, phone },
+      });
+    }
   }
 
-  // Unknown action
   return respondJSON(res, {
     success: false,
     say: "",
     text: "",
     results: { say: "", text: "" },
     error: `Unknown action: ${action}`,
-    data: { action, studioKey, timezone, source, datePhraseRaw },
+    data: { action, studioKey, timezone, source },
   });
 });
 
