@@ -137,7 +137,13 @@ function addDaysISO(iso, days) {
   return `${yy}-${mm}-${dd}`;
 }
 
-// Parse date phrases to ISO date
+function compareISO(a, b) {
+  // ISO yyyy-mm-dd lexicographic compare works
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
+// Parse date phrases to ISO date (robust, avoids Date.parse weird defaults like year 2001)
 function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
   const todayISO = getTodayISOInTZ(tz);
@@ -145,6 +151,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const phrase = decodeMaybe(datePhraseRaw).trim().toLowerCase();
   if (!phrase) return { ok: false, reason: "missing date phrase" };
 
+  // Common
   if (phrase === "today") {
     return { ok: true, requestedDate: todayISO, todayISO, daysAhead: 0 };
   }
@@ -160,8 +167,28 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     return { ok: true, requestedDate: phrase, todayISO, daysAhead };
   }
 
-  // Weekday handling
+  // Handle "this friday" / "next friday"
   const weekdays = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+  const mThisNext = phrase.match(/^(this|next)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
+  if (mThisNext) {
+    const which = mThisNext[1];
+    const wdName = mThisNext[2];
+    const wdIndex = weekdays.indexOf(wdName);
+
+    const now = new Date();
+    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
+    const todayName = dtf.format(now).toLowerCase();
+    const todayIdx = weekdays.indexOf(todayName);
+
+    let delta = (wdIndex - todayIdx + 7) % 7;
+    if (delta === 0) delta = 7; // next occurrence
+    if (which === "next") delta += 7; // push one more week
+
+    const requestedDate = addDaysISO(todayISO, delta);
+    return { ok: true, requestedDate, todayISO, daysAhead: delta };
+  }
+
+  // Simple weekday ("friday" => next occurrence)
   const wdIndex = weekdays.indexOf(phrase);
   if (wdIndex !== -1) {
     const now = new Date();
@@ -175,21 +202,55 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     return { ok: true, requestedDate, todayISO, daysAhead: delta };
   }
 
-  // Natural date parsing
-  const cleaned = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1");
-  const parsed = Date.parse(cleaned);
-  if (!Number.isNaN(parsed)) {
-    const dt = new Date(parsed);
-    const yy = dt.getFullYear();
-    const mm = String(dt.getMonth() + 1).padStart(2, "0");
-    const dd = String(dt.getDate()).padStart(2, "0");
-    const requestedDate = `${yy}-${mm}-${dd}`;
+  // Handle "on the 17th" / "17th"
+  const dayOnly = phrase.replace(/^on\s+the\s+/, "").replace(/(\d+)(st|nd|rd|th)$/g, "$1");
+  if (/^\d{1,2}$/.test(dayOnly)) {
+    const dayNum = parseInt(dayOnly, 10);
+    const [y, m] = todayISO.split("-").map((x) => parseInt(x, 10));
+
+    const candidateThisMonth = `${y}-${String(m).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
+    let requestedDate = candidateThisMonth;
+
+    // If already passed, move to next month
+    if (compareISO(requestedDate, todayISO) < 0) {
+      const nextMonthDate = addDaysISO(`${y}-${String(m).padStart(2, "0")}-01`, 32); // jump into next month
+      const [ny, nm] = nextMonthDate.split("-").map((x) => parseInt(x, 10));
+      requestedDate = `${ny}-${String(nm).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
+    }
 
     const daysAhead = Math.round(
       (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
     );
-
     return { ok: true, requestedDate, todayISO, daysAhead };
+  }
+
+  // Handle "February 24th" / "Feb 24"
+  const cleaned = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1");
+  const monthNames = [
+    "january","february","march","april","may","june",
+    "july","august","september","october","november","december"
+  ];
+  const monthShort = monthNames.map((x) => x.slice(0,3));
+  const md = cleaned.match(/^([a-z]+)\s+(\d{1,2})$/);
+  if (md) {
+    const monRaw = md[1];
+    const dayNum = parseInt(md[2], 10);
+    let monIdx = monthNames.indexOf(monRaw);
+    if (monIdx === -1) monIdx = monthShort.indexOf(monRaw.slice(0,3));
+    if (monIdx !== -1) {
+      const [y] = todayISO.split("-").map((x) => parseInt(x, 10));
+      let requestedDate = `${y}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
+
+      // If date already passed this year, bump to next year
+      if (compareISO(requestedDate, todayISO) < 0) {
+        requestedDate = `${y + 1}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
+      }
+
+      const daysAhead = Math.round(
+        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
+      );
+      return { ok: true, requestedDate, todayISO, daysAhead };
+    }
   }
 
   return { ok: false, reason: `unrecognized date phrase: "${datePhraseRaw}"` };
@@ -207,28 +268,25 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
-/**
- * ✅ UPDATED for voice delivery:
- * - Full sentences per class
- * - Double line breaks for natural TTS pauses
- * - Includes instructor when available
- */
+// ✅ UPDATED for PERFECT voice delivery: structured lines with \n
 function buildScheduleSay(spokenDateLabel, classes) {
   if (!classes || classes.length === 0) {
-    return `I couldn’t find any classes for ${spokenDateLabel}. Would you like a different date?`;
+    return `I couldn’t find any classes for ${spokenDateLabel}.\nWould you like a different date?`;
   }
 
   const lines = [];
   lines.push(`Here are the classes for ${spokenDateLabel}.`);
 
-  classes.forEach((c) => {
-    const instructorPart = c.instructor ? ` with ${c.instructor}` : "";
-    lines.push(`${c.time} — ${c.name}${instructorPart}.`);
-  });
+  const safeClasses = Array.isArray(classes) ? classes.slice(0) : [];
+  for (const c of safeClasses) {
+    const time = c?.time || "Time TBD";
+    const name = c?.name || "Class";
+    const instructor = c?.instructor ? ` with ${c.instructor}` : "";
+    lines.push(`${time} — ${name}${instructor}.`);
+  }
 
   lines.push(`Which class would you like to book?`);
-
-  return lines.join("\n\n");
+  return lines.join("\n");
 }
 
 // ---------------------------
