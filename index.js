@@ -48,45 +48,24 @@ function decodeMaybe(v) {
 }
 
 /**
- * ✅ IMPORTANT:
- * Some platforms do NOT read `say` automatically.
- * This returns the same spoken text under multiple common keys:
- * - say / text (your original)
- * - response / message / output / speech (common webhook conventions)
- * - results.say/results.text (nested convention)
+ * ✅ UPDATED (CRITICAL FIX):
+ * We return ONLY:
+ *   { success, data, error }
+ *
+ * We intentionally remove duplicated "say/text/response/message/output/speech/results" fields
+ * because they cause the agent to sometimes read the wrong field and hallucinate/merge schedules.
+ *
+ * Your prompt should read schedule ONLY from: data.schedule.classes
  */
 function respondJSON(res, payload) {
-  const say = safeString(payload?.say);
-  const text = safeString(payload?.text);
-  const err = safeString(payload?.error);
-
-  const spoken = say || text || err || "";
-
   const finalPayload = {
-    ...payload,
-
-    // your original fields
-    say: spoken,
-    text: spoken,
-
-    // common aliases other tools look for
-    response: spoken,
-    message: spoken,
-    output: spoken,
-    speech: spoken,
-
-    // nested convention
-    results: payload?.results || { say: spoken, text: spoken },
-
-    // sometimes platforms want an explicit "data" bubble (keep yours)
-    data: payload?.data || payload?.data === 0 ? payload.data : payload?.data,
-
-    // sometimes platforms look for "success" boolean
     success: !!payload?.success,
+    data: payload?.data ?? null,
+    error: payload?.error ?? null,
   };
 
-  // ✅ This proves what we returned (shows in Railway logs)
-  console.log("RESPONDING:", finalPayload.success, finalPayload.response);
+  // ✅ Log minimal, reliable info
+  console.log("RESPONDING:", finalPayload.success);
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   return res.status(200).json(finalPayload);
