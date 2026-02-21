@@ -4,7 +4,6 @@
  *
  * Actions:
  *   - ping
- *   - debug_echo              (NEW: helps prove what params are arriving)
  *   - get_schedule | get_schedule_web | get_schedule_by_date
  *   - book_class
  *   - cancel_class
@@ -19,8 +18,8 @@
  *   MINDBODY_TOKEN_USERNAME
  *   MINDBODY_TOKEN_PASSWORD
  *
- * Returns voice-agent-friendly payload with MANY speech keys:
- *  { success, say, text, response, result, message, output, speech, body, results:{say,text,body}, data:{...} }
+ * Returns voice-agent-friendly payload:
+ *  { success, say, text, results:{say,text}, data:{...} }
  */
 
 const express = require("express");
@@ -51,54 +50,43 @@ function decodeMaybe(v) {
 /**
  * ✅ IMPORTANT:
  * Some platforms do NOT read `say` automatically.
- * This returns the same spoken text under multiple common keys.
+ * This returns the same spoken text under multiple common keys:
+ * - say / text (your original)
+ * - response / message / output / speech (common webhook conventions)
+ * - results.say/results.text (nested convention)
  */
 function respondJSON(res, payload) {
   const say = safeString(payload?.say);
   const text = safeString(payload?.text);
   const err = safeString(payload?.error);
 
-  // If say/text empty, fall back to error so SOMETHING is speakable in failures
   const spoken = say || text || err || "";
-
-  // Stringified body is useful because some tools only surface `body`
-  const bodyString = safeString(payload?.body) || JSON.stringify({
-    ...payload,
-    say: spoken,
-    text: spoken,
-  });
 
   const finalPayload = {
     ...payload,
-
-    // canonical
-    success: !!payload?.success,
 
     // your original fields
     say: spoken,
     text: spoken,
 
-    // common aliases used by different voice/workflow platforms
+    // common aliases other tools look for
     response: spoken,
-    result: spoken,
     message: spoken,
     output: spoken,
     speech: spoken,
-    assistant_response: spoken,
-    tool_result: spoken,
-
-    // raw-ish body
-    body: bodyString,
 
     // nested convention
-    results: payload?.results || { say: spoken, text: spoken, body: bodyString },
+    results: payload?.results || { say: spoken, text: spoken },
 
-    // keep data
-    data: payload?.data,
+    // sometimes platforms want an explicit "data" bubble (keep yours)
+    data: payload?.data || payload?.data === 0 ? payload.data : payload?.data,
+
+    // sometimes platforms look for "success" boolean
+    success: !!payload?.success,
   };
 
-  // ✅ proves what we returned (Railway logs)
-  console.log("RESPONDING:", finalPayload.success, finalPayload.result);
+  // ✅ This proves what we returned (shows in Railway logs)
+  console.log("RESPONDING:", finalPayload.success, finalPayload.response);
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   return res.status(200).json(finalPayload);
@@ -219,12 +207,28 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
+/**
+ * ✅ UPDATED for voice delivery:
+ * - Full sentences per class
+ * - Double line breaks for natural TTS pauses
+ * - Includes instructor when available
+ */
 function buildScheduleSay(spokenDateLabel, classes) {
   if (!classes || classes.length === 0) {
     return `I couldn’t find any classes for ${spokenDateLabel}. Would you like a different date?`;
   }
-  const parts = classes.map((c) => `${c.time} — ${c.name}`);
-  return `Here are the classes for ${spokenDateLabel}: ${parts.join(", ")}. Which class would you like to book?`;
+
+  const lines = [];
+  lines.push(`Here are the classes for ${spokenDateLabel}.`);
+
+  classes.forEach((c) => {
+    const instructorPart = c.instructor ? ` with ${c.instructor}` : "";
+    lines.push(`${c.time} — ${c.name}${instructorPart}.`);
+  });
+
+  lines.push(`Which class would you like to book?`);
+
+  return lines.join("\n\n");
 }
 
 // ---------------------------
@@ -509,32 +513,12 @@ app.post("/ghl/mindbody", async (req, res) => {
   console.log("query:", q);
   console.log("body:", b);
 
-  // 1) ping
   if (action === "ping") {
     return respondJSON(res, {
       success: true,
       say: "pong",
       text: "pong",
       data: { action, studioKey, timezone, source },
-    });
-  }
-
-  // 2) debug_echo (NEW)
-  if (action === "debug_echo") {
-    const say =
-      `Debug received. studioKey=${studioKey}, timezone=${timezone}, source=${source}, date=${datePhraseRaw || "(none)"}, classId=${classId || "(none)"}.`;
-    return respondJSON(res, {
-      success: true,
-      say,
-      text: say,
-      data: {
-        action,
-        received: {
-          studioKey, timezone, source,
-          date: datePhraseRaw,
-          classId, firstName, lastName, email, phone, isNewClientRaw,
-        },
-      },
     });
   }
 
@@ -549,6 +533,8 @@ app.post("/ghl/mindbody", async (req, res) => {
     if (!resolved.ok) {
       return respondJSON(res, {
         success: false,
+        say: "",
+        text: "",
         error: `Could not parse date: ${resolved.reason}`,
         data: { action, studioKey, timezone, source, datePhraseRaw },
       });
@@ -579,6 +565,8 @@ app.post("/ghl/mindbody", async (req, res) => {
     if (!liveConfigured) {
       return respondJSON(res, {
         success: false,
+        say: "",
+        text: "",
         error: "Mindbody LIVE not configured. Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
         data: { action: "get_schedule", mode: "live_unconfigured", studioKey, timezone, source },
       });
@@ -610,6 +598,8 @@ app.post("/ghl/mindbody", async (req, res) => {
       console.log("Mindbody live schedule error:", err?.message || err);
       return respondJSON(res, {
         success: false,
+        say: "",
+        text: "",
         error: err?.message || "Mindbody live schedule error",
         data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw },
       });
@@ -797,6 +787,8 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   return respondJSON(res, {
     success: false,
+    say: "",
+    text: "",
     error: `Unknown action: ${action}`,
     data: { action, studioKey, timezone, source },
   });
