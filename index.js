@@ -54,21 +54,20 @@ function respondJSON(res, payload) {
 
   const finalPayload = {
     ...payload,
-    success: typeof payload?.success === "boolean" ? payload.success : Boolean(payload?.success),
     say: say || text || "",
     text: text || say || "",
     results: payload?.results || { say: say || text || "", text: text || say || "" },
   };
 
-  // 🔥 This is the "proof" line you need in Railway logs
+  // ✅ IMPORTANT: proves the server actually returned something during agent calls
   console.log(
     "RESPONDING:",
     finalPayload.success,
-    (finalPayload.say || finalPayload.text || finalPayload.error || "").slice(0, 220)
+    finalPayload.say || finalPayload.text || finalPayload.error || "(no message)"
   );
 
-  // Use res.json so platforms parse it cleanly
-  res.status(200).json(finalPayload);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.status(200).send(JSON.stringify(finalPayload));
 }
 
 function requireEnv(name) {
