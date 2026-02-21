@@ -54,13 +54,21 @@ function respondJSON(res, payload) {
 
   const finalPayload = {
     ...payload,
+    success: typeof payload?.success === "boolean" ? payload.success : Boolean(payload?.success),
     say: say || text || "",
     text: text || say || "",
     results: payload?.results || { say: say || text || "", text: text || say || "" },
   };
 
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.status(200).send(JSON.stringify(finalPayload));
+  // 🔥 This is the "proof" line you need in Railway logs
+  console.log(
+    "RESPONDING:",
+    finalPayload.success,
+    (finalPayload.say || finalPayload.text || finalPayload.error || "").slice(0, 220)
+  );
+
+  // Use res.json so platforms parse it cleanly
+  res.status(200).json(finalPayload);
 }
 
 function requireEnv(name) {
