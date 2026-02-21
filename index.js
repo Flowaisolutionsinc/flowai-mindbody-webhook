@@ -47,27 +47,49 @@ function decodeMaybe(v) {
   }
 }
 
+/**
+ * ✅ IMPORTANT:
+ * Some platforms do NOT read `say` automatically.
+ * This returns the same spoken text under multiple common keys:
+ * - say / text (your original)
+ * - response / message / output / speech (common webhook conventions)
+ * - results.say/results.text (nested convention)
+ */
 function respondJSON(res, payload) {
-  // Always ensure top-level say/text exist (agent usability)
   const say = safeString(payload?.say);
   const text = safeString(payload?.text);
+  const err = safeString(payload?.error);
+
+  const spoken = say || text || err || "";
 
   const finalPayload = {
     ...payload,
-    say: say || text || "",
-    text: text || say || "",
-    results: payload?.results || { say: say || text || "", text: text || say || "" },
+
+    // your original fields
+    say: spoken,
+    text: spoken,
+
+    // common aliases other tools look for
+    response: spoken,
+    message: spoken,
+    output: spoken,
+    speech: spoken,
+
+    // nested convention
+    results: payload?.results || { say: spoken, text: spoken },
+
+    // sometimes platforms want an explicit "data" bubble (keep yours)
+    data: payload?.data || payload?.data === 0 ? payload.data : payload?.data,
+
+    // sometimes platforms look for "success" boolean
+    success: !!payload?.success,
   };
 
-  // ✅ IMPORTANT: proves the server actually returned something during agent calls
-  console.log(
-    "RESPONDING:",
-    finalPayload.success,
-    finalPayload.say || finalPayload.text || finalPayload.error || "(no message)"
-  );
+  // ✅ This proves what we returned (shows in Railway logs)
+  console.log("RESPONDING:", finalPayload.success, finalPayload.response);
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.status(200).send(JSON.stringify(finalPayload));
+  return res.status(200).json(finalPayload);
 }
 
 function requireEnv(name) {
@@ -679,7 +701,7 @@ app.post("/ghl/mindbody", async (req, res) => {
     if (!liveConfigured) {
       return respondJSON(res, {
         success: false,
-        say: "Mindbody live is not configured yet.",
+       say: "Mindbody live is not configured yet.",
         text: "Mindbody live is not configured yet.",
         error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
         data: { action, mode: "live_unconfigured", studioKey, timezone, source },
