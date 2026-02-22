@@ -1,5 +1,5 @@
 /**
- * Flow AI – Mindbody Webhook (Mock + Live) — PRODUCTION STABLE (DATA-FIRST)
+ * Flow AI – Mindbody Webhook (Mock + Live)
  * - POST /ghl/mindbody
  *
  * Actions:
@@ -54,10 +54,6 @@ function decodeMaybe(v) {
  * - say / text (your original)
  * - response / message / output / speech (common webhook conventions)
  * - results.say/results.text (nested convention)
- *
- * NOTE (B FIX):
- * For schedule, we intentionally keep say/text minimal to prevent LLM hallucinations.
- * The agent must read from data.schedule.classes.
  */
 function respondJSON(res, payload) {
   const say = safeString(payload?.say);
@@ -82,15 +78,14 @@ function respondJSON(res, payload) {
     // nested convention
     results: payload?.results || { say: spoken, text: spoken },
 
-    // explicit data bubble
-    data:
-      payload?.data || payload?.data === 0
-        ? payload.data
-        : payload?.data,
+    // sometimes platforms want an explicit "data" bubble (keep yours)
+    data: payload?.data || payload?.data === 0 ? payload.data : payload?.data,
 
+    // sometimes platforms look for "success" boolean
     success: !!payload?.success,
   };
 
+  // ✅ This proves what we returned (shows in Railway logs)
   console.log("RESPONDING:", finalPayload.success, finalPayload.response);
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -104,12 +99,12 @@ function requireEnv(name) {
 }
 
 function getMindbodyConfig() {
-  const mode = (requireEnv("MINDBODY_MODE") || "mock").toLowerCase();
+  // ✅ DEFAULT TO LIVE (so you don’t accidentally run mock)
+  const mode = (requireEnv("MINDBODY_MODE") || "live").toLowerCase();
+
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const siteId = requireEnv("MINDBODY_SITE_ID");
-  const baseUrl =
-    requireEnv("MINDBODY_BASE_URL") ||
-    "https://api.mindbodyonline.com/public/v6";
+  const baseUrl = requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
 
   const tokenUsername = requireEnv("MINDBODY_TOKEN_USERNAME");
   const tokenPassword = requireEnv("MINDBODY_TOKEN_PASSWORD");
@@ -145,6 +140,7 @@ function addDaysISO(iso, days) {
 }
 
 function compareISO(a, b) {
+  // ISO yyyy-mm-dd lexicographic compare works
   if (a === b) return 0;
   return a < b ? -1 : 1;
 }
@@ -154,156 +150,146 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
   const todayISO = getTodayISOInTZ(tz);
 
-  const phrase = decodeMaybe(datePhraseRaw).trim().toLowerCase();
-  if (!phrase) return { ok: false, reason: "missing date phrase" };
+  const phraseRaw = decodeMaybe(datePhraseRaw).trim().toLowerCase();
+  if (!phraseRaw) return { ok: false, reason: "missing date phrase" };
 
+  // ✅ Extract time-of-day modifiers (morning/afternoon/evening/tonight/later),
+  // then parse the remaining date phrase.
+  let timeOfDay = null; // "morning" | "afternoon" | "evening"
+  let phrase = phraseRaw;
+
+  if (/\bmorning\b/.test(phrase)) timeOfDay = "morning";
+  if (/\bafternoon\b/.test(phrase)) timeOfDay = "afternoon";
+  if (/\bevening\b|\btonight\b|\blater\b/.test(phrase)) timeOfDay = "evening";
+
+  phrase = phrase
+    .replace(/\b(morning|afternoon|evening|tonight|later)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Common
   if (phrase === "today") {
-    return { ok: true, requestedDate: todayISO, todayISO, daysAhead: 0 };
+    return { ok: true, requestedDate: todayISO, todayISO, daysAhead: 0, timeOfDay };
   }
   if (phrase === "tomorrow") {
-    return {
-      ok: true,
-      requestedDate: addDaysISO(todayISO, 1),
-      todayISO,
-      daysAhead: 1,
-    };
+    return { ok: true, requestedDate: addDaysISO(todayISO, 1), todayISO, daysAhead: 1, timeOfDay };
   }
 
   // YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(phrase)) {
     const daysAhead = Math.round(
-      (Date.parse(phrase + "T00:00:00Z") -
-        Date.parse(todayISO + "T00:00:00Z")) /
-        86400000
+      (Date.parse(phrase + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
     );
-    return { ok: true, requestedDate: phrase, todayISO, daysAhead };
+    return { ok: true, requestedDate: phrase, todayISO, daysAhead, timeOfDay };
   }
 
   // Handle "this friday" / "next friday"
-  const weekdays = [
-    "sunday",
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-  ];
-  const mThisNext = phrase.match(
-    /^(this|next)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/
-  );
+  const weekdays = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+  const mThisNext = phrase.match(/^(this|next)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
   if (mThisNext) {
     const which = mThisNext[1];
     const wdName = mThisNext[2];
     const wdIndex = weekdays.indexOf(wdName);
 
     const now = new Date();
-    const dtf = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      weekday: "long",
-    });
+    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
     const todayName = dtf.format(now).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
 
     let delta = (wdIndex - todayIdx + 7) % 7;
-    if (delta === 0) delta = 7;
-    if (which === "next") delta += 7;
+    if (delta === 0) delta = 7; // next occurrence
+    if (which === "next") delta += 7; // push one more week
 
     const requestedDate = addDaysISO(todayISO, delta);
-    return { ok: true, requestedDate, todayISO, daysAhead: delta };
+    return { ok: true, requestedDate, todayISO, daysAhead: delta, timeOfDay };
   }
 
   // Simple weekday ("friday" => next occurrence)
   const wdIndex = weekdays.indexOf(phrase);
   if (wdIndex !== -1) {
     const now = new Date();
-    const dtf = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      weekday: "long",
-    });
+    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
     const todayName = dtf.format(now).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
 
     let delta = (wdIndex - todayIdx + 7) % 7;
     if (delta === 0) delta = 7;
-
     const requestedDate = addDaysISO(todayISO, delta);
-    return { ok: true, requestedDate, todayISO, daysAhead: delta };
+    return { ok: true, requestedDate, todayISO, daysAhead: delta, timeOfDay };
   }
 
   // Handle "on the 17th" / "17th"
-  const dayOnly = phrase
-    .replace(/^on\s+the\s+/, "")
-    .replace(/(\d+)(st|nd|rd|th)$/g, "$1");
+  const dayOnly = phrase.replace(/^on\s+the\s+/, "").replace(/(\d+)(st|nd|rd|th)$/g, "$1");
   if (/^\d{1,2}$/.test(dayOnly)) {
     const dayNum = parseInt(dayOnly, 10);
     const [y, m] = todayISO.split("-").map((x) => parseInt(x, 10));
 
-    const candidateThisMonth = `${y}-${String(m).padStart(2, "0")}-${String(
-      dayNum
-    ).padStart(2, "0")}`;
+    const candidateThisMonth = `${y}-${String(m).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
     let requestedDate = candidateThisMonth;
 
+    // If already passed, move to next month
     if (compareISO(requestedDate, todayISO) < 0) {
-      const nextMonthDate = addDaysISO(
-        `${y}-${String(m).padStart(2, "0")}-01`,
-        32
-      );
+      const nextMonthDate = addDaysISO(`${y}-${String(m).padStart(2, "0")}-01`, 32); // jump into next month
       const [ny, nm] = nextMonthDate.split("-").map((x) => parseInt(x, 10));
-      requestedDate = `${ny}-${String(nm).padStart(2, "0")}-${String(
-        dayNum
-      ).padStart(2, "0")}`;
+      requestedDate = `${ny}-${String(nm).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
     }
 
     const daysAhead = Math.round(
-      (Date.parse(requestedDate + "T00:00:00Z") -
-        Date.parse(todayISO + "T00:00:00Z")) /
-        86400000
+      (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
     );
-    return { ok: true, requestedDate, todayISO, daysAhead };
+    return { ok: true, requestedDate, todayISO, daysAhead, timeOfDay };
   }
 
   // Handle "February 24th" / "Feb 24"
   const cleaned = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1");
   const monthNames = [
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
+    "january","february","march","april","may","june",
+    "july","august","september","october","november","december"
   ];
-  const monthShort = monthNames.map((x) => x.slice(0, 3));
+  const monthShort = monthNames.map((x) => x.slice(0,3));
   const md = cleaned.match(/^([a-z]+)\s+(\d{1,2})$/);
   if (md) {
     const monRaw = md[1];
     const dayNum = parseInt(md[2], 10);
     let monIdx = monthNames.indexOf(monRaw);
-    if (monIdx === -1) monIdx = monthShort.indexOf(monRaw.slice(0, 3));
+    if (monIdx === -1) monIdx = monthShort.indexOf(monRaw.slice(0,3));
     if (monIdx !== -1) {
       const [y] = todayISO.split("-").map((x) => parseInt(x, 10));
-      let requestedDate = `${y}-${String(monIdx + 1).padStart(2, "0")}-${String(
-        dayNum
-      ).padStart(2, "0")}`;
+      let requestedDate = `${y}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
 
+      // If date already passed this year, bump to next year
       if (compareISO(requestedDate, todayISO) < 0) {
-        requestedDate = `${y + 1}-${String(monIdx + 1).padStart(2, "0")}-${String(
-          dayNum
-        ).padStart(2, "0")}`;
+        requestedDate = `${y + 1}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
       }
 
       const daysAhead = Math.round(
-        (Date.parse(requestedDate + "T00:00:00Z") -
-          Date.parse(todayISO + "T00:00:00Z")) /
-          86400000
+        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
       );
-      return { ok: true, requestedDate, todayISO, daysAhead };
+      return { ok: true, requestedDate, todayISO, daysAhead, timeOfDay };
+    }
+  }
+
+  // ✅ Handle "February 22, 2026" / "Feb 22, 2026" / "February 22nd, 2026"
+  const cleaned2 = phrase
+    .replace(/(\d+)(st|nd|rd|th)/g, "$1")
+    .replace(/,/g, "")
+    .trim();
+
+  const mdy = cleaned2.match(/^([a-z]+)\s+(\d{1,2})\s+(\d{4})$/);
+  if (mdy) {
+    const monRaw = mdy[1];
+    const dayNum = parseInt(mdy[2], 10);
+    const yearNum = parseInt(mdy[3], 10);
+
+    let monIdx = monthNames.indexOf(monRaw);
+    if (monIdx === -1) monIdx = monthShort.indexOf(monRaw.slice(0, 3));
+
+    if (monIdx !== -1) {
+      const requestedDate = `${yearNum}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
+      const daysAhead = Math.round(
+        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
+      );
+      return { ok: true, requestedDate, todayISO, daysAhead, timeOfDay };
     }
   }
 
@@ -322,90 +308,37 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
-// ---------------------------
-// Time-of-day filtering (server-side)
-// ---------------------------
-// Morning: before 12:00 PM
-// Afternoon: 12:00 PM to before 5:00 PM
-// Evening: 5:00 PM and later
-function parseTimeToMinutes(timeStr) {
-  const s = safeString(timeStr).trim();
-  if (!s) return null;
-
-  // e.g. "8:30 AM", "12:15 PM", "7:00 PM"
-  const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
-  if (!m) return null;
-
-  let hh = parseInt(m[1], 10);
-  const mm = parseInt(m[2] || "0", 10);
-  const ap = m[3].toUpperCase();
-
-  if (ap === "AM") {
-    if (hh === 12) hh = 0;
-  } else {
-    if (hh !== 12) hh += 12;
+// ✅ UPDATED for PERFECT voice delivery: structured lines with \n
+function buildScheduleSay(spokenDateLabel, classes) {
+  if (!classes || classes.length === 0) {
+    return `I couldn’t find any classes for ${spokenDateLabel}.\nWould you like a different date?`;
   }
 
-  return hh * 60 + mm;
-}
+  const lines = [];
+  lines.push(`Here are the classes for ${spokenDateLabel}.`);
 
-function filterClassesByTimeOfDay(classes, timeOfDayRaw) {
-  const tod = safeString(timeOfDayRaw).trim().toLowerCase();
-  if (!tod || tod === "full_day" || tod === "all" || tod === "any") return classes;
+  const safeClasses = Array.isArray(classes) ? classes.slice(0) : [];
+  for (const c of safeClasses) {
+    const time = c?.time || "Time TBD";
+    const name = c?.name || "Class";
+    const instructor = c?.instructor ? ` with ${c.instructor}` : "";
+    lines.push(`${time} — ${name}${instructor}.`);
+  }
 
-  const morningEnd = 12 * 60; // 12:00 PM
-  const afternoonEnd = 17 * 60; // 5:00 PM
-
-  return (classes || []).filter((c) => {
-    const mins = parseTimeToMinutes(c?.time);
-    if (mins === null) return true; // if unknown, keep rather than drop
-    if (tod === "morning") return mins < morningEnd;
-    if (tod === "afternoon") return mins >= morningEnd && mins < afternoonEnd;
-    if (tod === "evening") return mins >= afternoonEnd;
-    return true;
-  });
+  lines.push(`Which class would you like to book?`);
+  return lines.join("\n");
 }
 
 // ---------------------------
-// MOCK schedule
+// MOCK schedule (only used if MINDBODY_MODE=mock)
 // ---------------------------
 function buildMockSchedule(requestedDate) {
   return [
-    {
-      id: `mock_${requestedDate.replaceAll("-", "")}_1`,
-      name: "Hot Yoga (Mock)",
-      time: "6:00 AM",
-      instructor: "Mock Instructor",
-      bookable: true,
-    },
-    {
-      id: `mock_${requestedDate.replaceAll("-", "")}_2`,
-      name: "Hot Pilates (Mock)",
-      time: "9:00 AM",
-      instructor: "Mock Instructor",
-      bookable: true,
-    },
-    {
-      id: `mock_${requestedDate.replaceAll("-", "")}_3`,
-      name: "Warm Yin (Mock)",
-      time: "12:00 PM",
-      instructor: "Mock Instructor",
-      bookable: true,
-    },
-    {
-      id: `mock_${requestedDate.replaceAll("-", "")}_4`,
-      name: "Hot Yoga (Mock)",
-      time: "5:30 PM",
-      instructor: "Mock Instructor",
-      bookable: true,
-    },
-    {
-      id: `mock_${requestedDate.replaceAll("-", "")}_5`,
-      name: "Hot Sculpt (Mock)",
-      time: "7:00 PM",
-      instructor: "Mock Instructor",
-      bookable: true,
-    },
+    { id: `mock_${requestedDate.replaceAll("-", "")}_1`, name: "Hot Yoga (Mock)", time: "6:00 AM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-", "")}_2`, name: "Hot Pilates (Mock)", time: "9:00 AM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-", "")}_3`, name: "Warm Yin (Mock)", time: "12:00 PM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-", "")}_4`, name: "Hot Yoga (Mock)", time: "5:30 PM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-", "")}_5`, name: "Hot Sculpt (Mock)", time: "7:00 PM", instructor: "Mock Instructor", bookable: true },
   ];
 }
 
@@ -419,15 +352,8 @@ function toMindbodyTimeWindow(dateISO) {
   };
 }
 
-/**
- * Normalize Mindbody classes to:
- * { id, name, time, instructor, bookable }
- * AND format time in the caller/studio timezone.
- */
-function normalizeMindbodyClasses(rawClasses, timeZone) {
-  const tz = decodeMaybe(timeZone) || "America/Vancouver";
+function normalizeMindbodyClasses(rawClasses) {
   const out = [];
-
   for (const c of rawClasses || []) {
     const name =
       c?.ClassDescription?.Name ||
@@ -447,64 +373,29 @@ function normalizeMindbodyClasses(rawClasses, timeZone) {
     if (startDateTime) {
       const dt = new Date(startDateTime);
       if (!Number.isNaN(dt.getTime())) {
-        time = new Intl.DateTimeFormat("en-US", {
-          timeZone: tz,
-          hour: "numeric",
-          minute: "2-digit",
-        }).format(dt);
+        time = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(dt);
       } else {
         time = String(startDateTime);
       }
     }
 
-    const instructor =
-      c?.Staff?.Name ||
-      c?.Staff?.FirstName ||
-      c?.InstructorName ||
-      "";
-
-    const id =
-      c?.Id ||
-      c?.ClassId ||
-      c?.ClassScheduleId ||
-      c?.ClassInstanceId ||
-      `class_${Math.random().toString(16).slice(2)}`;
+    const instructor = c?.Staff?.Name || c?.Staff?.FirstName || c?.InstructorName || "";
+    const id = c?.Id || c?.ClassId || c?.ClassScheduleId || c?.ClassInstanceId || `class_${Math.random().toString(16).slice(2)}`;
 
     const bookable =
-      typeof c?.IsAvailable === "boolean"
-        ? c.IsAvailable
-        : typeof c?.Bookable === "boolean"
-          ? c.Bookable
-          : true;
+      typeof c?.IsAvailable === "boolean" ? c.IsAvailable :
+      typeof c?.Bookable === "boolean" ? c.Bookable :
+      true;
 
-    out.push({
-      id: String(id),
-      name,
-      time: time || "Time TBD",
-      instructor: instructor || "",
-      bookable,
-    });
+    out.push({ id: String(id), name, time: time || "Time TBD", instructor: instructor || "", bookable });
   }
-
-  // Sort by time (best-effort)
-  out.sort((a, b) => {
-    const am = parseTimeToMinutes(a.time);
-    const bm = parseTimeToMinutes(b.time);
-    if (am === null && bm === null) return 0;
-    if (am === null) return 1;
-    if (bm === null) return -1;
-    return am - bm;
-  });
-
   return out;
 }
 
-async function fetchMindbodyScheduleForDate(cfg, dateISO, timeZone) {
+async function fetchMindbodyScheduleForDate(cfg, dateISO) {
   const { start, end } = toMindbodyTimeWindow(dateISO);
 
-  const url = new URL(
-    `${cfg.baseUrl.replace(/\/$/, "")}/class/classes`
-  );
+  const url = new URL(`${cfg.baseUrl.replace(/\/$/, "")}/class/classes`);
   url.searchParams.set("StartDateTime", start);
   url.searchParams.set("EndDateTime", end);
 
@@ -519,31 +410,44 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO, timeZone) {
 
   const text = await resp.text();
   let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {}
+  try { json = JSON.parse(text); } catch {}
 
   if (!resp.ok) {
-    const msg =
-      json?.Error?.Message ||
-      json?.Message ||
-      text ||
-      `HTTP ${resp.status}`;
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
     throw new Error(`Mindbody schedule error (${resp.status}): ${msg}`);
   }
 
-  const rawClasses =
-    json?.Classes ||
-    json?.classes ||
-    json?.Items ||
-    json?.items ||
-    json ||
-    [];
+  const rawClasses = json?.Classes || json?.classes || json?.Items || json?.items || json || [];
+  return { raw: json, classes: normalizeMindbodyClasses(rawClasses) };
+}
 
-  return {
-    raw: json,
-    classes: normalizeMindbodyClasses(rawClasses, timeZone),
-  };
+// ---------------------------
+// Time-of-day filtering (morning/afternoon/evening)
+// ---------------------------
+function timeStringToMinutes(t) {
+  const s = String(t || "");
+  const m = s.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!m) return null;
+  let hh = parseInt(m[1], 10);
+  const mm = parseInt(m[2], 10);
+  const ap = m[3].toUpperCase();
+  if (ap === "PM" && hh !== 12) hh += 12;
+  if (ap === "AM" && hh === 12) hh = 0;
+  return hh * 60 + mm;
+}
+
+function filterClassesByTimeOfDay(classes, timeOfDay) {
+  if (!timeOfDay) return classes;
+
+  return (classes || []).filter((c) => {
+    const mins = timeStringToMinutes(c?.time);
+    if (mins === null) return false;
+
+    if (timeOfDay === "morning") return mins < 12 * 60;
+    if (timeOfDay === "afternoon") return mins >= 12 * 60 && mins < 17 * 60;
+    if (timeOfDay === "evening") return mins >= 17 * 60;
+    return true;
+  });
 }
 
 // ---------------------------
@@ -553,8 +457,7 @@ let tokenCache = { value: null, expiresAt: 0 };
 
 async function getMindbodyUserToken(cfg) {
   const now = Date.now();
-  if (tokenCache.value && tokenCache.expiresAt > now + 5 * 60 * 1000)
-    return tokenCache.value;
+  if (tokenCache.value && tokenCache.expiresAt > now + 5 * 60 * 1000) return tokenCache.value;
 
   if (!cfg.tokenUsername || !cfg.tokenPassword) return null;
 
@@ -566,29 +469,21 @@ async function getMindbodyUserToken(cfg) {
       "SiteId": cfg.siteId,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      Username: cfg.tokenUsername,
-      Password: cfg.tokenPassword,
-    }),
+    body: JSON.stringify({ Username: cfg.tokenUsername, Password: cfg.tokenPassword }),
   });
 
   const text = await resp.text();
   let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {}
+  try { json = JSON.parse(text); } catch {}
 
   if (!resp.ok) {
-    const msg =
-      json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
     throw new Error(`Mindbody token error (${resp.status}): ${msg}`);
   }
 
-  const accessToken =
-    json?.AccessToken || json?.access_token || json?.Token || json?.token;
+  const accessToken = json?.AccessToken || json?.access_token || json?.Token || json?.token;
   const expiresIn = Number(json?.ExpiresIn || json?.expires_in || 3600);
-  if (!accessToken)
-    throw new Error("Mindbody token error: missing AccessToken in response");
+  if (!accessToken) throw new Error("Mindbody token error: missing AccessToken in response");
 
   tokenCache.value = accessToken;
   tokenCache.expiresAt = Date.now() + expiresIn * 1000;
@@ -598,8 +493,7 @@ async function getMindbodyUserToken(cfg) {
 async function mbGet(cfg, path, token, paramsObj = {}) {
   const url = new URL(`${cfg.baseUrl.replace(/\/$/, "")}${path}`);
   for (const [k, v] of Object.entries(paramsObj)) {
-    if (v !== undefined && v !== null && String(v).trim() !== "")
-      url.searchParams.set(k, String(v));
+    if (v !== undefined && v !== null && String(v).trim() !== "") url.searchParams.set(k, String(v));
   }
 
   const headers = {
@@ -612,13 +506,10 @@ async function mbGet(cfg, path, token, paramsObj = {}) {
   const resp = await fetch(url.toString(), { method: "GET", headers });
   const text = await resp.text();
   let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {}
+  try { json = JSON.parse(text); } catch {}
 
   if (!resp.ok) {
-    const msg =
-      json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
     throw new Error(`Mindbody GET ${path} error (${resp.status}): ${msg}`);
   }
   return json;
@@ -642,13 +533,10 @@ async function mbPost(cfg, path, token, bodyObj = {}) {
 
   const text = await resp.text();
   let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {}
+  try { json = JSON.parse(text); } catch {}
 
   if (!resp.ok) {
-    const msg =
-      json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
+    const msg = json?.Error?.Message || json?.Message || text || `HTTP ${resp.status}`;
     throw new Error(`Mindbody POST ${path} error (${resp.status}): ${msg}`);
   }
   return json;
@@ -664,20 +552,12 @@ async function findClientId(cfg, token, email, phone) {
   const searchText = email || phone || "";
   if (!searchText) return null;
 
-  const json = await mbGet(cfg, "/client/clients", token, {
-    SearchText: searchText,
-    Limit: 10,
-    Offset: 0,
-  });
-
+  const json = await mbGet(cfg, "/client/clients", token, { SearchText: searchText, Limit: 10, Offset: 0 });
   const clients = json?.Clients || json?.clients || [];
   if (!Array.isArray(clients) || clients.length === 0) return null;
 
   if (email) {
-    const exact = clients.find(
-      (c) =>
-        (c?.Email || c?.email || "").toLowerCase() === email.toLowerCase()
-    );
+    const exact = clients.find((c) => (c?.Email || c?.email || "").toLowerCase() === email.toLowerCase());
     if (exact?.Id) return String(exact.Id);
   }
 
@@ -717,26 +597,15 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   // Core
   const action = decodeMaybe(q.action ?? b.action).trim() || "ping";
-  const studioKey =
-    decodeMaybe(q.studioKey ?? b.studioKey).trim() || "oxygen_roundhouse";
-  const timezone =
-    decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
+  const studioKey = decodeMaybe(q.studioKey ?? b.studioKey).trim() || "oxygen_roundhouse";
+  const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
-
-  // Optional time filter (B FIX)
-  // Accepts: morning | afternoon | evening | full_day
-  const timeOfDay =
-    decodeMaybe(q.timeOfDay ?? b.timeOfDay ?? q.time_frame ?? b.time_frame).trim() ||
-    "full_day";
 
   // Date (supports multiple aliases)
   const dateParamRaw =
-    q.date ??
-    b.date ??
-    q.datePhrase ??
-    b.datePhrase ??
-    q.dateParam ??
-    b.dateParam;
+    q.date ?? b.date ??
+    q.datePhrase ?? b.datePhrase ??
+    q.dateParam ?? b.dateParam;
 
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
 
@@ -744,24 +613,26 @@ app.post("/ghl/mindbody", async (req, res) => {
   const classId = decodeMaybe(q.classId ?? b.classId).trim();
 
   const firstName = decodeMaybe(
-    q.firstName ?? b.firstName ?? q.client_first_name ?? b.client_first_name
+    q.firstName ?? b.firstName ??
+    q.client_first_name ?? b.client_first_name
   ).trim();
 
   const lastName = decodeMaybe(
-    q.lastName ?? b.lastName ?? q.client_last_name ?? b.client_last_name
+    q.lastName ?? b.lastName ??
+    q.client_last_name ?? b.client_last_name
   ).trim();
 
   const email = decodeMaybe(q.email ?? b.email).trim();
 
   const phone = normalizePhone(
-    q.phone ?? b.phone ?? q.mobilephone ?? b.mobilephone
+    q.phone ?? b.phone ??
+    q.mobilephone ?? b.mobilephone
   );
 
   const isNewClientRaw = decodeMaybe(
-    q.isNewClient ?? b.isNewClient ?? q.is_new_client ?? b.is_new_client
-  )
-    .trim()
-    .toLowerCase();
+    q.isNewClient ?? b.isNewClient ??
+    q.is_new_client ?? b.is_new_client
+  ).trim().toLowerCase();
 
   console.log("--------------------------------------------------");
   console.log("POST /ghl/mindbody");
@@ -782,13 +653,9 @@ app.post("/ghl/mindbody", async (req, res) => {
   const liveConfigured = cfg.apiKey && cfg.siteId && cfg.baseUrl;
 
   // ---------------------------
-  // GET SCHEDULE (DATA-FIRST)
+  // GET SCHEDULE
   // ---------------------------
-  if (
-    action === "get_schedule" ||
-    action === "get_schedule_web" ||
-    action === "get_schedule_by_date"
-  ) {
+  if (action === "get_schedule" || action === "get_schedule_web" || action === "get_schedule_by_date") {
     const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
     if (!resolved.ok) {
       return respondJSON(res, {
@@ -796,23 +663,25 @@ app.post("/ghl/mindbody", async (req, res) => {
         say: "",
         text: "",
         error: `Could not parse date: ${resolved.reason}`,
-        data: { action, studioKey, timezone, source, datePhraseRaw, timeOfDay },
+        data: { action, studioKey, timezone, source, datePhraseRaw },
       });
     }
 
-    const requestedDate = resolved.requestedDate;
-    const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
-
-    // MOCK
+    // MOCK mode (optional)
     if (cfg.mode !== "live") {
-      const classesAll = buildMockSchedule(requestedDate);
-      const classes = filterClassesByTimeOfDay(classesAll, timeOfDay);
+      const requestedDate = resolved.requestedDate;
+      const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
+      let classes = buildMockSchedule(requestedDate);
 
-      // B FIX: keep say/text minimal for schedule to force agent to read structured data
+      // ✅ filter mock classes too if caller asked morning/afternoon/evening
+      classes = filterClassesByTimeOfDay(classes, resolved.timeOfDay);
+
+      const say = buildScheduleSay(spokenDate, classes);
+
       return respondJSON(res, {
         success: true,
-        say: "Schedule retrieved.",
-        text: "Schedule retrieved.",
+        say,
+        text: say,
         data: {
           action: "get_schedule",
           mode: "mock",
@@ -820,46 +689,39 @@ app.post("/ghl/mindbody", async (req, res) => {
           timezone,
           source,
           requestedDate,
-          timeOfDay,
+          timeOfDay: resolved.timeOfDay || null,
           schedule: { studioKey, timezone, date: requestedDate, spokenDate, classes },
         },
       });
     }
 
-    // LIVE
+    // LIVE mode
     if (!liveConfigured) {
       return respondJSON(res, {
         success: false,
         say: "",
         text: "",
-        error:
-          "Mindbody LIVE not configured. Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
-        data: {
-          action: "get_schedule",
-          mode: "live_unconfigured",
-          studioKey,
-          timezone,
-          source,
-          timeOfDay,
-        },
+        error: "Mindbody LIVE not configured. Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
+        data: { action: "get_schedule", mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
 
     try {
-      const schedule = await fetchMindbodyScheduleForDate(
-        cfg,
-        requestedDate,
-        timezone
-      );
+      const requestedDate = resolved.requestedDate;
+      const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
 
-      const classesAll = schedule.classes;
-      const classes = filterClassesByTimeOfDay(classesAll, timeOfDay);
+      const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
+      let classes = schedule.classes;
 
-      // B FIX: keep say/text minimal for schedule to prevent hallucinations
+      // ✅ IMPORTANT: filter if caller asked morning/afternoon/evening
+      classes = filterClassesByTimeOfDay(classes, resolved.timeOfDay);
+
+      const say = buildScheduleSay(spokenDate, classes);
+
       return respondJSON(res, {
         success: true,
-        say: "Schedule retrieved.",
-        text: "Schedule retrieved.",
+        say,
+        text: say,
         data: {
           action: "get_schedule",
           mode: "live",
@@ -867,7 +729,7 @@ app.post("/ghl/mindbody", async (req, res) => {
           timezone,
           source,
           requestedDate,
-          timeOfDay,
+          timeOfDay: resolved.timeOfDay || null,
           schedule: { studioKey, timezone, date: requestedDate, spokenDate, classes },
         },
       });
@@ -878,15 +740,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         say: "",
         text: "",
         error: err?.message || "Mindbody live schedule error",
-        data: {
-          action: "get_schedule",
-          mode: "live_error",
-          studioKey,
-          timezone,
-          source,
-          datePhraseRaw,
-          timeOfDay,
-        },
+        data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw },
       });
     }
   }
@@ -931,23 +785,12 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           say: "Booking isn’t enabled yet on our side.",
           text: "Booking isn’t enabled yet on our side.",
-          error:
-            "Booking requires Mindbody user token credentials. Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
-          data: {
-            action,
-            mode: "live_missing_token_creds",
-            studioKey,
-            timezone,
-            source,
-            classId,
-          },
+          error: "Booking requires Mindbody user token credentials. Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
+          data: { action, mode: "live_missing_token_creds", studioKey, timezone, source, classId },
         });
       }
 
-      const isNewClient =
-        isNewClientRaw === "true" ||
-        isNewClientRaw === "yes" ||
-        isNewClientRaw === "1";
+      const isNewClient = (isNewClientRaw === "true" || isNewClientRaw === "yes" || isNewClientRaw === "1");
 
       let clientId = await findClientId(cfg, token, email, phone);
 
@@ -958,8 +801,7 @@ app.post("/ghl/mindbody", async (req, res) => {
             success: false,
             say: "I just need your first and last name to complete the booking.",
             text: "I just need your first and last name to complete the booking.",
-            error:
-              "No existing client found; missing firstName/lastName to create new client.",
+            error: "No existing client found; missing firstName/lastName to create new client.",
             data: { action, studioKey, timezone, source, classId, email, phone },
           });
         }
@@ -969,10 +811,9 @@ app.post("/ghl/mindbody", async (req, res) => {
 
       await bookClientIntoClass(cfg, token, clientId, classId);
 
-      const say =
-        created || isNewClient
-          ? "You’re booked! I’ll also send you a waiver link right after this call to complete before class."
-          : "You’re booked! Anything else I can help you with?";
+      const say = (created || isNewClient)
+        ? "You’re booked! I’ll also send you a waiver link right after this call to complete before class."
+        : "You’re booked! Anything else I can help you with?";
 
       return respondJSON(res, {
         success: true,
@@ -984,13 +825,7 @@ app.post("/ghl/mindbody", async (req, res) => {
           studioKey,
           timezone,
           source,
-          booking: {
-            classId: String(classId),
-            clientId: String(clientId),
-            createdClient: created,
-            email,
-            phone,
-          },
+          booking: { classId: String(classId), clientId: String(clientId), createdClient: created, email, phone },
         },
       });
     } catch (err) {
@@ -1045,16 +880,8 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           say: "Canceling isn’t enabled yet on our side.",
           text: "Canceling isn’t enabled yet on our side.",
-          error:
-            "Canceling requires Mindbody user token credentials. Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
-          data: {
-            action,
-            mode: "live_missing_token_creds",
-            studioKey,
-            timezone,
-            source,
-            classId,
-          },
+          error: "Canceling requires Mindbody user token credentials. Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
+          data: { action, mode: "live_missing_token_creds", studioKey, timezone, source, classId },
         });
       }
 
