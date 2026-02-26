@@ -19,7 +19,7 @@
  *   MINDBODY_TOKEN_PASSWORD
  *
  * Returns voice-agent-friendly payload:
- *  { success, say, text, results:{say,text}, data:{...} }
+ *  { success, response, results:{say,text}, data:{...}, error:"" }
  */
 
 const express = require("express");
@@ -56,54 +56,38 @@ function normalizeTimeOfDay(v) {
 }
 
 /**
- * ✅ IMPORTANT:
- * Some platforms do NOT read `say` automatically.
- * This returns the same spoken text under multiple common keys.
- *
- * ✅ NEW:
- * Also sets `body` and `result` because some platforms surface tool output there.
- * Also sets `ok` because some platforms expect that convention.
+ * ✅ UPDATED RESPONDER (VOICE-SAFE)
+ * - Keep payload small + predictable
+ * - Provide ONE canonical spoken field: `response`
+ * - Provide backup nested: `results.say` / `results.text`
+ * - Cap spoken content so Voice AI doesn't truncate/fail
  */
 function respondJSON(res, payload) {
-  const say = safeString(payload?.say);
-  const text = safeString(payload?.text);
-  const err = safeString(payload?.error);
+  const say = safeString(payload?.say || payload?.text || payload?.error || "");
 
-  const spoken = say || text || err || "";
-
-  const isSuccess = payload?.success === true;
+  const MAX = 900;
+  const spoken = say.length > MAX ? say.slice(0, MAX - 3) + "..." : say;
 
   const finalPayload = {
-    ...payload,
+    success: !!payload?.success,
 
-    // canonical fields
-    success: isSuccess,
-    ok: isSuccess,
-
-    // your original fields (force spoken string)
-    say: spoken,
-    text: spoken,
-
-    // common aliases other tools look for
+    // ONE canonical spoken field
     response: spoken,
-    message: spoken,
-    output: spoken,
-    speech: spoken,
 
-    // ✅ critical: some platforms surface output here
-    body: spoken,
-    result: spoken,
+    // backup field some platforms prefer
+    results: { say: spoken, text: spoken },
 
-    // nested convention
-    results: payload?.results || { say: spoken, text: spoken },
+    // keep your structured data
+    data: payload?.data ?? null,
 
-    data:
-      payload?.data || payload?.data === 0
-        ? payload.data
-        : payload?.data,
+    error: payload?.error ? safeString(payload.error) : "",
   };
 
-  console.log("RESPONDING:", finalPayload.success, finalPayload.response);
+  console.log(
+    "RESPONDING:",
+    finalPayload.success,
+    (finalPayload.response || "").slice(0, 120)
+  );
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   return res.status(200).json(finalPayload);
@@ -121,8 +105,7 @@ function getMindbodyConfig() {
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const siteId = requireEnv("MINDBODY_SITE_ID");
   const baseUrl =
-    requireEnv("MINDBODY_BASE_URL") ||
-    "https://api.mindbodyonline.com/public/v6";
+    requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
 
   const tokenUsername = requireEnv("MINDBODY_TOKEN_USERNAME");
   const tokenPassword = requireEnv("MINDBODY_TOKEN_PASSWORD");
@@ -204,8 +187,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(phrase)) {
     const daysAhead = Math.round(
-      (Date.parse(phrase + "T00:00:00Z") -
-        Date.parse(todayISO + "T00:00:00Z")) /
+      (Date.parse(phrase + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) /
         86400000
     );
     return { ok: true, requestedDate: phrase, todayISO, daysAhead, extractedTimeOfDay };
@@ -229,10 +211,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     const wdIndex = weekdays.indexOf(wdName);
 
     const now = new Date();
-    const dtf = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      weekday: "long",
-    });
+    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
     const todayName = dtf.format(now).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
 
@@ -247,10 +226,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const wdIndex = weekdays.indexOf(phrase);
   if (wdIndex !== -1) {
     const now = new Date();
-    const dtf = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      weekday: "long",
-    });
+    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
     const todayName = dtf.format(now).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
 
@@ -278,8 +254,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     }
 
     const daysAhead = Math.round(
-      (Date.parse(requestedDate + "T00:00:00Z") -
-        Date.parse(todayISO + "T00:00:00Z")) /
+      (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) /
         86400000
     );
     return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
@@ -315,8 +290,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
         requestedDate = `${y + 1}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
       }
       const daysAhead = Math.round(
-        (Date.parse(requestedDate + "T00:00:00Z") -
-          Date.parse(todayISO + "T00:00:00Z")) /
+        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) /
           86400000
       );
       return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
@@ -341,8 +315,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     if (monIdx !== -1) {
       const requestedDate = `${yearNum}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
       const daysAhead = Math.round(
-        (Date.parse(requestedDate + "T00:00:00Z") -
-          Date.parse(todayISO + "T00:00:00Z")) /
+        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) /
           86400000
       );
       return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
@@ -367,7 +340,7 @@ function buildSpokenDateLabel(dateISO, timeZone) {
 /**
  * ✅ FIXED:
  * - NO "Which class would you like to book?" in the webhook message.
- *   Your prompt handles follow-up.
+ *   Your prompt handles the follow-up question AFTER speaking tool output.
  */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
@@ -504,7 +477,8 @@ function filterClassesByTimeOfDay(classes, timeOfDay) {
 }
 
 /**
- * ✅ Sort classes by time (earliest -> latest)
+ * ✅ STEP A FIX:
+ * Sort classes by time (earliest -> latest) so the webhook "say" is already perfect.
  */
 function sortClassesByStartTime(classes) {
   const arr = Array.isArray(classes) ? classes : [];
@@ -646,12 +620,12 @@ async function createClient(cfg, token, firstName, lastName, email, phone) {
   return String(id);
 }
 
-async function bookClientIntoClass(cfg, token, classId, clientId) {
+async function bookClientIntoClass(cfg, token, clientId, classId) {
   const payload = { ClientId: clientId, ClassId: Number(classId) };
   return await mbPost(cfg, "/class/addclienttoclass", token, payload);
 }
 
-async function cancelClientFromClass(cfg, token, classId, clientId) {
+async function cancelClientFromClass(cfg, token, clientId, classId) {
   const payload = { ClientId: clientId, ClassId: Number(classId) };
   return await mbPost(cfg, "/class/removeclientfromclass", token, payload);
 }
@@ -668,6 +642,7 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
 
+  // NEW: timeOfDay param can be passed explicitly (preferred)
   const timeOfDayParam = normalizeTimeOfDay(q.timeOfDay ?? b.timeOfDay);
 
   const dateParamRaw =
@@ -677,6 +652,7 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
 
+  // Booking/Cancellation
   const classId = decodeMaybe(q.classId ?? b.classId).trim();
 
   const firstName = decodeMaybe(
@@ -728,6 +704,7 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     }
 
+    // Preferred explicit param; fallback to extraction from date phrase
     const finalTimeOfDay = timeOfDayParam || resolved.extractedTimeOfDay || null;
 
     if (cfg.mode !== "live") {
@@ -737,6 +714,7 @@ app.post("/ghl/mindbody", async (req, res) => {
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
+      // ✅ FIX: if no classes, return success:false so voice prompt doesn't ask booking question
       if (!classes || classes.length === 0) {
         const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
         return respondJSON(res, {
@@ -791,6 +769,7 @@ app.post("/ghl/mindbody", async (req, res) => {
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
+      // ✅ FIX: if no classes, return success:false so voice prompt doesn't ask booking question
       if (!classes || classes.length === 0) {
         const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
         return respondJSON(res, {
@@ -831,6 +810,8 @@ app.post("/ghl/mindbody", async (req, res) => {
       console.log("Mindbody live schedule error:", err?.message || err);
       return respondJSON(res, {
         success: false,
+        say: "",
+        text: "",
         error: err?.message || "Mindbody live schedule error",
         data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
@@ -901,7 +882,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         created = true;
       }
 
-      await bookClientIntoClass(cfg, token, classId, clientId);
+      await bookClientIntoClass(cfg, token, clientId, classId);
 
       const say = (created || isNewClient)
         ? "You’re booked! I’ll also send you a waiver link right after this call to complete before class."
@@ -988,7 +969,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         });
       }
 
-      await cancelClientFromClass(cfg, token, classId, clientId);
+      await cancelClientFromClass(cfg, token, clientId, classId);
 
       const say = "Done — you’re canceled. Want me to book you into a different class instead?";
       return respondJSON(res, {
