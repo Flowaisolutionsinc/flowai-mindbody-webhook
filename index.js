@@ -440,6 +440,22 @@ function filterClassesByTimeOfDay(classes, timeOfDay) {
   });
 }
 
+/**
+ * ✅ STEP A FIX (NEW)
+ * Sort classes by time (earliest -> latest) so the webhook "say" is already perfect.
+ */
+function sortClassesByStartTime(classes) {
+  const arr = Array.isArray(classes) ? classes : [];
+  arr.sort((a, b) => {
+    const am = timeStringToMinutes(a?.time);
+    const bm = timeStringToMinutes(b?.time);
+    const aa = am === null ? 99999 : am;
+    const bb = bm === null ? 99999 : bm;
+    return aa - bb;
+  });
+  return arr;
+}
+
 // ---------------------------
 // Token + booking/cancel
 // ---------------------------
@@ -661,6 +677,9 @@ app.post("/ghl/mindbody", async (req, res) => {
       let classes = buildMockSchedule(requestedDate);
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
 
+      // ✅ STEP A FIX: ensure order is always earliest -> latest
+      classes = sortClassesByStartTime(classes);
+
       const say = buildScheduleSay(spokenDate, classes);
       return respondJSON(res, {
         success: true,
@@ -694,6 +713,9 @@ app.post("/ghl/mindbody", async (req, res) => {
       const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       let classes = schedule.classes;
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
+
+      // ✅ STEP A FIX: ensure order is always earliest -> latest
+      classes = sortClassesByStartTime(classes);
 
       const say = buildScheduleSay(spokenDate, classes);
 
@@ -912,3 +934,4 @@ app.post("/ghl/mindbody", async (req, res) => {
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
