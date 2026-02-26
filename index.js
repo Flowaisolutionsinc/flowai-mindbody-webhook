@@ -91,7 +91,9 @@ function respondJSON(res, payload) {
     success: !!payload?.success,
   };
 
+  // Logging is fine — it does NOT affect JSON tool parsing.
   console.log("RESPONDING:", finalPayload.success, finalPayload.response);
+
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   return res.status(200).json(finalPayload);
 }
@@ -302,15 +304,17 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
+/**
+ * ✅ FIXED:
+ * - NO "Which class would you like to book?" in the webhook message.
+ *   Your prompt handles the follow-up question AFTER speaking tool output.
+ */
 function buildScheduleSay(spokenDateLabel, classes) {
-  if (!classes || classes.length === 0) {
-    return `I couldn’t find any classes for ${spokenDateLabel}.\nWould you like a different date?`;
-  }
+  const safeClasses = Array.isArray(classes) ? classes : [];
 
   const lines = [];
   lines.push(`Here are the classes for ${spokenDateLabel}.`);
 
-  const safeClasses = Array.isArray(classes) ? classes.slice(0) : [];
   for (const c of safeClasses) {
     const time = c?.time || "Time TBD";
     const name = c?.name || "Class";
@@ -318,7 +322,6 @@ function buildScheduleSay(spokenDateLabel, classes) {
     lines.push(`${time} — ${name}${instructor}.`);
   }
 
-  lines.push(`Which class would you like to book?`);
   return lines.join("\n");
 }
 
@@ -441,7 +444,7 @@ function filterClassesByTimeOfDay(classes, timeOfDay) {
 }
 
 /**
- * ✅ STEP A FIX (NEW)
+ * ✅ STEP A FIX:
  * Sort classes by time (earliest -> latest) so the webhook "say" is already perfect.
  */
 function sortClassesByStartTime(classes) {
@@ -676,9 +679,27 @@ app.post("/ghl/mindbody", async (req, res) => {
       const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
       let classes = buildMockSchedule(requestedDate);
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
-
-      // ✅ STEP A FIX: ensure order is always earliest -> latest
       classes = sortClassesByStartTime(classes);
+
+      // ✅ FIX: if no classes, return success:false so voice prompt doesn't ask booking question
+      if (!classes || classes.length === 0) {
+        const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
+        return respondJSON(res, {
+          success: false,
+          say: msg,
+          text: msg,
+          data: {
+            action: "get_schedule",
+            mode: "mock",
+            studioKey,
+            timezone,
+            source,
+            requestedDate,
+            timeOfDay: finalTimeOfDay,
+            schedule: { studioKey, timezone, date: requestedDate, spokenDate, classes: [] },
+          },
+        });
+      }
 
       const say = buildScheduleSay(spokenDate, classes);
       return respondJSON(res, {
@@ -713,9 +734,27 @@ app.post("/ghl/mindbody", async (req, res) => {
       const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       let classes = schedule.classes;
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
-
-      // ✅ STEP A FIX: ensure order is always earliest -> latest
       classes = sortClassesByStartTime(classes);
+
+      // ✅ FIX: if no classes, return success:false so voice prompt doesn't ask booking question
+      if (!classes || classes.length === 0) {
+        const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
+        return respondJSON(res, {
+          success: false,
+          say: msg,
+          text: msg,
+          data: {
+            action: "get_schedule",
+            mode: "live",
+            studioKey,
+            timezone,
+            source,
+            requestedDate,
+            timeOfDay: finalTimeOfDay,
+            schedule: { studioKey, timezone, date: requestedDate, spokenDate, classes: [] },
+          },
+        });
+      }
 
       const say = buildScheduleSay(spokenDate, classes);
 
