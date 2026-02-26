@@ -19,7 +19,7 @@
  *   MINDBODY_TOKEN_PASSWORD
  *
  * Returns voice-agent-friendly payload:
- *  { success, say, text, response, message, output, speech, body, result, results:{say,text}, data:{...} }
+ *  { success, say, text, results:{say,text}, data:{...} }
  */
 
 const express = require("express");
@@ -51,58 +51,54 @@ function normalizeTimeOfDay(v) {
   const s = decodeMaybe(v).trim().toLowerCase();
   if (!s) return null;
   if (s === "all") return null;
-
-  // Accept common variants some voice agents send
-  if (["morning", "afternoon", "evening", "tonight", "later"].includes(s)) {
-    if (s === "tonight") return "evening";
-    if (s === "later") return null; // treat as no filter (or change if you prefer)
-    return s;
-  }
-
+  if (["morning", "afternoon", "evening"].includes(s)) return s;
   return null;
 }
 
 /**
- * ✅ IMPORTANT:
- * Some platforms do NOT read `say` automatically.
- * This returns the same spoken text under multiple common keys.
+ * ✅ MAX COMPAT RESPONSE:
+ * - Always place the spoken string in MANY common keys.
+ * - Also includes `body` and `result` because some platforms expect those.
+ * - Never return empty spoken strings on error.
  */
 function respondJSON(res, payload) {
   const say = safeString(payload?.say);
   const text = safeString(payload?.text);
   const err = safeString(payload?.error);
 
+  // Pick the first useful spoken string
   const spoken = say || text || err || "";
 
   const finalPayload = {
     ...payload,
 
-    // primary
+    // Primary
     say: spoken,
     text: spoken,
 
-    // common aliases different tools/platforms may read
+    // Common aliases
     response: spoken,
     message: spoken,
     output: spoken,
     speech: spoken,
 
-    // extra aliases to be extra bulletproof
+    // VERY common tool wrappers
     body: spoken,
     result: spoken,
 
-    // nested convention
+    // Nested convention
     results: payload?.results || { say: spoken, text: spoken },
 
+    // Keep data stable
     data:
       payload?.data || payload?.data === 0
         ? payload.data
         : payload?.data,
 
+    // Boolean success
     success: !!payload?.success,
   };
 
-  // Logging is fine — it does NOT affect JSON tool parsing.
   console.log("RESPONDING:", finalPayload.success, finalPayload.response);
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -169,7 +165,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const phraseRaw = decodeMaybe(datePhraseRaw).trim().toLowerCase();
   if (!phraseRaw) return { ok: false, reason: "missing date phrase" };
 
-  // Backup: extract time-of-day words if someone still sends "tomorrow afternoon"
+  // Extract time-of-day words if someone sends "tomorrow afternoon"
   let extractedTimeOfDay = null; // morning|afternoon|evening
   let phrase = phraseRaw;
 
@@ -315,11 +311,6 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
-/**
- * ✅ FIXED:
- * - NO "Which class would you like to book?" in the webhook message.
- *   Your prompt handles the follow-up question AFTER speaking tool output.
- */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
 
@@ -426,7 +417,7 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
 }
 
 // ---------------------------
-// Time-of-day filtering + sorting
+// Time-of-day filtering (morning/afternoon/evening)
 // ---------------------------
 function timeStringToMinutes(t) {
   const s = String(t || "");
@@ -454,10 +445,7 @@ function filterClassesByTimeOfDay(classes, timeOfDay) {
   });
 }
 
-/**
- * ✅ STEP A FIX:
- * Sort classes by time (earliest -> latest) so the webhook message is already in perfect order.
- */
+// Sort classes by time (earliest -> latest)
 function sortClassesByStartTime(classes) {
   const arr = Array.isArray(classes) ? classes : [];
   arr.sort((a, b) => {
@@ -620,13 +608,12 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
 
-  // timeOfDay param can be passed explicitly
+  // timeOfDay optional
   const timeOfDayParam = normalizeTimeOfDay(q.timeOfDay ?? b.timeOfDay);
 
-  // ✅ IMPORTANT: prefer datePhrase first to avoid "date" reserved-field collisions
   const dateParamRaw =
-    q.datePhrase ?? b.datePhrase ??
     q.date ?? b.date ??
+    q.datePhrase ?? b.datePhrase ??
     q.dateParam ?? b.dateParam;
 
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
@@ -676,8 +663,11 @@ app.post("/ghl/mindbody", async (req, res) => {
   if (action === "get_schedule" || action === "get_schedule_web" || action === "get_schedule_by_date") {
     const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
     if (!resolved.ok) {
+      const msg = "I couldn’t understand that date. What day would you like the schedule for?";
       return respondJSON(res, {
         success: false,
+        say: msg,
+        text: msg,
         error: `Could not parse date: ${resolved.reason}`,
         data: { action, studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
@@ -732,8 +722,11 @@ app.post("/ghl/mindbody", async (req, res) => {
     }
 
     if (!liveConfigured) {
+      const msg = "I’m not able to pull the schedule up on my end right now.";
       return respondJSON(res, {
         success: false,
+        say: msg,
+        text: msg,
         error: "Mindbody LIVE not configured. Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
         data: { action: "get_schedule", mode: "live_unconfigured", studioKey, timezone, source },
       });
@@ -745,7 +738,6 @@ app.post("/ghl/mindbody", async (req, res) => {
 
       const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       let classes = schedule.classes;
-
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
@@ -787,10 +779,13 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     } catch (err) {
       console.log("Mindbody live schedule error:", err?.message || err);
+
+      // ✅ IMPORTANT: never return blank say/text on error
+      const msg = "I’m not able to pull the schedule up on my end right now.";
       return respondJSON(res, {
         success: false,
-        say: "",
-        text: "",
+        say: msg,
+        text: msg,
         error: err?.message || "Mindbody live schedule error",
         data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
@@ -864,7 +859,7 @@ app.post("/ghl/mindbody", async (req, res) => {
       await bookClientIntoClass(cfg, token, clientId, classId);
 
       const say = (created || isNewClient)
-        ? "You’re booked! I’ll also send you a waiver link right after this call to complete before class."
+        ? "You’re booked! I’ll send you a waiver link right after this call to complete before class."
         : "You’re booked! Anything else I can help you with?";
 
       return respondJSON(res, {
@@ -978,6 +973,8 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   return respondJSON(res, {
     success: false,
+    say: "Sorry — I’m not sure how to help with that request.",
+    text: "Sorry — I’m not sure how to help with that request.",
     error: `Unknown action: ${action}`,
     data: { action, studioKey, timezone, source },
   });
