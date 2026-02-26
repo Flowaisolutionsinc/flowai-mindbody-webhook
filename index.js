@@ -56,47 +56,51 @@ function normalizeTimeOfDay(v) {
 }
 
 /**
- * ✅ MAX COMPAT RESPONSE:
- * - Always place the spoken string in MANY common keys.
- * - Also includes `body` and `result` because some platforms expect those.
- * - Never return empty spoken strings on error.
+ * ✅ IMPORTANT:
+ * Some platforms do NOT read `say` automatically.
+ * This returns the same spoken text under multiple common keys.
+ *
+ * ✅ NEW:
+ * Also sets `body` and `result` because some platforms surface tool output there.
+ * Also sets `ok` because some platforms expect that convention.
  */
 function respondJSON(res, payload) {
   const say = safeString(payload?.say);
   const text = safeString(payload?.text);
   const err = safeString(payload?.error);
 
-  // Pick the first useful spoken string
   const spoken = say || text || err || "";
+
+  const isSuccess = payload?.success === true;
 
   const finalPayload = {
     ...payload,
 
-    // Primary
+    // canonical fields
+    success: isSuccess,
+    ok: isSuccess,
+
+    // your original fields (force spoken string)
     say: spoken,
     text: spoken,
 
-    // Common aliases
+    // common aliases other tools look for
     response: spoken,
     message: spoken,
     output: spoken,
     speech: spoken,
 
-    // VERY common tool wrappers
+    // ✅ critical: some platforms surface output here
     body: spoken,
     result: spoken,
 
-    // Nested convention
+    // nested convention
     results: payload?.results || { say: spoken, text: spoken },
 
-    // Keep data stable
     data:
       payload?.data || payload?.data === 0
         ? payload.data
         : payload?.data,
-
-    // Boolean success
-    success: !!payload?.success,
   };
 
   console.log("RESPONDING:", finalPayload.success, finalPayload.response);
@@ -117,7 +121,8 @@ function getMindbodyConfig() {
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const siteId = requireEnv("MINDBODY_SITE_ID");
   const baseUrl =
-    requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
+    requireEnv("MINDBODY_BASE_URL") ||
+    "https://api.mindbodyonline.com/public/v6";
 
   const tokenUsername = requireEnv("MINDBODY_TOKEN_USERNAME");
   const tokenPassword = requireEnv("MINDBODY_TOKEN_PASSWORD");
@@ -165,7 +170,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const phraseRaw = decodeMaybe(datePhraseRaw).trim().toLowerCase();
   if (!phraseRaw) return { ok: false, reason: "missing date phrase" };
 
-  // Extract time-of-day words if someone sends "tomorrow afternoon"
+  // Backup: extract time-of-day words if someone still sends "tomorrow afternoon"
   let extractedTimeOfDay = null; // morning|afternoon|evening
   let phrase = phraseRaw;
 
@@ -179,28 +184,55 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     .trim();
 
   if (phrase === "today") {
-    return { ok: true, requestedDate: todayISO, todayISO, daysAhead: 0, extractedTimeOfDay };
+    return {
+      ok: true,
+      requestedDate: todayISO,
+      todayISO,
+      daysAhead: 0,
+      extractedTimeOfDay,
+    };
   }
   if (phrase === "tomorrow") {
-    return { ok: true, requestedDate: addDaysISO(todayISO, 1), todayISO, daysAhead: 1, extractedTimeOfDay };
+    return {
+      ok: true,
+      requestedDate: addDaysISO(todayISO, 1),
+      todayISO,
+      daysAhead: 1,
+      extractedTimeOfDay,
+    };
   }
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(phrase)) {
     const daysAhead = Math.round(
-      (Date.parse(phrase + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
+      (Date.parse(phrase + "T00:00:00Z") -
+        Date.parse(todayISO + "T00:00:00Z")) /
+        86400000
     );
     return { ok: true, requestedDate: phrase, todayISO, daysAhead, extractedTimeOfDay };
   }
 
-  const weekdays = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
-  const mThisNext = phrase.match(/^(this|next)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
+  const weekdays = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+  ];
+  const mThisNext = phrase.match(
+    /^(this|next)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/
+  );
   if (mThisNext) {
     const which = mThisNext[1];
     const wdName = mThisNext[2];
     const wdIndex = weekdays.indexOf(wdName);
 
     const now = new Date();
-    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      weekday: "long",
+    });
     const todayName = dtf.format(now).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
 
@@ -215,7 +247,10 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const wdIndex = weekdays.indexOf(phrase);
   if (wdIndex !== -1) {
     const now = new Date();
-    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      weekday: "long",
+    });
     const todayName = dtf.format(now).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
 
@@ -226,7 +261,9 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     return { ok: true, requestedDate, todayISO, daysAhead: delta, extractedTimeOfDay };
   }
 
-  const dayOnly = phrase.replace(/^on\s+the\s+/, "").replace(/(\d+)(st|nd|rd|th)$/g, "$1");
+  const dayOnly = phrase
+    .replace(/^on\s+the\s+/, "")
+    .replace(/(\d+)(st|nd|rd|th)$/g, "$1");
   if (/^\d{1,2}$/.test(dayOnly)) {
     const dayNum = parseInt(dayOnly, 10);
     const [y, m] = todayISO.split("-").map((x) => parseInt(x, 10));
@@ -241,24 +278,36 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     }
 
     const daysAhead = Math.round(
-      (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
+      (Date.parse(requestedDate + "T00:00:00Z") -
+        Date.parse(todayISO + "T00:00:00Z")) /
+        86400000
     );
     return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
   }
 
   const cleaned = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1");
   const monthNames = [
-    "january","february","march","april","may","june",
-    "july","august","september","october","november","december"
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
   ];
-  const monthShort = monthNames.map((x) => x.slice(0,3));
+  const monthShort = monthNames.map((x) => x.slice(0, 3));
 
   const md = cleaned.match(/^([a-z]+)\s+(\d{1,2})$/);
   if (md) {
     const monRaw = md[1];
     const dayNum = parseInt(md[2], 10);
     let monIdx = monthNames.indexOf(monRaw);
-    if (monIdx === -1) monIdx = monthShort.indexOf(monRaw.slice(0,3));
+    if (monIdx === -1) monIdx = monthShort.indexOf(monRaw.slice(0, 3));
     if (monIdx !== -1) {
       const [y] = todayISO.split("-").map((x) => parseInt(x, 10));
       let requestedDate = `${y}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
@@ -266,7 +315,9 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
         requestedDate = `${y + 1}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
       }
       const daysAhead = Math.round(
-        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
+        (Date.parse(requestedDate + "T00:00:00Z") -
+          Date.parse(todayISO + "T00:00:00Z")) /
+          86400000
       );
       return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
     }
@@ -290,7 +341,9 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     if (monIdx !== -1) {
       const requestedDate = `${yearNum}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
       const daysAhead = Math.round(
-        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
+        (Date.parse(requestedDate + "T00:00:00Z") -
+          Date.parse(todayISO + "T00:00:00Z")) /
+          86400000
       );
       return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
     }
@@ -311,6 +364,11 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
+/**
+ * ✅ FIXED:
+ * - NO "Which class would you like to book?" in the webhook message.
+ *   Your prompt handles follow-up.
+ */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
 
@@ -445,7 +503,9 @@ function filterClassesByTimeOfDay(classes, timeOfDay) {
   });
 }
 
-// Sort classes by time (earliest -> latest)
+/**
+ * ✅ Sort classes by time (earliest -> latest)
+ */
 function sortClassesByStartTime(classes) {
   const arr = Array.isArray(classes) ? classes : [];
   arr.sort((a, b) => {
@@ -586,12 +646,12 @@ async function createClient(cfg, token, firstName, lastName, email, phone) {
   return String(id);
 }
 
-async function bookClientIntoClass(cfg, token, clientId, classId) {
+async function bookClientIntoClass(cfg, token, classId, clientId) {
   const payload = { ClientId: clientId, ClassId: Number(classId) };
   return await mbPost(cfg, "/class/addclienttoclass", token, payload);
 }
 
-async function cancelClientFromClass(cfg, token, clientId, classId) {
+async function cancelClientFromClass(cfg, token, classId, clientId) {
   const payload = { ClientId: clientId, ClassId: Number(classId) };
   return await mbPost(cfg, "/class/removeclientfromclass", token, payload);
 }
@@ -608,7 +668,6 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
 
-  // timeOfDay optional
   const timeOfDayParam = normalizeTimeOfDay(q.timeOfDay ?? b.timeOfDay);
 
   const dateParamRaw =
@@ -618,7 +677,6 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
 
-  // Booking/Cancellation
   const classId = decodeMaybe(q.classId ?? b.classId).trim();
 
   const firstName = decodeMaybe(
@@ -663,23 +721,18 @@ app.post("/ghl/mindbody", async (req, res) => {
   if (action === "get_schedule" || action === "get_schedule_web" || action === "get_schedule_by_date") {
     const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
     if (!resolved.ok) {
-      const msg = "I couldn’t understand that date. What day would you like the schedule for?";
       return respondJSON(res, {
         success: false,
-        say: msg,
-        text: msg,
         error: `Could not parse date: ${resolved.reason}`,
         data: { action, studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
     }
 
-    // Preferred explicit param; fallback to extraction from date phrase
     const finalTimeOfDay = timeOfDayParam || resolved.extractedTimeOfDay || null;
 
     if (cfg.mode !== "live") {
       const requestedDate = resolved.requestedDate;
       const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
-
       let classes = buildMockSchedule(requestedDate);
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
@@ -722,11 +775,8 @@ app.post("/ghl/mindbody", async (req, res) => {
     }
 
     if (!liveConfigured) {
-      const msg = "I’m not able to pull the schedule up on my end right now.";
       return respondJSON(res, {
         success: false,
-        say: msg,
-        text: msg,
         error: "Mindbody LIVE not configured. Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
         data: { action: "get_schedule", mode: "live_unconfigured", studioKey, timezone, source },
       });
@@ -779,13 +829,8 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     } catch (err) {
       console.log("Mindbody live schedule error:", err?.message || err);
-
-      // ✅ IMPORTANT: never return blank say/text on error
-      const msg = "I’m not able to pull the schedule up on my end right now.";
       return respondJSON(res, {
         success: false,
-        say: msg,
-        text: msg,
         error: err?.message || "Mindbody live schedule error",
         data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
@@ -856,10 +901,10 @@ app.post("/ghl/mindbody", async (req, res) => {
         created = true;
       }
 
-      await bookClientIntoClass(cfg, token, clientId, classId);
+      await bookClientIntoClass(cfg, token, classId, clientId);
 
       const say = (created || isNewClient)
-        ? "You’re booked! I’ll send you a waiver link right after this call to complete before class."
+        ? "You’re booked! I’ll also send you a waiver link right after this call to complete before class."
         : "You’re booked! Anything else I can help you with?";
 
       return respondJSON(res, {
@@ -943,7 +988,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         });
       }
 
-      await cancelClientFromClass(cfg, token, clientId, classId);
+      await cancelClientFromClass(cfg, token, classId, clientId);
 
       const say = "Done — you’re canceled. Want me to book you into a different class instead?";
       return respondJSON(res, {
@@ -973,8 +1018,6 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   return respondJSON(res, {
     success: false,
-    say: "Sorry — I’m not sure how to help with that request.",
-    text: "Sorry — I’m not sure how to help with that request.",
     error: `Unknown action: ${action}`,
     data: { action, studioKey, timezone, source },
   });
