@@ -19,7 +19,7 @@
  *   MINDBODY_TOKEN_PASSWORD
  *
  * Returns voice-agent-friendly payload:
- *  { success, response, results:{say,text}, data:{...}, error:"" }
+ *  { success, speech, say, text, response, message, output, results:{say,text}, data:{...}, error:"" }
  */
 
 const express = require("express");
@@ -56,28 +56,61 @@ function normalizeTimeOfDay(v) {
 }
 
 /**
- * ✅ UPDATED RESPONDER (VOICE-SAFE)
- * - Keep payload small + predictable
- * - Provide ONE canonical spoken field: `response`
- * - Provide backup nested: `results.say` / `results.text`
- * - Cap spoken content so Voice AI doesn't truncate/fail
+ * ✅ UPDATED RESPONDER (MAX COMPATIBILITY FOR VOICE)
+ * Why:
+ * - Some voice stacks read only `speech` (or `say`/`text`) and ignore `response`.
+ * - We return the spoken string in multiple top-level keys so GHL can’t miss it.
+ * - Keep it capped so long schedules don't break TTS.
  */
 function respondJSON(res, payload) {
-  const say = safeString(payload?.say || payload?.text || payload?.error || "");
+  // Pick spoken content from ANY known field the rest of your code might pass
+  const raw = safeString(
+    payload?.speech ??
+      payload?.say ??
+      payload?.text ??
+      payload?.response ??
+      payload?.message ??
+      payload?.output ??
+      payload?.result ??
+      payload?.body ??
+      payload?.error ??
+      ""
+  );
 
-  const MAX = 900;
-  const spoken = say.length > MAX ? say.slice(0, MAX - 3) + "..." : say;
+  // Voice-safe cap (keep it tighter than 900; long strings can get dropped)
+  const MAX = 700;
+  const spoken = raw.length > MAX ? raw.slice(0, MAX - 3) + "..." : raw;
+
+  // Determine success: if caller provided explicit payload.success, respect it,
+  // but never mark success true if spoken is empty.
+  const explicitSuccess =
+    payload?.success === undefined || payload?.success === null
+      ? null
+      : !!payload.success;
+
+  const success = explicitSuccess === null ? !!spoken : explicitSuccess && !!spoken;
 
   const finalPayload = {
-    success: !!payload?.success,
+    success,
 
-    // ONE canonical spoken field
+    // ✅ most common voice key
+    speech: spoken,
+
+    // ✅ common alternates
+    say: spoken,
+    text: spoken,
     response: spoken,
+    message: spoken,
+    output: spoken,
+    result: spoken,
 
-    // backup field some platforms prefer
+    // ✅ some tools look for body
+    body: spoken,
+
+    // ✅ nested backup (your prompt already checks results.say)
     results: { say: spoken, text: spoken },
 
-    // keep your structured data
+    // structured data for UI / future booking flows
     data: payload?.data ?? null,
 
     error: payload?.error ? safeString(payload.error) : "",
@@ -86,7 +119,7 @@ function respondJSON(res, payload) {
   console.log(
     "RESPONDING:",
     finalPayload.success,
-    (finalPayload.response || "").slice(0, 120)
+    (finalPayload.speech || "").slice(0, 140)
   );
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -714,7 +747,6 @@ app.post("/ghl/mindbody", async (req, res) => {
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
-      // ✅ FIX: if no classes, return success:false so voice prompt doesn't ask booking question
       if (!classes || classes.length === 0) {
         const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
         return respondJSON(res, {
@@ -769,7 +801,6 @@ app.post("/ghl/mindbody", async (req, res) => {
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
-      // ✅ FIX: if no classes, return success:false so voice prompt doesn't ask booking question
       if (!classes || classes.length === 0) {
         const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
         return respondJSON(res, {
