@@ -19,7 +19,7 @@
  *   MINDBODY_TOKEN_PASSWORD
  *
  * Returns voice-agent-friendly payload:
- *  { success, say, text, results:{say,text}, data:{...} }
+ *  { success, say, text, response, message, output, speech, body, result, results:{say,text}, data:{...} }
  */
 
 const express = require("express");
@@ -51,7 +51,14 @@ function normalizeTimeOfDay(v) {
   const s = decodeMaybe(v).trim().toLowerCase();
   if (!s) return null;
   if (s === "all") return null;
-  if (["morning", "afternoon", "evening"].includes(s)) return s;
+
+  // Accept common variants some voice agents send
+  if (["morning", "afternoon", "evening", "tonight", "later"].includes(s)) {
+    if (s === "tonight") return "evening";
+    if (s === "later") return null; // treat as no filter (or change if you prefer)
+    return s;
+  }
+
   return null;
 }
 
@@ -70,15 +77,19 @@ function respondJSON(res, payload) {
   const finalPayload = {
     ...payload,
 
-    // your original fields
+    // primary
     say: spoken,
     text: spoken,
 
-    // common aliases other tools look for
+    // common aliases different tools/platforms may read
     response: spoken,
     message: spoken,
     output: spoken,
     speech: spoken,
+
+    // extra aliases to be extra bulletproof
+    body: spoken,
+    result: spoken,
 
     // nested convention
     results: payload?.results || { say: spoken, text: spoken },
@@ -415,7 +426,7 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
 }
 
 // ---------------------------
-// Time-of-day filtering (morning/afternoon/evening)
+// Time-of-day filtering + sorting
 // ---------------------------
 function timeStringToMinutes(t) {
   const s = String(t || "");
@@ -445,7 +456,7 @@ function filterClassesByTimeOfDay(classes, timeOfDay) {
 
 /**
  * ✅ STEP A FIX:
- * Sort classes by time (earliest -> latest) so the webhook "say" is already perfect.
+ * Sort classes by time (earliest -> latest) so the webhook message is already in perfect order.
  */
 function sortClassesByStartTime(classes) {
   const arr = Array.isArray(classes) ? classes : [];
@@ -609,12 +620,13 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
 
-  // NEW: timeOfDay param can be passed explicitly (preferred)
+  // timeOfDay param can be passed explicitly
   const timeOfDayParam = normalizeTimeOfDay(q.timeOfDay ?? b.timeOfDay);
 
+  // ✅ IMPORTANT: prefer datePhrase first to avoid "date" reserved-field collisions
   const dateParamRaw =
-    q.date ?? b.date ??
     q.datePhrase ?? b.datePhrase ??
+    q.date ?? b.date ??
     q.dateParam ?? b.dateParam;
 
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
@@ -677,11 +689,11 @@ app.post("/ghl/mindbody", async (req, res) => {
     if (cfg.mode !== "live") {
       const requestedDate = resolved.requestedDate;
       const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
+
       let classes = buildMockSchedule(requestedDate);
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
-      // ✅ FIX: if no classes, return success:false so voice prompt doesn't ask booking question
       if (!classes || classes.length === 0) {
         const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
         return respondJSON(res, {
@@ -733,10 +745,10 @@ app.post("/ghl/mindbody", async (req, res) => {
 
       const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       let classes = schedule.classes;
+
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
-      // ✅ FIX: if no classes, return success:false so voice prompt doesn't ask booking question
       if (!classes || classes.length === 0) {
         const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
         return respondJSON(res, {
