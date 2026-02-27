@@ -1,6 +1,7 @@
 /**
  * Flow AI – Mindbody Webhook (Mock + Live)
  * - POST /ghl/mindbody
+ * - GET  /ghl/mindbody
  *
  * Actions:
  *   - ping
@@ -627,9 +628,9 @@ async function cancelClientFromClass(cfg, token, clientId, classId) {
 }
 
 // ---------------------------
-// Route
+// Shared handler for GET + POST
 // ---------------------------
-app.post("/ghl/mindbody", async (req, res) => {
+async function mindbodyHandler(req, res) {
   const q = req.query || {};
   const b = req.body || {};
 
@@ -659,7 +660,7 @@ app.post("/ghl/mindbody", async (req, res) => {
   ).trim().toLowerCase();
 
   console.log("--------------------------------------------------");
-  console.log("POST /ghl/mindbody | action:", action);
+  console.log(`${req.method} /ghl/mindbody | action:`, action);
   console.log("query:", q);
   console.log("body:", b);
 
@@ -916,7 +917,13 @@ app.post("/ghl/mindbody", async (req, res) => {
     speech: `I didn't recognize that request.`,
     error: `Unknown action: ${action}`,
   });
-});
+}
+
+// ---------------------------
+// Routes — POST and GET both use the same handler
+// ---------------------------
+app.post("/ghl/mindbody", mindbodyHandler);
+app.get("/ghl/mindbody", mindbodyHandler);
 
 // Plain text endpoint — GHL reads this directly without summarizing
 app.post("/ghl/mindbody/speak", async (req, res) => {
