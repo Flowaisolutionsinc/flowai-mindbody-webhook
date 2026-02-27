@@ -382,7 +382,7 @@ function buildScheduleSay(spokenDateLabel, classes) {
   }
 
   return parts.join(". ");
-}}
+}
 
 // ---------------------------
 // MOCK schedule
