@@ -363,7 +363,7 @@ function buildSpokenDateLabel(dateISO, timeZone) {
  */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
-  const top = safeClasses.slice(0, 7);
+  const top = safeClasses.slice(0, 6);
 
   if (!top.length) {
     return `I couldn't find any classes for ${spokenDateLabel}. Would you like a different date?`;
@@ -375,15 +375,14 @@ function buildScheduleSay(spokenDateLabel, classes) {
     const time = c?.time || "Time TBD";
     const name = c?.name || "Class";
     const instructor = c?.instructor ? ` with ${c.instructor}` : "";
-    parts.push(`${time}: ${name}${instructor}`);
-  }
-
-  if (safeClasses.length > top.length) {
-    parts.push(`There are more classes that day too. Want morning, afternoon, or evening?`);
+    // Format: "At 6:00 AM: Hot Tone and Sculpt with Morgan T."
+    // Using "and" instead of "&" for cleaner TTS
+    const cleanName = name.replace(/&/g, "and").replace(/\|/g, "-").replace(/\*/g, "");
+    parts.push(`At ${time} — ${cleanName}${instructor}`);
   }
 
   return parts.join(". ");
-}
+}}
 
 // ---------------------------
 // MOCK schedule
