@@ -369,19 +369,21 @@ function buildScheduleSay(spokenDateLabel, classes) {
     return `I couldn't find any classes for ${spokenDateLabel}. Would you like a different date?`;
   }
 
-  const parts = [`Here are the classes for ${spokenDateLabel}.`];
+  const lines = [];
 
   for (const c of top) {
     const time = c?.time || "Time TBD";
     const name = c?.name || "Class";
     const instructor = c?.instructor ? ` with ${c.instructor}` : "";
-    // Format: "At 6:00 AM: Hot Tone and Sculpt with Morgan T."
-    // Using "and" instead of "&" for cleaner TTS
-    const cleanName = name.replace(/&/g, "and").replace(/\|/g, "-").replace(/\*/g, "");
-    parts.push(`At ${time} — ${cleanName}${instructor}`);
+    const cleanName = name
+      .replace(/&/g, "and")
+      .replace(/\|/g, "")
+      .replace(/\*/g, "")
+      .trim();
+    lines.push(`${time}: ${cleanName}${instructor}`);
   }
 
-  return parts.join(". ");
+  return `READBACK: Here are the classes for ${spokenDateLabel}. ` + lines.join(". ") + ".";
 }
 
 // ---------------------------
