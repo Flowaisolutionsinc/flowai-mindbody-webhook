@@ -925,43 +925,66 @@ async function mindbodyHandler(req, res) {
 app.post("/ghl/mindbody", mindbodyHandler);
 app.get("/ghl/mindbody", mindbodyHandler);
 
-// Plain text endpoint — GHL reads this directly without summarizing
-app.post("/ghl/mindbody/speak", async (req, res) => {
+// Plain text + JSON endpoint — supports both GET and POST
+// Returns plain text body AND JSON with multiple field names GHL might read
+async function speakHandler(req, res) {
   const b = req.body || {};
   const q = req.query || {};
   const datePhraseRaw = decodeMaybe(q.date ?? b.date ?? "today");
   const timezone = "America/Vancouver";
 
   const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
+
+  let speech = "";
+
   if (!resolved.ok) {
-    return res.status(200).type("text").send("I couldn't understand that date. What day did you mean?");
+    speech = "I couldn't understand that date. What day did you mean?";
+  } else {
+    const requestedDate = resolved.requestedDate;
+    const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
+
+    const cached = getCached(requestedDate);
+    if (cached) {
+      console.log(`speak cache hit: ${requestedDate}`);
+      speech = cached.speech;
+    } else {
+      try {
+        const cfg = {
+          mode: process.env.MINDBODY_MODE || "live",
+          apiKey: process.env.MINDBODY_API_KEY || "",
+          siteId: process.env.MINDBODY_SITE_ID || "",
+          baseUrl: process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6",
+          timezone,
+        };
+        const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
+        const classes = sortClassesByStartTime(schedule.classes);
+        speech = buildScheduleSay(spokenDate, classes);
+      } catch (e) {
+        speech = "I wasn't able to pull the schedule right now. Would you like me to connect you with the front desk?";
+      }
+    }
   }
 
-  const requestedDate = resolved.requestedDate;
-  const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
+  console.log("SPEAK RESPONDING:", speech.slice(0, 140));
 
-  const cached = getCached(requestedDate);
-  if (cached) {
-    console.log(`speak cache hit: ${requestedDate}`);
-    return res.status(200).type("text").send(cached.speech);
-  }
+  // Return JSON with every possible field name GHL voice AI might look for
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  return res.status(200).json({
+    success: true,
+    speech: speech,
+    message: speech,
+    text: speech,
+    response: speech,
+    result: speech,
+    output: speech,
+    say: speech,
+    answer: speech,
+    content: speech,
+  });
+}
 
-  try {
-    const cfg = {
-      mode: process.env.MINDBODY_MODE || "live",
-      apiKey: process.env.MINDBODY_API_KEY || "",
-      siteId: process.env.MINDBODY_SITE_ID || "",
-      baseUrl: process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6",
-      timezone,
-    };
-    const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
-    const classes = sortClassesByStartTime(schedule.classes);
-    const speech = buildScheduleSay(spokenDate, classes);
-    return res.status(200).type("text").send(speech);
-  } catch (e) {
-    return res.status(200).type("text").send("I wasn't able to pull the schedule right now. Would you like me to connect you with the front desk?");
-  }
-});
+app.post("/ghl/mindbody/speak", speakHandler);
+app.get("/ghl/mindbody/speak", speakHandler);
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
