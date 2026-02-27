@@ -13,19 +13,11 @@
  *   MINDBODY_API_KEY
  *   MINDBODY_SITE_ID
  *   MINDBODY_BASE_URL (default: https://api.mindbodyonline.com/public/v6)
+ *   RAILWAY_STATIC_URL  (just the domain e.g. yourapp.up.railway.app — for keep-alive)
  *
  * Optional (booking/cancel often requires token):
  *   MINDBODY_TOKEN_USERNAME
  *   MINDBODY_TOKEN_PASSWORD
- *
- * Returns voice-agent-friendly payload:
- *  {
- *    success,
- *    speech, response, say, text,
- *    results:{say,text},
- *    data:{...},
- *    error:""
- *  }
  */
 
 const express = require("express");
@@ -36,12 +28,32 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 8080;
 
-// Optional “which deploy am I hitting” stamp (super helpful)
 const BUILD_ID =
   process.env.RAILWAY_GIT_COMMIT_SHA ||
   process.env.RAILWAY_STATIC_URL ||
   process.env.BUILD_ID ||
   "local";
+
+// ---------------------------
+// Keep-alive self-ping
+// Prevents Railway cold starts that cause GHL voice timeouts
+// ---------------------------
+const SELF_URL = process.env.RAILWAY_STATIC_URL
+  ? `https://${process.env.RAILWAY_STATIC_URL}`
+  : null;
+
+if (SELF_URL) {
+  setInterval(async () => {
+    try {
+      await fetch(SELF_URL);
+      console.log("keep-alive ping ok:", SELF_URL);
+    } catch (e) {
+      console.log("keep-alive ping failed:", e.message);
+    }
+  }, 4 * 60 * 1000); // every 4 minutes
+} else {
+  console.log("keep-alive disabled: set RAILWAY_STATIC_URL env var");
+}
 
 // ---------------------------
 // Helpers
@@ -69,61 +81,43 @@ function normalizeTimeOfDay(v) {
 }
 
 /**
- * ✅ UPDATED RESPONDER (GHL VOICE-SAFE)
- * We return the same spoken string in multiple fields:
- * - speech (some setups read this)
- * - response/message/output (other setups read these)
- * - say/text + results.say/results.text (older patterns)
- *
- * Also cap length to avoid Voice truncation/timeouts.
+ * VOICE-FIRST RESPONDER
+ * Returns a minimal, clean payload with ONE spoken field: speech
+ * Avoids overwhelming GHL voice layer with duplicate/nested text fields
  */
 function respondJSON(res, payload) {
-  // Pick spoken content from payload in a flexible way:
-  const candidate =
-    payload?.speech ??
-    payload?.response ??
-    payload?.message ??
-    payload?.output ??
-    payload?.say ??
-    payload?.text ??
-    payload?.error ??
-    "";
+  const speechRaw = safeString(
+    payload?.speech ||
+    payload?.say ||
+    payload?.text ||
+    payload?.error ||
+    ""
+  );
 
-  const raw = safeString(candidate);
+  const MAX = 650;
+  let speech = speechRaw
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n+/g, ". ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  // Keep it short for voice reliability
-  const MAX = 700;
-  const spoken = raw.length > MAX ? raw.slice(0, MAX - 3) + "..." : raw;
+  if (speech.length > MAX) speech = speech.slice(0, MAX - 3) + "...";
 
   const finalPayload = {
     success: !!payload?.success,
-
-    // Most important: these are the “likely-to-be-read” fields
-    speech: spoken,
-    response: spoken,
-    message: spoken,
-    output: spoken,
-
-    // Backward-compat fields
-    say: spoken,
-    text: spoken,
-    results: { say: spoken, text: spoken },
-
-    // Structured data stays here
-    data: payload?.data ?? null,
-
+    speech,                          // ✅ only field GHL voice should read
+    slots: payload?.slots || [],     // ✅ structured class list for booking
+    data: payload?.data || null,
     error: payload?.error ? safeString(payload.error) : "",
-
-    // Debug stamp so we know what deploy answered
     buildId: BUILD_ID,
   };
 
   console.log(
     "RESPONDING:",
     finalPayload.success,
-    (finalPayload.speech || "").slice(0, 120),
+    speech.slice(0, 140),
     "| buildId:",
-    finalPayload.buildId
+    BUILD_ID
   );
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -138,19 +132,15 @@ function requireEnv(name) {
 
 function getMindbodyConfig() {
   const mode = (requireEnv("MINDBODY_MODE") || "live").toLowerCase();
-
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const siteId = requireEnv("MINDBODY_SITE_ID");
   const baseUrl =
     requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
-
   const tokenUsername = requireEnv("MINDBODY_TOKEN_USERNAME");
   const tokenPassword = requireEnv("MINDBODY_TOKEN_PASSWORD");
-
   return { mode, apiKey, siteId, baseUrl, tokenUsername, tokenPassword };
 }
 
-// Get YYYY-MM-DD "today" in a given IANA timezone using Intl parts
 function getTodayISOInTZ(timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
   const dtf = new Intl.DateTimeFormat("en-CA", {
@@ -166,7 +156,6 @@ function getTodayISOInTZ(timeZone) {
   return `${y}-${m}-${d}`;
 }
 
-// Add N days to a YYYY-MM-DD string
 function addDaysISO(iso, days) {
   const [y, m, d] = iso.split("-").map((x) => parseInt(x, 10));
   const dt = new Date(Date.UTC(y, m - 1, d));
@@ -182,7 +171,6 @@ function compareISO(a, b) {
   return a < b ? -1 : 1;
 }
 
-// Parse date phrases to ISO date + optional timeOfDay extracted from phrase
 function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const tz = decodeMaybe(timeZone) || "America/Vancouver";
   const todayISO = getTodayISOInTZ(tz);
@@ -203,41 +191,21 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     .trim();
 
   if (phrase === "today") {
-    return {
-      ok: true,
-      requestedDate: todayISO,
-      todayISO,
-      daysAhead: 0,
-      extractedTimeOfDay,
-    };
+    return { ok: true, requestedDate: todayISO, todayISO, daysAhead: 0, extractedTimeOfDay };
   }
   if (phrase === "tomorrow") {
-    return {
-      ok: true,
-      requestedDate: addDaysISO(todayISO, 1),
-      todayISO,
-      daysAhead: 1,
-      extractedTimeOfDay,
-    };
+    return { ok: true, requestedDate: addDaysISO(todayISO, 1), todayISO, daysAhead: 1, extractedTimeOfDay };
   }
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(phrase)) {
     const daysAhead = Math.round(
-      (Date.parse(phrase + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) /
-        86400000
+      (Date.parse(phrase + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
     );
     return { ok: true, requestedDate: phrase, todayISO, daysAhead, extractedTimeOfDay };
   }
 
-  const weekdays = [
-    "sunday",
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-  ];
+  const weekdays = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+
   const mThisNext = phrase.match(
     /^(this|next)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/
   );
@@ -245,32 +213,23 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     const which = mThisNext[1];
     const wdName = mThisNext[2];
     const wdIndex = weekdays.indexOf(wdName);
-
-    const now = new Date();
     const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
-    const todayName = dtf.format(now).toLowerCase();
+    const todayName = dtf.format(new Date()).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
-
     let delta = (wdIndex - todayIdx + 7) % 7;
     if (delta === 0) delta = 7;
     if (which === "next") delta += 7;
-
-    const requestedDate = addDaysISO(todayISO, delta);
-    return { ok: true, requestedDate, todayISO, daysAhead: delta, extractedTimeOfDay };
+    return { ok: true, requestedDate: addDaysISO(todayISO, delta), todayISO, daysAhead: delta, extractedTimeOfDay };
   }
 
   const wdIndex = weekdays.indexOf(phrase);
   if (wdIndex !== -1) {
-    const now = new Date();
     const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" });
-    const todayName = dtf.format(now).toLowerCase();
+    const todayName = dtf.format(new Date()).toLowerCase();
     const todayIdx = weekdays.indexOf(todayName);
-
     let delta = (wdIndex - todayIdx + 7) % 7;
     if (delta === 0) delta = 7;
-
-    const requestedDate = addDaysISO(todayISO, delta);
-    return { ok: true, requestedDate, todayISO, daysAhead: delta, extractedTimeOfDay };
+    return { ok: true, requestedDate: addDaysISO(todayISO, delta), todayISO, daysAhead: delta, extractedTimeOfDay };
   }
 
   const dayOnly = phrase
@@ -279,40 +238,23 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   if (/^\d{1,2}$/.test(dayOnly)) {
     const dayNum = parseInt(dayOnly, 10);
     const [y, m] = todayISO.split("-").map((x) => parseInt(x, 10));
-
     const candidateThisMonth = `${y}-${String(m).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
     let requestedDate = candidateThisMonth;
-
     if (compareISO(requestedDate, todayISO) < 0) {
       const nextMonthDate = addDaysISO(`${y}-${String(m).padStart(2, "0")}-01`, 32);
       const [ny, nm] = nextMonthDate.split("-").map((x) => parseInt(x, 10));
       requestedDate = `${ny}-${String(nm).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
     }
-
     const daysAhead = Math.round(
-      (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) /
-        86400000
+      (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
     );
     return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
   }
 
-  const cleaned = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1");
-  const monthNames = [
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
-  ];
+  const monthNames = ["january","february","march","april","may","june","july","august","september","october","november","december"];
   const monthShort = monthNames.map((x) => x.slice(0, 3));
 
+  const cleaned = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1");
   const md = cleaned.match(/^([a-z]+)\s+(\d{1,2})$/);
   if (md) {
     const monRaw = md[1];
@@ -326,32 +268,24 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
         requestedDate = `${y + 1}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
       }
       const daysAhead = Math.round(
-        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) /
-          86400000
+        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
       );
       return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
     }
   }
 
-  const cleaned2 = phrase
-    .replace(/(\d+)(st|nd|rd|th)/g, "$1")
-    .replace(/,/g, "")
-    .trim();
-
+  const cleaned2 = phrase.replace(/(\d+)(st|nd|rd|th)/g, "$1").replace(/,/g, "").trim();
   const mdy = cleaned2.match(/^([a-z]+)\s+(\d{1,2})\s+(\d{4})$/);
   if (mdy) {
     const monRaw = mdy[1];
     const dayNum = parseInt(mdy[2], 10);
     const yearNum = parseInt(mdy[3], 10);
-
     let monIdx = monthNames.indexOf(monRaw);
     if (monIdx === -1) monIdx = monthShort.indexOf(monRaw.slice(0, 3));
-
     if (monIdx !== -1) {
       const requestedDate = `${yearNum}-${String(monIdx + 1).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
       const daysAhead = Math.round(
-        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) /
-          86400000
+        (Date.parse(requestedDate + "T00:00:00Z") - Date.parse(todayISO + "T00:00:00Z")) / 86400000
       );
       return { ok: true, requestedDate, todayISO, daysAhead, extractedTimeOfDay };
     }
@@ -372,29 +306,45 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
+/**
+ * TTS-tight schedule builder
+ * Uses ". " joins (no newlines) so voice reads smoothly
+ * Caps at 7 classes for voice reliability
+ */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
-  const lines = [];
-  lines.push(`Here are the classes for ${spokenDateLabel}.`);
-  for (const c of safeClasses) {
+  const top = safeClasses.slice(0, 7);
+
+  if (!top.length) {
+    return `I couldn't find any classes for ${spokenDateLabel}. Would you like a different date?`;
+  }
+
+  const parts = [`Here are the classes for ${spokenDateLabel}.`];
+
+  for (const c of top) {
     const time = c?.time || "Time TBD";
     const name = c?.name || "Class";
     const instructor = c?.instructor ? ` with ${c.instructor}` : "";
-    lines.push(`${time} — ${name}${instructor}.`);
+    parts.push(`${time}: ${name}${instructor}`);
   }
-  return lines.join("\n");
+
+  if (safeClasses.length > top.length) {
+    parts.push(`There are more classes that day too. Want morning, afternoon, or evening?`);
+  }
+
+  return parts.join(". ");
 }
 
 // ---------------------------
-// MOCK schedule (only used if MINDBODY_MODE=mock)
+// MOCK schedule
 // ---------------------------
 function buildMockSchedule(requestedDate) {
   return [
-    { id: `mock_${requestedDate.replaceAll("-", "")}_1`, name: "Hot Yoga (Mock)", time: "6:00 AM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${requestedDate.replaceAll("-", "")}_2`, name: "Hot Pilates (Mock)", time: "9:00 AM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${requestedDate.replaceAll("-", "")}_3`, name: "Warm Yin (Mock)", time: "12:00 PM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${requestedDate.replaceAll("-", "")}_4`, name: "Hot Yoga (Mock)", time: "5:30 PM", instructor: "Mock Instructor", bookable: true },
-    { id: `mock_${requestedDate.replaceAll("-", "")}_5`, name: "Hot Sculpt (Mock)", time: "7:00 PM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-","")}_1`, name: "Hot Yoga (Mock)", time: "6:00 AM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-","")}_2`, name: "Hot Pilates (Mock)", time: "9:00 AM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-","")}_3`, name: "Warm Yin (Mock)", time: "12:00 PM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-","")}_4`, name: "Hot Yoga (Mock)", time: "5:30 PM", instructor: "Mock Instructor", bookable: true },
+    { id: `mock_${requestedDate.replaceAll("-","")}_5`, name: "Hot Sculpt (Mock)", time: "7:00 PM", instructor: "Mock Instructor", bookable: true },
   ];
 }
 
@@ -416,29 +366,30 @@ function normalizeMindbodyClasses(rawClasses) {
       "Class";
 
     const startDateTime =
-      c?.StartDateTime ||
-      c?.startDateTime ||
-      c?.StartTime ||
-      c?.startTime ||
-      null;
+      c?.StartDateTime || c?.startDateTime || c?.StartTime || c?.startTime || null;
 
     let time = "";
     if (startDateTime) {
       const dt = new Date(startDateTime);
       if (!Number.isNaN(dt.getTime())) {
-        time = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(dt);
+        time = new Intl.DateTimeFormat("en-US", {
+          hour: "numeric",
+          minute: "2-digit",
+          timeZone: "America/Vancouver",
+        }).format(dt);
       } else {
         time = String(startDateTime);
       }
     }
 
     const instructor = c?.Staff?.Name || c?.Staff?.FirstName || c?.InstructorName || "";
-    const id = c?.Id || c?.ClassId || c?.ClassScheduleId || c?.ClassInstanceId || `class_${Math.random().toString(16).slice(2)}`;
+    const id =
+      c?.Id || c?.ClassId || c?.ClassScheduleId || c?.ClassInstanceId ||
+      `class_${Math.random().toString(16).slice(2)}`;
 
     const bookable =
       typeof c?.IsAvailable === "boolean" ? c.IsAvailable :
-      typeof c?.Bookable === "boolean" ? c.Bookable :
-      true;
+      typeof c?.Bookable === "boolean" ? c.Bookable : true;
 
     out.push({ id: String(id), name, time: time || "Time TBD", instructor: instructor || "", bookable });
   }
@@ -447,7 +398,6 @@ function normalizeMindbodyClasses(rawClasses) {
 
 async function fetchMindbodyScheduleForDate(cfg, dateISO) {
   const { start, end } = toMindbodyTimeWindow(dateISO);
-
   const url = new URL(`${cfg.baseUrl.replace(/\/$/, "")}/class/classes`);
   url.searchParams.set("StartDateTime", start);
   url.searchParams.set("EndDateTime", end);
@@ -474,9 +424,6 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
   return { raw: json, classes: normalizeMindbodyClasses(rawClasses) };
 }
 
-// ---------------------------
-// Time-of-day filtering (morning/afternoon/evening)
-// ---------------------------
 function timeStringToMinutes(t) {
   const s = String(t || "");
   const m = s.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
@@ -491,11 +438,9 @@ function timeStringToMinutes(t) {
 
 function filterClassesByTimeOfDay(classes, timeOfDay) {
   if (!timeOfDay) return classes;
-
   return (classes || []).filter((c) => {
     const mins = timeStringToMinutes(c?.time);
     if (mins === null) return false;
-
     if (timeOfDay === "morning") return mins < 12 * 60;
     if (timeOfDay === "afternoon") return mins >= 12 * 60 && mins < 17 * 60;
     if (timeOfDay === "evening") return mins >= 17 * 60;
@@ -508,9 +453,7 @@ function sortClassesByStartTime(classes) {
   arr.sort((a, b) => {
     const am = timeStringToMinutes(a?.time);
     const bm = timeStringToMinutes(b?.time);
-    const aa = am === null ? 99999 : am;
-    const bb = bm === null ? 99999 : bm;
-    return aa - bb;
+    return (am === null ? 99999 : am) - (bm === null ? 99999 : bm);
   });
   return arr;
 }
@@ -523,17 +466,12 @@ let tokenCache = { value: null, expiresAt: 0 };
 async function getMindbodyUserToken(cfg) {
   const now = Date.now();
   if (tokenCache.value && tokenCache.expiresAt > now + 5 * 60 * 1000) return tokenCache.value;
-
   if (!cfg.tokenUsername || !cfg.tokenPassword) return null;
 
   const url = `${cfg.baseUrl.replace(/\/$/, "")}/usertoken/issue`;
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      "Api-Key": cfg.apiKey,
-      "SiteId": cfg.siteId,
-      "Content-Type": "application/json",
-    },
+    headers: { "Api-Key": cfg.apiKey, "SiteId": cfg.siteId, "Content-Type": "application/json" },
     body: JSON.stringify({ Username: cfg.tokenUsername, Password: cfg.tokenPassword }),
   });
 
@@ -560,12 +498,7 @@ async function mbGet(cfg, path, token, paramsObj = {}) {
   for (const [k, v] of Object.entries(paramsObj)) {
     if (v !== undefined && v !== null && String(v).trim() !== "") url.searchParams.set(k, String(v));
   }
-
-  const headers = {
-    "Api-Key": cfg.apiKey,
-    "SiteId": cfg.siteId,
-    "Content-Type": "application/json",
-  };
+  const headers = { "Api-Key": cfg.apiKey, "SiteId": cfg.siteId, "Content-Type": "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
   const resp = await fetch(url.toString(), { method: "GET", headers });
@@ -582,12 +515,7 @@ async function mbGet(cfg, path, token, paramsObj = {}) {
 
 async function mbPost(cfg, path, token, bodyObj = {}) {
   const url = `${cfg.baseUrl.replace(/\/$/, "")}${path}`;
-
-  const headers = {
-    "Api-Key": cfg.apiKey,
-    "SiteId": cfg.siteId,
-    "Content-Type": "application/json",
-  };
+  const headers = { "Api-Key": cfg.apiKey, "SiteId": cfg.siteId, "Content-Type": "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
   const resp = await fetch(url, {
@@ -616,16 +544,13 @@ function normalizePhone(phoneRaw) {
 async function findClientId(cfg, token, email, phone) {
   const searchText = email || phone || "";
   if (!searchText) return null;
-
   const json = await mbGet(cfg, "/client/clients", token, { SearchText: searchText, Limit: 10, Offset: 0 });
   const clients = json?.Clients || json?.clients || [];
   if (!Array.isArray(clients) || clients.length === 0) return null;
-
   if (email) {
     const exact = clients.find((c) => (c?.Email || c?.email || "").toLowerCase() === email.toLowerCase());
     if (exact?.Id) return String(exact.Id);
   }
-
   const first = clients[0];
   if (first?.Id) return String(first.Id);
   return null;
@@ -635,7 +560,6 @@ async function createClient(cfg, token, firstName, lastName, email, phone) {
   const payload = { FirstName: firstName, LastName: lastName };
   if (email) payload.Email = email;
   if (phone) payload.MobilePhone = phone;
-
   const json = await mbPost(cfg, "/client/addclient", token, payload);
   const client = json?.Client || json?.client || json;
   const id = client?.Id || client?.ClientId || client?.id;
@@ -644,13 +568,11 @@ async function createClient(cfg, token, firstName, lastName, email, phone) {
 }
 
 async function bookClientIntoClass(cfg, token, clientId, classId) {
-  const payload = { ClientId: clientId, ClassId: Number(classId) };
-  return await mbPost(cfg, "/class/addclienttoclass", token, payload);
+  return await mbPost(cfg, "/class/addclienttoclass", token, { ClientId: clientId, ClassId: Number(classId) });
 }
 
 async function cancelClientFromClass(cfg, token, clientId, classId) {
-  const payload = { ClientId: clientId, ClassId: Number(classId) };
-  return await mbPost(cfg, "/class/removeclientfromclass", token, payload);
+  return await mbPost(cfg, "/class/removeclientfromclass", token, { ClientId: clientId, ClassId: Number(classId) });
 }
 
 // ---------------------------
@@ -673,33 +595,28 @@ app.post("/ghl/mindbody", async (req, res) => {
     q.dateParam ?? b.dateParam;
 
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
-
   const classId = decodeMaybe(q.classId ?? b.classId).trim();
 
   const firstName = decodeMaybe(
-    q.firstName ?? b.firstName ??
-    q.client_first_name ?? b.client_first_name
+    q.firstName ?? b.firstName ?? q.client_first_name ?? b.client_first_name
   ).trim();
-
   const lastName = decodeMaybe(
-    q.lastName ?? b.lastName ??
-    q.client_last_name ?? b.client_last_name
+    q.lastName ?? b.lastName ?? q.client_last_name ?? b.client_last_name
   ).trim();
-
   const email = decodeMaybe(q.email ?? b.email).trim();
   const phone = normalizePhone(q.phone ?? b.phone ?? q.mobilephone ?? b.mobilephone);
-
   const isNewClientRaw = decodeMaybe(
-    q.isNewClient ?? b.isNewClient ??
-    q.is_new_client ?? b.is_new_client
+    q.isNewClient ?? b.isNewClient ?? q.is_new_client ?? b.is_new_client
   ).trim().toLowerCase();
 
   console.log("--------------------------------------------------");
-  console.log("POST /ghl/mindbody");
-  console.log("action:", action);
+  console.log("POST /ghl/mindbody | action:", action);
   console.log("query:", q);
   console.log("body:", b);
 
+  // ---------------------------
+  // PING
+  // ---------------------------
   if (action === "ping") {
     return respondJSON(res, {
       success: true,
@@ -714,118 +631,97 @@ app.post("/ghl/mindbody", async (req, res) => {
   // ---------------------------
   // GET SCHEDULE
   // ---------------------------
-  if (action === "get_schedule" || action === "get_schedule_web" || action === "get_schedule_by_date") {
+  if (
+    action === "get_schedule" ||
+    action === "get_schedule_web" ||
+    action === "get_schedule_by_date"
+  ) {
     const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
+
     if (!resolved.ok) {
       return respondJSON(res, {
         success: false,
+        speech: `I couldn't understand that date. What day did you mean?`,
         error: `Could not parse date: ${resolved.reason}`,
-        speech: `I couldn’t understand that date. What day did you mean?`,
         data: { action, studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
     }
 
     const finalTimeOfDay = timeOfDayParam || resolved.extractedTimeOfDay || null;
+    const requestedDate = resolved.requestedDate;
+    const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
 
+    // ---- MOCK ----
     if (cfg.mode !== "live") {
-      const requestedDate = resolved.requestedDate;
-      const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
       let classes = buildMockSchedule(requestedDate);
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
-      if (!classes || classes.length === 0) {
-        const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
+      if (!classes.length) {
         return respondJSON(res, {
           success: false,
-          speech: msg,
-          data: {
-            action: "get_schedule",
-            mode: "mock",
-            studioKey,
-            timezone,
-            source,
-            requestedDate,
-            timeOfDay: finalTimeOfDay,
-            schedule: { studioKey, timezone, date: requestedDate, spokenDate, classes: [] },
-          },
+          speech: `I couldn't find any classes for ${spokenDate}. Would you like a different date?`,
+          slots: [],
+          data: { action: "get_schedule", mode: "mock", studioKey, timezone, source, requestedDate, timeOfDay: finalTimeOfDay, spokenDate },
         });
       }
 
       const speech = buildScheduleSay(spokenDate, classes);
+      const slots = classes.slice(0, 12).map((c) => ({
+        id: String(c.id), time: c.time, name: c.name, instructor: c.instructor || "", bookable: !!c.bookable,
+      }));
+
       return respondJSON(res, {
         success: true,
         speech,
-        data: {
-          action: "get_schedule",
-          mode: "mock",
-          studioKey,
-          timezone,
-          source,
-          requestedDate,
-          timeOfDay: finalTimeOfDay,
-          schedule: { studioKey, timezone, date: requestedDate, spokenDate, classes },
-        },
+        slots,
+        data: { action: "get_schedule", mode: "mock", studioKey, timezone, source, requestedDate, timeOfDay: finalTimeOfDay, spokenDate },
       });
     }
 
+    // ---- LIVE not configured ----
     if (!liveConfigured) {
       return respondJSON(res, {
         success: false,
-        error: "Mindbody LIVE not configured. Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
-        speech: "I’m not connected to Mindbody yet on my end.",
+        speech: "I'm not connected to Mindbody yet on my end.",
+        error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
         data: { action: "get_schedule", mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
 
+    // ---- LIVE ----
     try {
-      const requestedDate = resolved.requestedDate;
-      const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
-
       const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       let classes = schedule.classes;
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
-      if (!classes || classes.length === 0) {
-        const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
+      if (!classes.length) {
         return respondJSON(res, {
           success: false,
-          speech: msg,
-          data: {
-            action: "get_schedule",
-            mode: "live",
-            studioKey,
-            timezone,
-            source,
-            requestedDate,
-            timeOfDay: finalTimeOfDay,
-            schedule: { studioKey, timezone, date: requestedDate, spokenDate, classes: [] },
-          },
+          speech: `I couldn't find any classes for ${spokenDate}. Would you like a different date?`,
+          slots: [],
+          data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, timeOfDay: finalTimeOfDay, spokenDate },
         });
       }
 
       const speech = buildScheduleSay(spokenDate, classes);
+      const slots = classes.slice(0, 12).map((c) => ({
+        id: String(c.id), time: c.time, name: c.name, instructor: c.instructor || "", bookable: !!c.bookable,
+      }));
 
       return respondJSON(res, {
         success: true,
         speech,
-        data: {
-          action: "get_schedule",
-          mode: "live",
-          studioKey,
-          timezone,
-          source,
-          requestedDate,
-          timeOfDay: finalTimeOfDay,
-          schedule: { studioKey, timezone, date: requestedDate, spokenDate, classes },
-        },
+        slots,
+        data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, timeOfDay: finalTimeOfDay, spokenDate },
       });
     } catch (err) {
       console.log("Mindbody live schedule error:", err?.message || err);
       return respondJSON(res, {
         success: false,
-        speech: "I’m having trouble pulling the schedule right now. Want me to try again?",
+        speech: "I'm not able to pull the schedule up on my end right now. Would you like me to try again?",
+        slots: [],
         error: err?.message || "Mindbody live schedule error",
         data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
@@ -843,7 +739,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         data: { action, mode: cfg.mode, studioKey, timezone, source },
       });
     }
-
     if (!liveConfigured) {
       return respondJSON(res, {
         success: false,
@@ -852,11 +747,10 @@ app.post("/ghl/mindbody", async (req, res) => {
         data: { action, mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
-
     if (!classId) {
       return respondJSON(res, {
         success: false,
-        speech: "I’m missing the class selection.",
+        speech: "I'm missing the class selection.",
         error: "Missing classId",
         data: { action, studioKey, timezone, source },
       });
@@ -867,23 +761,22 @@ app.post("/ghl/mindbody", async (req, res) => {
       if (!token) {
         return respondJSON(res, {
           success: false,
-          speech: "Booking isn’t enabled yet on our side.",
-          error: "Booking requires Mindbody user token credentials. Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
+          speech: "Booking isn't enabled yet on our side.",
+          error: "Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
           data: { action, mode: "live_missing_token_creds", studioKey, timezone, source, classId },
         });
       }
 
       const isNewClient = (isNewClientRaw === "true" || isNewClientRaw === "yes" || isNewClientRaw === "1");
-
       let clientId = await findClientId(cfg, token, email, phone);
-
       let created = false;
+
       if (!clientId) {
         if (!firstName || !lastName) {
           return respondJSON(res, {
             success: false,
             speech: "I just need your first and last name to complete the booking.",
-            error: "No existing client found; missing firstName/lastName to create new client.",
+            error: "Missing firstName/lastName to create new client.",
             data: { action, studioKey, timezone, source, classId, email, phone },
           });
         }
@@ -894,8 +787,8 @@ app.post("/ghl/mindbody", async (req, res) => {
       await bookClientIntoClass(cfg, token, clientId, classId);
 
       const speech = (created || isNewClient)
-        ? "You’re booked."
-        : "You’re booked.";
+        ? "You're booked! I'll send you a waiver link right after this call to complete before class."
+        : "You're booked! Is there anything else I can help you with?";
 
       return respondJSON(res, {
         success: true,
@@ -913,7 +806,7 @@ app.post("/ghl/mindbody", async (req, res) => {
       console.log("Mindbody book_class error:", err?.message || err);
       return respondJSON(res, {
         success: false,
-        speech: "I couldn’t complete that booking right now.",
+        speech: "I couldn't complete that booking right now.",
         error: err?.message || "Mindbody booking error",
         data: { action, mode: "live_error", studioKey, timezone, source, classId, email, phone },
       });
@@ -931,7 +824,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         data: { action, mode: cfg.mode, studioKey, timezone, source },
       });
     }
-
     if (!liveConfigured) {
       return respondJSON(res, {
         success: false,
@@ -940,11 +832,10 @@ app.post("/ghl/mindbody", async (req, res) => {
         data: { action, mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
-
     if (!classId) {
       return respondJSON(res, {
         success: false,
-        speech: "I’m missing the class selection to cancel.",
+        speech: "I'm missing the class to cancel.",
         error: "Missing classId",
         data: { action, studioKey, timezone, source },
       });
@@ -955,8 +846,8 @@ app.post("/ghl/mindbody", async (req, res) => {
       if (!token) {
         return respondJSON(res, {
           success: false,
-          speech: "Canceling isn’t enabled yet on our side.",
-          error: "Canceling requires Mindbody user token credentials. Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
+          speech: "Canceling isn't enabled yet on our side.",
+          error: "Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
           data: { action, mode: "live_missing_token_creds", studioKey, timezone, source, classId },
         });
       }
@@ -965,7 +856,7 @@ app.post("/ghl/mindbody", async (req, res) => {
       if (!clientId) {
         return respondJSON(res, {
           success: false,
-          speech: "I couldn’t find your account to cancel that booking.",
+          speech: "I couldn't find your account to cancel that booking.",
           error: "No client found for provided email/phone.",
           data: { action, studioKey, timezone, source, classId, email, phone },
         });
@@ -973,10 +864,9 @@ app.post("/ghl/mindbody", async (req, res) => {
 
       await cancelClientFromClass(cfg, token, clientId, classId);
 
-      const speech = "Done — you’re canceled.";
       return respondJSON(res, {
         success: true,
-        speech,
+        speech: "Done — you're canceled. Would you like to book a different class instead?",
         data: {
           action,
           mode: "live",
@@ -990,21 +880,27 @@ app.post("/ghl/mindbody", async (req, res) => {
       console.log("Mindbody cancel_class error:", err?.message || err);
       return respondJSON(res, {
         success: false,
-        speech: "I couldn’t cancel that right now.",
+        speech: "I couldn't cancel that right now.",
         error: err?.message || "Mindbody cancel error",
         data: { action, mode: "live_error", studioKey, timezone, source, classId, email, phone },
       });
     }
   }
 
+  // ---------------------------
+  // Unknown action
+  // ---------------------------
   return respondJSON(res, {
     success: false,
-    speech: `Unknown action: ${action}`,
+    speech: `I didn't recognize that request.`,
     error: `Unknown action: ${action}`,
     data: { action, studioKey, timezone, source },
   });
 });
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
-app.listen(PORT, () => console.log(`Server listening on ${PORT} | buildId: ${BUILD_ID}`));
+
+app.listen(PORT, () =>
+  console.log(`Server listening on ${PORT} | buildId: ${BUILD_ID}`)
+);
 
