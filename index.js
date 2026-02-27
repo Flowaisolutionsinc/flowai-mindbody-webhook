@@ -386,7 +386,7 @@ function buildScheduleSay(spokenDateLabel, classes) {
       .replace(/\*/g, "")
       .trim();
     // Wrap class name in quotes so GPT-4o reads it as a proper noun
-    lines.push(`${time} — "${cleanName}"${instructor}`);
+    lines.push(`${time}: ${cleanName}${instructor}`);
   }
 
   return `Here are the classes for ${spokenDateLabel}. ` + lines.join(". ") + ". Would you like to book one of those?";
