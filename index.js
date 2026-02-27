@@ -155,8 +155,13 @@ function respondJSON(res, payload) {
 
   const finalPayload = {
     success: !!payload?.success,
-    speech,                          // ✅ only field GHL voice should read
-    slots: payload?.slots || [],     // ✅ structured class list for booking
+    speech,
+    message: speech,
+    text: speech,
+    response: speech,
+    result: speech,
+    output: speech,
+    slots: payload?.slots || [],
     data: payload?.data || null,
     error: payload?.error ? safeString(payload.error) : "",
     buildId: BUILD_ID,
