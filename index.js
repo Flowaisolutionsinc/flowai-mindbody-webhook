@@ -692,7 +692,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: `I couldn't understand that date. What day did you mean?`,
         error: `Could not parse date: ${resolved.reason}`,
-        data: { action, studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
+        data: { action, studioKey, timezone, source, datePhraseRaw },
       });
     }
 
@@ -781,7 +781,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         speech: "I'm not able to pull the schedule up on my end right now. Would you like me to try again?",
         slots: [],
         error: err?.message || "Mindbody live schedule error",
-        data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
+        data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw },
       });
     }
   }
