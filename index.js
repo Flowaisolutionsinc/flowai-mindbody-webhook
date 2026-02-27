@@ -384,7 +384,7 @@ function buildScheduleSay(spokenDateLabel, classes) {
     lines.push(`${time} — "${cleanName}"${instructor}`);
   }
 
-  return `READBACK: Here are the classes for ${spokenDateLabel}. ` + lines.join(". ") + ". Would you like to book one of those?";
+  return `Here are the classes for ${spokenDateLabel}. ` + lines.join(". ") + ". Would you like to book one of those?";
 }
 
 // ---------------------------
