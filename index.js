@@ -56,6 +56,56 @@ if (SELF_URL) {
 }
 
 // ---------------------------
+// Schedule Cache
+// Pre-fetches Mindbody schedules so GHL gets sub-second responses
+// ---------------------------
+const scheduleCache = new Map();
+const CACHE_TTL_MS = 15 * 60 * 1000;
+
+function getCached(dateStr) {
+  const entry = scheduleCache.get(dateStr);
+  if (!entry) return null;
+  if (Date.now() - entry.fetchedAt > CACHE_TTL_MS) {
+    scheduleCache.delete(dateStr);
+    return null;
+  }
+  return entry;
+}
+
+async function warmCacheForDate(cfg, dateStr) {
+  try {
+    const schedule = await fetchMindbodyScheduleForDate(cfg, dateStr);
+    let classes = schedule.classes;
+    classes = sortClassesByStartTime(classes);
+    const tz = cfg.timezone || "America/Vancouver";
+    const spokenDate = buildSpokenDateLabel(dateStr, tz);
+    const speech = buildScheduleSay(spokenDate, classes);
+    const slots = classes.slice(0, 12).map((c) => ({
+      id: String(c.id), time: c.time, name: c.name, instructor: c.instructor || "", bookable: !!c.bookable,
+    }));
+    scheduleCache.set(dateStr, { speech, slots, spokenDate, fetchedAt: Date.now() });
+    console.log(`cache warmed: ${dateStr} (${classes.length} classes)`);
+  } catch (e) {
+    console.log(`cache warm failed ${dateStr}:`, e.message);
+  }
+}
+
+function startCacheWarmer(cfg) {
+  if (cfg.mode === "mock") return;
+  const warm = async () => {
+    const now = new Date();
+    for (let i = 0; i < 8; i++) {
+      const d = new Date(now);
+      d.setDate(d.getDate() + i);
+      const dateStr = d.toISOString().split("T")[0];
+      await warmCacheForDate(cfg, dateStr);
+    }
+  };
+  warm();
+  setInterval(warm, CACHE_TTL_MS);
+}
+
+// ---------------------------
 // Helpers
 // ---------------------------
 function safeString(v) {
@@ -688,6 +738,18 @@ app.post("/ghl/mindbody", async (req, res) => {
 
     // ---- LIVE ----
     try {
+      // Check cache first for instant response
+      const cached = getCached(requestedDate);
+      if (cached) {
+        console.log(`cache hit: ${requestedDate}`);
+        return respondJSON(res, {
+          success: true,
+          speech: cached.speech,
+          slots: cached.slots,
+          data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, spokenDate: cached.spokenDate, cached: true },
+        });
+      }
+
       const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       let classes = schedule.classes;
       classes = sortClassesByStartTime(classes);
@@ -896,6 +958,9 @@ app.post("/ghl/mindbody", async (req, res) => {
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-app.listen(PORT, () =>
-  console.log(`Server listening on ${PORT} | buildId: ${BUILD_ID}`)
+app.listen(PORT, () => {
+  console.log(`Server listening on ${PORT} | buildId: ${BUILD_ID}`);
+  const cfg = getStudioConfig("oxygen_roundhouse");
+  startCacheWarmer(cfg);
+}
 );
