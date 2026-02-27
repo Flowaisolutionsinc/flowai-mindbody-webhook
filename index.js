@@ -960,7 +960,12 @@ app.get("/", (_req, res) => res.status(200).send("ok"));
 
 app.listen(PORT, () => {
   console.log(`Server listening on ${PORT} | buildId: ${BUILD_ID}`);
-  const cfg = getStudioConfig("oxygen_roundhouse");
-  startCacheWarmer(cfg);
-}
-);
+  const warmCfg = {
+    mode: process.env.MINDBODY_MODE || "live",
+    apiKey: process.env.MINDBODY_API_KEY || "",
+    siteId: process.env.MINDBODY_SITE_ID || "",
+    baseUrl: process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6",
+    timezone: "America/Vancouver",
+  };
+  startCacheWarmer(warmCfg);
+});
