@@ -588,8 +588,6 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
 
-  const timeOfDayParam = normalizeTimeOfDay(q.timeOfDay ?? b.timeOfDay);
-
   const dateParamRaw =
     q.date ?? b.date ??
     q.datePhrase ?? b.datePhrase ??
@@ -648,14 +646,12 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     }
 
-    const finalTimeOfDay = timeOfDayParam || resolved.extractedTimeOfDay || null;
     const requestedDate = resolved.requestedDate;
     const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
 
     // ---- MOCK ----
     if (cfg.mode !== "live") {
       let classes = buildMockSchedule(requestedDate);
-      classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
       if (!classes.length) {
@@ -663,7 +659,7 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           speech: `I couldn't find any classes for ${spokenDate}. Would you like a different date?`,
           slots: [],
-          data: { action: "get_schedule", mode: "mock", studioKey, timezone, source, requestedDate, timeOfDay: finalTimeOfDay, spokenDate },
+          data: { action: "get_schedule", mode: "mock", studioKey, timezone, source, requestedDate, spokenDate },
         });
       }
 
@@ -676,7 +672,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: true,
         speech,
         slots,
-        data: { action: "get_schedule", mode: "mock", studioKey, timezone, source, requestedDate, timeOfDay: finalTimeOfDay, spokenDate },
+        data: { action: "get_schedule", mode: "mock", studioKey, timezone, source, requestedDate, spokenDate },
       });
     }
 
@@ -694,7 +690,6 @@ app.post("/ghl/mindbody", async (req, res) => {
     try {
       const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       let classes = schedule.classes;
-      classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
       if (!classes.length) {
@@ -702,7 +697,7 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           speech: `I couldn't find any classes for ${spokenDate}. Would you like a different date?`,
           slots: [],
-          data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, timeOfDay: finalTimeOfDay, spokenDate },
+          data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, spokenDate },
         });
       }
 
@@ -715,7 +710,7 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: true,
         speech,
         slots,
-        data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, timeOfDay: finalTimeOfDay, spokenDate },
+        data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, spokenDate },
       });
     } catch (err) {
       console.log("Mindbody live schedule error:", err?.message || err);
@@ -904,4 +899,3 @@ app.get("/", (_req, res) => res.status(200).send("ok"));
 app.listen(PORT, () =>
   console.log(`Server listening on ${PORT} | buildId: ${BUILD_ID}`)
 );
-
