@@ -360,7 +360,7 @@ function buildSpokenDateLabel(dateISO, timeZone) {
  */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
-  const top = safeClasses.slice(0, 3);
+  const top = safeClasses.slice(0, 4);
 
   if (!top.length) {
     return `I couldn't find any classes for ${spokenDateLabel}. Would you like a different date?`;
@@ -370,18 +370,20 @@ function buildScheduleSay(spokenDateLabel, classes) {
 
   for (const c of top) {
     const time = c?.time || "Time TBD";
-    const name = c?.name || "Class";
-    const instructor = c?.instructor ? ` with ${c.instructor}` : "";
-    const cleanName = name
+    const instructor = c?.instructor || "staff";
+    const name = (c?.name || "Class")
+      .replace(/EXPRESS\s*/gi, "")
+      .replace(/NEW\s*/gi, "")
+      .replace(/\(Pilates Inspired\)/gi, "Pilates")
       .replace(/&/g, "and")
       .replace(/\|/g, "")
       .replace(/\*/g, "")
+      .replace(/\s+/g, " ")
       .trim();
-    // Wrap class name in quotes so GPT-4o reads it as a proper noun
-    lines.push(`${time}: ${cleanName}${instructor}`);
+    lines.push(`${time} ${name} with ${instructor}`);
   }
 
-  return `Here are the classes for ${spokenDateLabel}. ` + lines.join(". ") + ". Would you like to book one of those?";
+  return `The classes for ${spokenDateLabel} are: ` + lines.join(", ") + ". Would you like to book one?";
 }
 
 // ---------------------------
