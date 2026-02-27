@@ -18,8 +18,14 @@
  *   MINDBODY_TOKEN_USERNAME
  *   MINDBODY_TOKEN_PASSWORD
  *
- * Returns voice-agent-friendly payload (GHL Voice-safe):
- *   { success: boolean, speech: string, data: any, error: string }
+ * Returns voice-agent-friendly payload:
+ *  {
+ *    success,
+ *    speech, response, say, text,
+ *    results:{say,text},
+ *    data:{...},
+ *    error:""
+ *  }
  */
 
 const express = require("express");
@@ -29,6 +35,13 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 8080;
+
+// Optional “which deploy am I hitting” stamp (super helpful)
+const BUILD_ID =
+  process.env.RAILWAY_GIT_COMMIT_SHA ||
+  process.env.RAILWAY_STATIC_URL ||
+  process.env.BUILD_ID ||
+  "local";
 
 // ---------------------------
 // Helpers
@@ -56,38 +69,64 @@ function normalizeTimeOfDay(v) {
 }
 
 /**
- * ✅ UPDATED RESPONDER (VOICE-SAFE)
- * - Minimal payload: { success, speech, data, error }
- * - ONE canonical spoken field: `speech`
- * - Cap speech so Voice AI doesn't truncate/fail
+ * ✅ UPDATED RESPONDER (GHL VOICE-SAFE)
+ * We return the same spoken string in multiple fields:
+ * - speech (some setups read this)
+ * - response/message/output (other setups read these)
+ * - say/text + results.say/results.text (older patterns)
+ *
+ * Also cap length to avoid Voice truncation/timeouts.
  */
 function respondJSON(res, payload) {
-  const raw = safeString(
+  // Pick spoken content from payload in a flexible way:
+  const candidate =
     payload?.speech ??
-      payload?.say ??
-      payload?.text ??
-      payload?.response ??
-      payload?.message ??
-      payload?.output ??
-      payload?.result ??
-      payload?.error ??
-      ""
-  ).trim();
+    payload?.response ??
+    payload?.message ??
+    payload?.output ??
+    payload?.say ??
+    payload?.text ??
+    payload?.error ??
+    "";
 
+  const raw = safeString(candidate);
+
+  // Keep it short for voice reliability
   const MAX = 700;
-  const speech = raw.length > MAX ? raw.slice(0, MAX - 3) + "..." : raw;
+  const spoken = raw.length > MAX ? raw.slice(0, MAX - 3) + "..." : raw;
 
   const finalPayload = {
     success: !!payload?.success,
-    speech, // 👈 GHL Voice should read this
+
+    // Most important: these are the “likely-to-be-read” fields
+    speech: spoken,
+    response: spoken,
+    message: spoken,
+    output: spoken,
+
+    // Backward-compat fields
+    say: spoken,
+    text: spoken,
+    results: { say: spoken, text: spoken },
+
+    // Structured data stays here
     data: payload?.data ?? null,
+
     error: payload?.error ? safeString(payload.error) : "",
+
+    // Debug stamp so we know what deploy answered
+    buildId: BUILD_ID,
   };
 
-  console.log("RESPONDING:", finalPayload.success, (speech || "").slice(0, 140));
+  console.log(
+    "RESPONDING:",
+    finalPayload.success,
+    (finalPayload.speech || "").slice(0, 120),
+    "| buildId:",
+    finalPayload.buildId
+  );
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store");
   return res.status(200).json(finalPayload);
 }
 
@@ -151,8 +190,7 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
   const phraseRaw = decodeMaybe(datePhraseRaw).trim().toLowerCase();
   if (!phraseRaw) return { ok: false, reason: "missing date phrase" };
 
-  // Backup: extract time-of-day words if someone still sends "tomorrow afternoon"
-  let extractedTimeOfDay = null; // morning|afternoon|evening
+  let extractedTimeOfDay = null;
   let phrase = phraseRaw;
 
   if (/\bmorning\b|\bearly\b/.test(phrase)) extractedTimeOfDay = "morning";
@@ -295,7 +333,6 @@ function resolveDatePhraseToISO(datePhraseRaw, timeZone) {
     }
   }
 
-  // "February 22, 2026" / "Feb 22, 2026" / "February 22nd, 2026"
   const cleaned2 = phrase
     .replace(/(\d+)(st|nd|rd|th)/g, "$1")
     .replace(/,/g, "")
@@ -335,24 +372,16 @@ function buildSpokenDateLabel(dateISO, timeZone) {
   }).format(dt);
 }
 
-/**
- * ✅ FIXED:
- * - NO "Which class would you like to book?" in the webhook message.
- *   Your prompt handles the follow-up question AFTER speaking tool output.
- */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
-
   const lines = [];
   lines.push(`Here are the classes for ${spokenDateLabel}.`);
-
   for (const c of safeClasses) {
     const time = c?.time || "Time TBD";
     const name = c?.name || "Class";
     const instructor = c?.instructor ? ` with ${c.instructor}` : "";
     lines.push(`${time} — ${name}${instructor}.`);
   }
-
   return lines.join("\n");
 }
 
@@ -474,10 +503,6 @@ function filterClassesByTimeOfDay(classes, timeOfDay) {
   });
 }
 
-/**
- * ✅ STEP A FIX:
- * Sort classes by time (earliest -> latest) so the webhook speech is already perfect.
- */
 function sortClassesByStartTime(classes) {
   const arr = Array.isArray(classes) ? classes : [];
   arr.sort((a, b) => {
@@ -640,7 +665,6 @@ app.post("/ghl/mindbody", async (req, res) => {
   const timezone = decodeMaybe(q.timezone ?? b.timezone).trim() || "America/Vancouver";
   const source = decodeMaybe(q.source ?? b.source).trim() || "agencyvault";
 
-  // NEW: timeOfDay param can be passed explicitly (preferred)
   const timeOfDayParam = normalizeTimeOfDay(q.timeOfDay ?? b.timeOfDay);
 
   const dateParamRaw =
@@ -650,7 +674,6 @@ app.post("/ghl/mindbody", async (req, res) => {
 
   const datePhraseRaw = decodeMaybe(dateParamRaw).trim();
 
-  // Booking/Cancellation
   const classId = decodeMaybe(q.classId ?? b.classId).trim();
 
   const firstName = decodeMaybe(
@@ -696,13 +719,12 @@ app.post("/ghl/mindbody", async (req, res) => {
     if (!resolved.ok) {
       return respondJSON(res, {
         success: false,
-        speech: `Could not parse date: ${resolved.reason}`,
         error: `Could not parse date: ${resolved.reason}`,
+        speech: `I couldn’t understand that date. What day did you mean?`,
         data: { action, studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
     }
 
-    // Preferred explicit param; fallback to extraction from date phrase
     const finalTimeOfDay = timeOfDayParam || resolved.extractedTimeOfDay || null;
 
     if (cfg.mode !== "live") {
@@ -712,7 +734,6 @@ app.post("/ghl/mindbody", async (req, res) => {
       classes = filterClassesByTimeOfDay(classes, finalTimeOfDay);
       classes = sortClassesByStartTime(classes);
 
-      // If no classes: keep it simple + voice-friendly
       if (!classes || classes.length === 0) {
         const msg = `I couldn’t find any classes for ${spokenDate}. Would you like a different date?`;
         return respondJSON(res, {
@@ -731,10 +752,10 @@ app.post("/ghl/mindbody", async (req, res) => {
         });
       }
 
-      const say = buildScheduleSay(spokenDate, classes);
+      const speech = buildScheduleSay(spokenDate, classes);
       return respondJSON(res, {
         success: true,
-        speech: say,
+        speech,
         data: {
           action: "get_schedule",
           mode: "mock",
@@ -749,11 +770,10 @@ app.post("/ghl/mindbody", async (req, res) => {
     }
 
     if (!liveConfigured) {
-      const msg = "Mindbody LIVE not configured yet.";
       return respondJSON(res, {
         success: false,
-        speech: msg,
-        error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
+        error: "Mindbody LIVE not configured. Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
+        speech: "I’m not connected to Mindbody yet on my end.",
         data: { action: "get_schedule", mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
@@ -785,11 +805,11 @@ app.post("/ghl/mindbody", async (req, res) => {
         });
       }
 
-      const say = buildScheduleSay(spokenDate, classes);
+      const speech = buildScheduleSay(spokenDate, classes);
 
       return respondJSON(res, {
         success: true,
-        speech: say,
+        speech,
         data: {
           action: "get_schedule",
           mode: "live",
@@ -803,10 +823,9 @@ app.post("/ghl/mindbody", async (req, res) => {
       });
     } catch (err) {
       console.log("Mindbody live schedule error:", err?.message || err);
-      const msg = "I’m not able to pull the schedule up on my end right now.";
       return respondJSON(res, {
         success: false,
-        speech: msg,
+        speech: "I’m having trouble pulling the schedule right now. Want me to try again?",
         error: err?.message || "Mindbody live schedule error",
         data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw, timeOfDayParam },
       });
@@ -874,13 +893,13 @@ app.post("/ghl/mindbody", async (req, res) => {
 
       await bookClientIntoClass(cfg, token, clientId, classId);
 
-      const say = (created || isNewClient)
-        ? "You’re booked! I’ll also send you a waiver link right after this call to complete before class."
-        : "You’re booked! Anything else I can help you with?";
+      const speech = (created || isNewClient)
+        ? "You’re booked."
+        : "You’re booked.";
 
       return respondJSON(res, {
         success: true,
-        speech: say,
+        speech,
         data: {
           action,
           mode: "live",
@@ -954,10 +973,10 @@ app.post("/ghl/mindbody", async (req, res) => {
 
       await cancelClientFromClass(cfg, token, clientId, classId);
 
-      const say = "Done — you’re canceled. Want me to book you into a different class instead?";
+      const speech = "Done — you’re canceled.";
       return respondJSON(res, {
         success: true,
-        speech: say,
+        speech,
         data: {
           action,
           mode: "live",
@@ -987,5 +1006,5 @@ app.post("/ghl/mindbody", async (req, res) => {
 });
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
-app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Server listening on ${PORT} | buildId: ${BUILD_ID}`));
 
