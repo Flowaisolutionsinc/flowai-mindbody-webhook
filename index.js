@@ -156,7 +156,6 @@ function respondJSON(res, payload) {
   const finalPayload = {
     success: !!payload?.success,
     speech,
-    error: payload?.error ? safeString(payload.error) : "",
   };
 
   console.log(
@@ -360,7 +359,7 @@ function buildSpokenDateLabel(dateISO, timeZone) {
  */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
-  const top = safeClasses.slice(0, 4);
+  const top = safeClasses.slice(0, 3);
 
   if (!top.length) {
     return `I couldn't find any classes for ${spokenDateLabel}. Would you like a different date?`;
@@ -671,7 +670,6 @@ app.post("/ghl/mindbody", async (req, res) => {
     return respondJSON(res, {
       success: true,
       speech: "pong",
-      data: { action, studioKey, timezone, source },
     });
   }
 
@@ -693,7 +691,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: `I couldn't understand that date. What day did you mean?`,
         error: `Could not parse date: ${resolved.reason}`,
-        data: { action, studioKey, timezone, source, datePhraseRaw },
       });
     }
 
@@ -710,7 +707,6 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           speech: `I couldn't find any classes for ${spokenDate}. Would you like a different date?`,
           slots: [],
-          data: { action: "get_schedule", mode: "mock", studioKey, timezone, source, requestedDate, spokenDate },
         });
       }
 
@@ -723,7 +719,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: true,
         speech,
         slots,
-        data: { action: "get_schedule", mode: "mock", studioKey, timezone, source, requestedDate, spokenDate },
       });
     }
 
@@ -733,7 +728,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: "I'm not connected to Mindbody yet on my end.",
         error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
-        data: { action: "get_schedule", mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
 
@@ -747,7 +741,6 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: true,
           speech: cached.speech,
           slots: cached.slots,
-          data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, spokenDate: cached.spokenDate, cached: true },
         });
       }
 
@@ -760,7 +753,6 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           speech: `I couldn't find any classes for ${spokenDate}. Would you like a different date?`,
           slots: [],
-          data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, spokenDate },
         });
       }
 
@@ -773,7 +765,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: true,
         speech,
         slots,
-        data: { action: "get_schedule", mode: "live", studioKey, timezone, source, requestedDate, spokenDate },
       });
     } catch (err) {
       console.log("Mindbody live schedule error:", err?.message || err);
@@ -782,7 +773,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         speech: "I'm not able to pull the schedule up on my end right now. Would you like me to try again?",
         slots: [],
         error: err?.message || "Mindbody live schedule error",
-        data: { action: "get_schedule", mode: "live_error", studioKey, timezone, source, datePhraseRaw },
       });
     }
   }
@@ -795,7 +785,6 @@ app.post("/ghl/mindbody", async (req, res) => {
       return respondJSON(res, {
         success: false,
         speech: "Booking is only available in live mode.",
-        data: { action, mode: cfg.mode, studioKey, timezone, source },
       });
     }
     if (!liveConfigured) {
@@ -803,7 +792,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: "Mindbody live is not configured yet.",
         error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
-        data: { action, mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
     if (!classId) {
@@ -811,7 +799,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: "I'm missing the class selection.",
         error: "Missing classId",
-        data: { action, studioKey, timezone, source },
       });
     }
 
@@ -822,7 +809,6 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           speech: "Booking isn't enabled yet on our side.",
           error: "Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
-          data: { action, mode: "live_missing_token_creds", studioKey, timezone, source, classId },
         });
       }
 
@@ -836,7 +822,6 @@ app.post("/ghl/mindbody", async (req, res) => {
             success: false,
             speech: "I just need your first and last name to complete the booking.",
             error: "Missing firstName/lastName to create new client.",
-            data: { action, studioKey, timezone, source, classId, email, phone },
           });
         }
         clientId = await createClient(cfg, token, firstName, lastName, email, phone);
@@ -852,14 +837,6 @@ app.post("/ghl/mindbody", async (req, res) => {
       return respondJSON(res, {
         success: true,
         speech,
-        data: {
-          action,
-          mode: "live",
-          studioKey,
-          timezone,
-          source,
-          booking: { classId: String(classId), clientId: String(clientId), createdClient: created, email, phone },
-        },
       });
     } catch (err) {
       console.log("Mindbody book_class error:", err?.message || err);
@@ -867,7 +844,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: "I couldn't complete that booking right now.",
         error: err?.message || "Mindbody booking error",
-        data: { action, mode: "live_error", studioKey, timezone, source, classId, email, phone },
       });
     }
   }
@@ -880,7 +856,6 @@ app.post("/ghl/mindbody", async (req, res) => {
       return respondJSON(res, {
         success: false,
         speech: "Canceling is only available in live mode.",
-        data: { action, mode: cfg.mode, studioKey, timezone, source },
       });
     }
     if (!liveConfigured) {
@@ -888,7 +863,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: "Mindbody live is not configured yet.",
         error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
-        data: { action, mode: "live_unconfigured", studioKey, timezone, source },
       });
     }
     if (!classId) {
@@ -896,7 +870,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: "I'm missing the class to cancel.",
         error: "Missing classId",
-        data: { action, studioKey, timezone, source },
       });
     }
 
@@ -907,7 +880,6 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           speech: "Canceling isn't enabled yet on our side.",
           error: "Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
-          data: { action, mode: "live_missing_token_creds", studioKey, timezone, source, classId },
         });
       }
 
@@ -917,7 +889,6 @@ app.post("/ghl/mindbody", async (req, res) => {
           success: false,
           speech: "I couldn't find your account to cancel that booking.",
           error: "No client found for provided email/phone.",
-          data: { action, studioKey, timezone, source, classId, email, phone },
         });
       }
 
@@ -926,14 +897,6 @@ app.post("/ghl/mindbody", async (req, res) => {
       return respondJSON(res, {
         success: true,
         speech: "Done — you're canceled. Would you like to book a different class instead?",
-        data: {
-          action,
-          mode: "live",
-          studioKey,
-          timezone,
-          source,
-          cancel: { classId: String(classId), clientId: String(clientId), email, phone },
-        },
       });
     } catch (err) {
       console.log("Mindbody cancel_class error:", err?.message || err);
@@ -941,7 +904,6 @@ app.post("/ghl/mindbody", async (req, res) => {
         success: false,
         speech: "I couldn't cancel that right now.",
         error: err?.message || "Mindbody cancel error",
-        data: { action, mode: "live_error", studioKey, timezone, source, classId, email, phone },
       });
     }
   }
@@ -953,7 +915,6 @@ app.post("/ghl/mindbody", async (req, res) => {
     success: false,
     speech: `I didn't recognize that request.`,
     error: `Unknown action: ${action}`,
-    data: { action, studioKey, timezone, source },
   });
 });
 
