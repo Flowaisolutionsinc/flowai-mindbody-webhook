@@ -156,15 +156,7 @@ function respondJSON(res, payload) {
   const finalPayload = {
     success: !!payload?.success,
     speech,
-    message: speech,
-    text: speech,
-    response: speech,
-    result: speech,
-    output: speech,
-    slots: payload?.slots || [],
-    data: payload?.data || null,
     error: payload?.error ? safeString(payload.error) : "",
-    buildId: BUILD_ID,
   };
 
   console.log(
@@ -368,7 +360,7 @@ function buildSpokenDateLabel(dateISO, timeZone) {
  */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
-  const top = safeClasses.slice(0, 6);
+  const top = safeClasses.slice(0, 3);
 
   if (!top.length) {
     return `I couldn't find any classes for ${spokenDateLabel}. Would you like a different date?`;
