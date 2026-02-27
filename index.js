@@ -404,6 +404,7 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
 
   const resp = await fetch(url.toString(), {
     method: "GET",
+    signal: AbortSignal.timeout(2500), // fail fast so GHL doesn't time out waiting
     headers: {
       "Api-Key": cfg.apiKey,
       "SiteId": cfg.siteId,
