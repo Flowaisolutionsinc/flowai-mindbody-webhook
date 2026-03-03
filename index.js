@@ -113,7 +113,7 @@ function decodeMaybe(v) {
   }
 }
 
-function respondJSON(res, payload) {
+function respondText(res, payload) {
   const speechRaw = safeString(
     payload?.speech || payload?.say || payload?.text || payload?.error || "",
   );
@@ -127,21 +127,22 @@ function respondJSON(res, payload) {
 
   if (speech.length > MAX) speech = `${speech.slice(0, MAX - 3)}...`;
 
-  const finalPayload = {
-    success: !!payload?.success,
-    speech,
-  };
+  const success = !!payload?.success;
 
   console.log(
     "RESPONDING:",
-    finalPayload.success,
+    success,
     speech.slice(0, 140),
     "| buildId:",
     BUILD_ID,
   );
 
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  return res.status(200).json(finalPayload);
+  /* ==========================================================
+     NEW VOICE-SAFE RESPONSE
+     Returns RAW TEXT ONLY
+  ========================================================== */
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  return res.status(200).send(speech);
 }
 
 function requireEnv(name) {
@@ -158,7 +159,7 @@ function getMindbodyConfig() {
     requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
   const tokenUsername = requireEnv("MINDBODY_TOKEN_USERNAME");
   const tokenPassword = requireEnv("MINDBODY_TOKEN_PASSWORD");
-  const locationId = (requireEnv("MINDBODY_LOCATION_ID") || "").trim();
+  const locationId = "1";
 
   return {
     mode,
@@ -762,7 +763,7 @@ async function mindbodyHandler(req, res) {
   console.log("body:", b);
 
   if (action === "ping") {
-    return respondJSON(res, { success: true, speech: "pong" });
+    return respondText(res, { success: true, speech: "pong" });
   }
 
   const cfg = getMindbodyConfig();
@@ -776,7 +777,7 @@ async function mindbodyHandler(req, res) {
     const resolved = resolveDatePhraseToISO(datePhraseRaw || "today", timezone);
 
     if (!resolved.ok) {
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "I couldn't understand that date. What day did you mean?",
         error: `Could not parse date: ${resolved.reason}`,
@@ -791,7 +792,7 @@ async function mindbodyHandler(req, res) {
       classes = sortClassesByStartTime(classes);
 
       if (!classes.length) {
-        return respondJSON(res, {
+        return respondText(res, {
           success: false,
           speech: `I couldn't find any classes for ${spokenDate}. Would you like a different date?`,
           slots: [],
@@ -807,11 +808,11 @@ async function mindbodyHandler(req, res) {
         bookable: !!c.bookable,
       }));
 
-      return respondJSON(res, { success: true, speech, slots });
+      return respondText(res, { success: true, speech, slots });
     }
 
     if (!liveConfigured) {
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "I'm not connected to Mindbody yet on my end.",
         error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
@@ -822,7 +823,7 @@ async function mindbodyHandler(req, res) {
       const cached = getCached(requestedDate, cfg.locationId);
       if (cached) {
         console.log(`cache hit: ${requestedDate}`);
-        return respondJSON(res, {
+        return respondText(res, {
           success: true,
           speech: cached.speech,
           slots: cached.slots,
@@ -834,7 +835,7 @@ async function mindbodyHandler(req, res) {
       classes = sortClassesByStartTime(classes);
 
       if (!classes.length) {
-        return respondJSON(res, {
+        return respondText(res, {
           success: false,
           speech: `I couldn't find any classes for ${spokenDate}. Would you like a different date?`,
           slots: [],
@@ -850,10 +851,10 @@ async function mindbodyHandler(req, res) {
         bookable: !!c.bookable,
       }));
 
-      return respondJSON(res, { success: true, speech, slots });
+      return respondText(res, { success: true, speech, slots });
     } catch (err) {
       console.log("Mindbody live schedule error:", err?.message || err);
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "I'm not able to pull the schedule up on my end right now. Would you like me to try again?",
         slots: [],
@@ -864,17 +865,17 @@ async function mindbodyHandler(req, res) {
 
   if (action === "book_class") {
     if (cfg.mode !== "live") {
-      return respondJSON(res, { success: false, speech: "Booking is only available in live mode." });
+      return respondText(res, { success: false, speech: "Booking is only available in live mode." });
     }
     if (!liveConfigured) {
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "Mindbody live is not configured yet.",
         error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
       });
     }
     if (!classId) {
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "I'm missing the class selection.",
         error: "Missing classId",
@@ -884,7 +885,7 @@ async function mindbodyHandler(req, res) {
     try {
       const token = await getMindbodyUserToken(cfg);
       if (!token) {
-        return respondJSON(res, {
+        return respondText(res, {
           success: false,
           speech: "Booking isn't enabled yet on our side.",
           error: "Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
@@ -897,7 +898,7 @@ async function mindbodyHandler(req, res) {
 
       if (!clientId) {
         if (!firstName || !lastName) {
-          return respondJSON(res, {
+          return respondText(res, {
             success: false,
             speech: "I just need your first and last name to complete the booking.",
             error: "Missing firstName/lastName to create new client.",
@@ -913,10 +914,10 @@ async function mindbodyHandler(req, res) {
         ? "You're booked! I'll send you a waiver link right after this call to complete before class."
         : "You're booked! Is there anything else I can help you with?";
 
-      return respondJSON(res, { success: true, speech });
+      return respondText(res, { success: true, speech });
     } catch (err) {
       console.log("Mindbody book_class error:", err?.message || err);
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "I couldn't complete that booking right now.",
         error: err?.message || "Mindbody booking error",
@@ -926,20 +927,20 @@ async function mindbodyHandler(req, res) {
 
   if (action === "cancel_class") {
     if (cfg.mode !== "live") {
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "Canceling is only available in live mode.",
       });
     }
     if (!liveConfigured) {
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "Mindbody live is not configured yet.",
         error: "Set MINDBODY_API_KEY, MINDBODY_SITE_ID, MINDBODY_BASE_URL.",
       });
     }
     if (!classId) {
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "I'm missing the class to cancel.",
         error: "Missing classId",
@@ -949,7 +950,7 @@ async function mindbodyHandler(req, res) {
     try {
       const token = await getMindbodyUserToken(cfg);
       if (!token) {
-        return respondJSON(res, {
+        return respondText(res, {
           success: false,
           speech: "Canceling isn't enabled yet on our side.",
           error: "Set MINDBODY_TOKEN_USERNAME and MINDBODY_TOKEN_PASSWORD.",
@@ -958,7 +959,7 @@ async function mindbodyHandler(req, res) {
 
       const clientId = await findClientId(cfg, token, email, phone);
       if (!clientId) {
-        return respondJSON(res, {
+        return respondText(res, {
           success: false,
           speech: "I couldn't find your account to cancel that booking.",
           error: "No client found for provided email/phone.",
@@ -966,13 +967,13 @@ async function mindbodyHandler(req, res) {
       }
 
       await cancelClientFromClass(cfg, token, clientId, classId);
-      return respondJSON(res, {
+      return respondText(res, {
         success: true,
         speech: "Done — you're canceled. Would you like to book a different class instead?",
       });
     } catch (err) {
       console.log("Mindbody cancel_class error:", err?.message || err);
-      return respondJSON(res, {
+      return respondText(res, {
         success: false,
         speech: "I couldn't cancel that right now.",
         error: err?.message || "Mindbody cancel error",
@@ -980,7 +981,7 @@ async function mindbodyHandler(req, res) {
     }
   }
 
-  return respondJSON(res, {
+  return respondText(res, {
     success: false,
     speech: "I didn't recognize that request.",
     error: `Unknown action: ${action}`,
@@ -1005,7 +1006,7 @@ async function speakHandler(req, res) {
     const requestedDate = resolved.requestedDate;
     const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
 
-    const locationId = process.env.MINDBODY_LOCATION_ID || null;
+    const locationId = "1";
     const cached = getCached(requestedDate, locationId);
 
     if (cached) {
@@ -1050,7 +1051,7 @@ app.listen(PORT, () => {
     apiKey: process.env.MINDBODY_API_KEY || "",
     siteId: process.env.MINDBODY_SITE_ID || "",
     baseUrl: process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6",
-    locationId: process.env.MINDBODY_LOCATION_ID || null,
+    locationId: "1",
     timezone: "America/Vancouver",
   };
 
