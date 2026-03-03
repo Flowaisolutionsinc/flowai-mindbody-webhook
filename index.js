@@ -222,7 +222,7 @@ function getMindbodyConfig() {
 // If MINDBODY_LOCATION_ID is set in Railway,
 // we will restrict class results to that location only.
 // ==========================================================
-const locationId = requireEnv("MINDBODY_LOCATION_ID");
+const locationId = (requireEnv("MINDBODY_LOCATION_ID") || "").trim();
 
 return {
   mode,
@@ -503,7 +503,7 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
 
   // Location filter (safe)
   if (cfg.locationId) {
-    url.searchParams.set("LocationId", cfg.locationId);
+    url.searchParams.set("LocationIds", cfg.locationId);
   }
 
   const resp = await fetch(url.toString(), {
