@@ -13,7 +13,7 @@ const BASE_URL = "https://api.mindbodyonline.com/public/v6";
 const LOCATION_ID = "1";
 
 /* =================================
-CACHE STORE
+CACHE
 ================================ */
 
 const scheduleCache = new Map();
@@ -157,17 +157,17 @@ function buildScheduleSay(dateLabel,classes){
   if(!classes.length)
     return `I couldn't find any classes for ${dateLabel}.`;
 
-  const max=6;
+  const max=2;
 
   const list=classes.slice(0,max).map(c =>
     `${c.time} ${c.name} with ${c.instructor}`
   );
 
-  return `The classes for ${dateLabel} are: ${list.join(", ")}. Would you like to book one?`;
+  return `The next classes for ${dateLabel} are: ${list.join(", ")}. Would you like to book one?`;
 }
 
 /* =================================
-MINDBODY LIVE FETCH
+MINDBODY FETCH
 ================================ */
 
 async function fetchLiveClasses(dateISO){
@@ -330,7 +330,7 @@ async function handleSchedule(req,res){
 }
 
 /* =================================
-ROUTES (UNCHANGED)
+ROUTES
 ================================ */
 
 app.post("/ghl/mindbody",handleSchedule);
@@ -340,7 +340,7 @@ app.post("/ghl/mindbody/speak",handleSchedule);
 app.get("/ghl/mindbody/speak",handleSchedule);
 
 /* =================================
-HEALTH
+HEALTH CHECK
 ================================ */
 
 app.get("/",(_,res)=>res.send("ok"));
