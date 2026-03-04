@@ -1,31 +1,31 @@
 const express = require("express");
 const app = express();
 
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.urlencoded({extended:true}));
 
 const PORT = process.env.PORT || 8080;
 
 const API_KEY = process.env.MINDBODY_API_KEY;
 const SITE_ID = process.env.MINDBODY_SITE_ID;
 
-const BASE_URL = "https://api.mindbodyonline.com/public/v6";
 const LOCATION_ID = "1";
+const BASE_URL = "https://api.mindbodyonline.com/public/v6";
 
-/* ===============================
+/* -----------------------------
 CACHE
-=============================== */
+----------------------------- */
 
-const scheduleCache = new Map();
-const CACHE_MAX_AGE = 15 * 60 * 1000;
+const cache = new Map();
+const CACHE_TTL = 15 * 60 * 1000;
 
-/* ===============================
+/* -----------------------------
 DATE PARSER
-=============================== */
+----------------------------- */
 
-function parseDatePhrase(input="today"){
+function parseDate(input="today"){
 
-  input = String(input).toLowerCase().trim();
+  input = decodeURIComponent(input).toLowerCase().trim();
   input = input.replace(/(\d+)(st|nd|rd|th)/g,"$1");
 
   const today = new Date();
@@ -40,273 +40,179 @@ function parseDatePhrase(input="today"){
   const parsed = new Date(input);
 
   if(!isNaN(parsed)){
-
     if(parsed.getFullYear() === 2001){
       parsed.setFullYear(today.getFullYear());
     }
-
     return parsed;
   }
 
   return today;
 }
 
-function toISO(date){
+function dateISO(date){
   return date.toISOString().split("T")[0];
 }
 
-function buildWindow(dateISO){
-  return {
-    start:`${dateISO}T00:00:00`,
-    end:`${dateISO}T23:59:59`
-  };
+/* -----------------------------
+FETCH MINDBODY
+----------------------------- */
+
+async function fetchClasses(date){
+
+  const start = `${date}T00:00:00`;
+  const end   = `${date}T23:59:59`;
+
+  const url = `${BASE_URL}/class/classes?StartDateTime=${start}&EndDateTime=${end}&LocationIds=${LOCATION_ID}`;
+
+  console.log("Mindbody request:",url);
+
+  const res = await fetch(url,{
+    headers:{
+      "Api-Key":API_KEY,
+      "SiteId":SITE_ID
+    }
+  });
+
+  const json = await res.json();
+
+  return json.Classes || [];
 }
 
-/* ===============================
-CLASS NORMALIZER
-=============================== */
+/* -----------------------------
+NORMALIZE CLASSES
+----------------------------- */
 
-function normalizeClasses(rawClasses){
+function normalize(classes){
 
-  const classes=[];
+  return classes.map(c=>{
 
-  for(const c of rawClasses || []){
+    const start = new Date(c.StartDateTime);
 
-    const name =
-      c?.ClassDescription?.Name ||
-      c?.Name ||
-      "Class";
-
-    const instructor =
-      c?.Staff?.Name ||
-      c?.Staff?.FirstName ||
-      "Instructor";
-
-    const start=c?.StartDateTime;
-
-    let time="";
-
-    if(start){
-
-      const dt=new Date(start);
-
-      time=new Intl.DateTimeFormat("en-US",{
-        hour:"numeric",
-        minute:"2-digit"
-      }).format(dt);
-
-    }
-
-    classes.push({
-      id:c?.Id,
-      name,
-      instructor,
-      time,
-      start
+    const time = start.toLocaleTimeString("en-US",{
+      hour:"numeric",
+      minute:"2-digit"
     });
 
-  }
+    return {
+      id:c.Id,
+      name:c.ClassDescription?.Name || c.Name || "Class",
+      instructor:c.Staff?.Name || "Instructor",
+      time,
+      start:c.StartDateTime
+    };
 
-  return classes;
+  }).sort((a,b)=>new Date(a.start)-new Date(b.start));
+
 }
 
-/* ===============================
-SPEECH BUILDER
-=============================== */
+/* -----------------------------
+BUILD SPEECH
+----------------------------- */
 
-function buildScheduleSay(dateLabel,classes){
+function buildSpeech(dateLabel,classes){
 
   if(!classes.length){
     return `I couldn't find any classes for ${dateLabel}.`;
   }
 
-  const list = classes
-    .slice(0,2)
-    .map(c => `${c.time} ${c.name} with ${c.instructor}`);
+  const top = classes.slice(0,2);
+
+  const list = top.map(c=>`${c.time} ${c.name} with ${c.instructor}`);
 
   return `The next classes for ${dateLabel} are: ${list.join(", ")}.`;
 }
 
-/* ===============================
-MINDBODY FETCH
-=============================== */
+/* -----------------------------
+CACHE HELPERS
+----------------------------- */
 
-async function fetchLiveClasses(dateISO){
+function getCache(date){
 
-  const {start,end}=buildWindow(dateISO);
+  const entry = cache.get(date);
 
-  const url=new URL(`${BASE_URL}/class/classes`);
+  if(!entry) return null;
 
-  url.searchParams.set("StartDateTime",start);
-  url.searchParams.set("EndDateTime",end);
-  url.searchParams.set("LocationIds",LOCATION_ID);
-
-  console.log("Mindbody request:",url.toString());
-
-  const resp=await fetch(url.toString(),{
-    method:"GET",
-    headers:{
-      "Api-Key":API_KEY,
-      SiteId:SITE_ID,
-      "Content-Type":"application/json"
-    },
-    signal:AbortSignal.timeout(2500)
-  });
-
-  const json=await resp.json();
-
-  if(!resp.ok){
-    throw new Error(json?.Error?.Message || "Mindbody error");
-  }
-
-  console.log("Mindbody classes received:",json.Classes?.length || 0);
-
-  return json.Classes || [];
-}
-
-/* ===============================
-CACHE FUNCTIONS
-=============================== */
-
-function getCachedClasses(dateISO){
-
-  const cached = scheduleCache.get(dateISO);
-
-  if(!cached) return null;
-
-  const age = Date.now() - cached.updated;
-
-  if(age > CACHE_MAX_AGE){
-
-    console.log("CACHE STALE:",dateISO);
-
-    scheduleCache.delete(dateISO);
-
+  if(Date.now() - entry.time > CACHE_TTL){
+    cache.delete(date);
     return null;
   }
 
-  console.log("CACHE HIT:",dateISO);
-
-  return cached.classes;
+  return entry.data;
 }
 
-function setCachedClasses(dateISO,classes){
-
-  scheduleCache.set(dateISO,{
-    classes,
-    updated: Date.now()
+function setCache(date,data){
+  cache.set(date,{
+    data,
+    time:Date.now()
   });
-
 }
 
-/* ===============================
-CACHE WARMER
-=============================== */
+/* -----------------------------
+WEBHOOK HANDLER
+----------------------------- */
 
-async function warmCache(){
-
-  console.log("Warming schedule cache...");
-
-  const today = new Date();
-
-  for(let i=0;i<7;i++){
-
-    const d = new Date(today);
-    d.setDate(today.getDate()+i);
-
-    const dateISO = toISO(d);
-
-    try{
-
-      const raw = await fetchLiveClasses(dateISO);
-
-      const classes = normalizeClasses(raw);
-
-      classes.sort((a,b)=> new Date(a.start)-new Date(b.start));
-
-      setCachedClasses(dateISO,classes);
-
-      console.log("Cache updated:",dateISO);
-
-    }catch(err){
-
-      console.log("Cache warm error:",err.message);
-
-    }
-
-  }
-
-}
-
-/* ===============================
-MAIN HANDLER
-=============================== */
-
-async function handleMindbody(req,res){
+async function handler(req,res){
 
   console.log("----- WEBHOOK REQUEST -----");
-  console.log("Body:",JSON.stringify(req.body,null,2));
-  console.log("Query:",JSON.stringify(req.query,null,2));
-  console.log("---------------------------");
 
-  const action =
-    req.body?.action ||
-    req.query?.action;
+  console.log("Body:",req.body);
+  console.log("Query:",req.query);
+
+  const action = req.body.action || req.query.action;
 
   if(action !== "get_schedule"){
-    return res.status(200).json({
-      results:"Invalid action."
+    return res.json({
+      results:"Unsupported action."
     });
   }
 
-  const datePhrase =
-    req.body?.date ||
-    req.query?.date ||
-    "today";
+  const datePhrase = req.body.date || req.query.date || "today";
 
   console.log("DATE PHRASE RECEIVED:",datePhrase);
 
   try{
 
-    const date = parseDatePhrase(datePhrase);
-    const dateISO = toISO(date);
+    const date = parseDate(datePhrase);
+    const iso  = dateISO(date);
 
-    const spokenDate = date.toLocaleDateString(
-      "en-US",
-      { weekday:"long", month:"long", day:"numeric" }
-    );
+    let classes = getCache(iso);
 
-    let classes = getCachedClasses(dateISO);
+    if(classes){
 
-    if(!classes){
+      console.log("CACHE HIT:",iso);
 
-      console.log("CACHE MISS:",dateISO);
+    }else{
 
-      const raw = await fetchLiveClasses(dateISO);
+      console.log("CACHE MISS:",iso);
 
-      classes = normalizeClasses(raw);
+      const raw = await fetchClasses(iso);
 
-      classes.sort((a,b)=> new Date(a.start)-new Date(b.start));
+      classes = normalize(raw);
 
-      setCachedClasses(dateISO,classes);
+      setCache(iso,classes);
 
     }
 
-    const speech = buildScheduleSay(spokenDate,classes);
+    const spokenDate = date.toLocaleDateString("en-US",{
+      weekday:"long",
+      month:"long",
+      day:"numeric"
+    });
+
+    const speech = buildSpeech(spokenDate,classes);
 
     console.log("----- WEBHOOK RESPONSE -----");
     console.log(speech);
-    console.log("----------------------------");
 
-    return res.status(200).json({
-      results: speech
+    return res.json({
+      results:speech
     });
 
   }catch(err){
 
-    console.log("ERROR:",err.message);
+    console.log("ERROR:",err);
 
-    return res.status(200).json({
+    return res.json({
       results:"I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?"
     });
 
@@ -314,38 +220,20 @@ async function handleMindbody(req,res){
 
 }
 
-/* ===============================
+/* -----------------------------
 ROUTES
-=============================== */
+----------------------------- */
 
-app.post("/ghl/mindbody",handleMindbody);
-app.get("/ghl/mindbody",handleMindbody);
+app.post("/ghl/mindbody",handler);
+app.get("/ghl/mindbody",handler);
 
-app.post("/ghl/mindbody/speak",handleMindbody);
-app.get("/ghl/mindbody/speak",handleMindbody);
+app.post("/ghl/mindbody/speak",handler);
+app.get("/ghl/mindbody/speak",handler);
 
-/* ===============================
-DEBUG ENDPOINT
-=============================== */
-
-app.get("/debug",(req,res)=>{
-  res.send("Webhook server alive");
-});
-
-/* ===============================
-CACHE START
-=============================== */
-
-warmCache();
-
-setInterval(()=>{
-  warmCache();
-},15*60*1000);
-
-/* ===============================
-SERVER START
-=============================== */
+/* -----------------------------
+SERVER
+----------------------------- */
 
 app.listen(PORT,()=>{
-  console.log("Server running on port",PORT);
+  console.log("Server running on",PORT);
 });
