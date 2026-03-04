@@ -12,28 +12,27 @@ const SITE_ID = process.env.MINDBODY_SITE_ID;
 const BASE_URL = "https://api.mindbodyonline.com/public/v6";
 const LOCATION_ID = "1";
 
-/* =================================
+/* ===============================
 CACHE
-================================ */
+=============================== */
 
 const scheduleCache = new Map();
 const CACHE_MAX_AGE = 15 * 60 * 1000;
 
-/* =================================
+/* ===============================
 DATE PARSER
-================================ */
+=============================== */
 
 function parseDatePhrase(input="today"){
 
   input = String(input).toLowerCase().trim();
-
   input = input.replace(/(\d+)(st|nd|rd|th)/g,"$1");
 
   const today = new Date();
 
-  if(input==="today") return today;
+  if(input === "today") return today;
 
-  if(input==="tomorrow"){
+  if(input === "tomorrow"){
     today.setDate(today.getDate()+1);
     return today;
   }
@@ -57,21 +56,21 @@ function toISO(date){
 }
 
 function buildWindow(dateISO){
-  return{
+  return {
     start:`${dateISO}T00:00:00`,
     end:`${dateISO}T23:59:59`
   };
 }
 
-/* =================================
-NORMALIZE CLASSES
-================================ */
+/* ===============================
+CLASS NORMALIZER
+=============================== */
 
 function normalizeClasses(rawClasses){
 
   const classes=[];
 
-  for(const c of rawClasses||[]){
+  for(const c of rawClasses || []){
 
     const name =
       c?.ClassDescription?.Name ||
@@ -88,12 +87,14 @@ function normalizeClasses(rawClasses){
     let time="";
 
     if(start){
+
       const dt=new Date(start);
 
       time=new Intl.DateTimeFormat("en-US",{
         hour:"numeric",
         minute:"2-digit"
       }).format(dt);
+
     }
 
     classes.push({
@@ -109,9 +110,9 @@ function normalizeClasses(rawClasses){
   return classes;
 }
 
-/* =================================
+/* ===============================
 SPEECH BUILDER
-================================ */
+=============================== */
 
 function buildScheduleSay(dateLabel,classes){
 
@@ -126,9 +127,9 @@ function buildScheduleSay(dateLabel,classes){
   return `The next classes for ${dateLabel} are: ${list.join(", ")}.`;
 }
 
-/* =================================
+/* ===============================
 MINDBODY FETCH
-================================ */
+=============================== */
 
 async function fetchLiveClasses(dateISO){
 
@@ -163,9 +164,9 @@ async function fetchLiveClasses(dateISO){
   return json.Classes || [];
 }
 
-/* =================================
-CACHE
-================================ */
+/* ===============================
+CACHE FUNCTIONS
+=============================== */
 
 function getCachedClasses(dateISO){
 
@@ -198,9 +199,9 @@ function setCachedClasses(dateISO,classes){
 
 }
 
-/* =================================
+/* ===============================
 CACHE WARMER
-================================ */
+=============================== */
 
 async function warmCache(){
 
@@ -237,9 +238,9 @@ async function warmCache(){
 
 }
 
-/* =================================
-MAIN WEBHOOK HANDLER
-================================ */
+/* ===============================
+MAIN HANDLER
+=============================== */
 
 async function handleMindbody(req,res){
 
@@ -253,7 +254,9 @@ async function handleMindbody(req,res){
     req.query?.action;
 
   if(action !== "get_schedule"){
-    return res.status(200).send("Invalid action.");
+    return res.status(200).json({
+      results:"Invalid action."
+    });
   }
 
   const datePhrase =
@@ -266,7 +269,6 @@ async function handleMindbody(req,res){
   try{
 
     const date = parseDatePhrase(datePhrase);
-
     const dateISO = toISO(date);
 
     const spokenDate = date.toLocaleDateString(
@@ -296,24 +298,25 @@ async function handleMindbody(req,res){
     console.log(speech);
     console.log("----------------------------");
 
-    res.setHeader("Content-Type","text/plain");
-
-    return res.status(200).send(speech);
+    return res.status(200).json({
+      results: speech
+    });
 
   }catch(err){
 
     console.log("ERROR:",err.message);
 
-    return res
-      .status(200)
-      .send("I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?");
+    return res.status(200).json({
+      results:"I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?"
+    });
+
   }
 
 }
 
-/* =================================
+/* ===============================
 ROUTES
-================================ */
+=============================== */
 
 app.post("/ghl/mindbody",handleMindbody);
 app.get("/ghl/mindbody",handleMindbody);
@@ -321,17 +324,17 @@ app.get("/ghl/mindbody",handleMindbody);
 app.post("/ghl/mindbody/speak",handleMindbody);
 app.get("/ghl/mindbody/speak",handleMindbody);
 
-/* =================================
+/* ===============================
 DEBUG ENDPOINT
-================================ */
+=============================== */
 
 app.get("/debug",(req,res)=>{
   res.send("Webhook server alive");
 });
 
-/* =================================
+/* ===============================
 CACHE START
-================================ */
+=============================== */
 
 warmCache();
 
@@ -339,9 +342,9 @@ setInterval(()=>{
   warmCache();
 },15*60*1000);
 
-/* =================================
+/* ===============================
 SERVER START
-================================ */
+=============================== */
 
 app.listen(PORT,()=>{
   console.log("Server running on port",PORT);
