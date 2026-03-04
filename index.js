@@ -20,7 +20,7 @@ const scheduleCache = new Map();
 const CACHE_MAX_AGE = 15 * 60 * 1000;
 
 /* =================================
-HELPERS
+DATE PARSER
 ================================ */
 
 function parseDatePhrase(input="today"){
@@ -64,7 +64,7 @@ function buildWindow(dateISO){
 }
 
 /* =================================
-CLASS NORMALIZER
+NORMALIZE CLASSES
 ================================ */
 
 function normalizeClasses(rawClasses){
@@ -119,10 +119,8 @@ function buildScheduleSay(dateLabel,classes){
     return `I couldn't find any classes for ${dateLabel}.`;
   }
 
-  const max = 2;
-
   const list = classes
-    .slice(0,max)
+    .slice(0,2)
     .map(c => `${c.time} ${c.name} with ${c.instructor}`);
 
   return `The next classes for ${dateLabel} are: ${list.join(", ")}.`;
@@ -142,6 +140,8 @@ async function fetchLiveClasses(dateISO){
   url.searchParams.set("EndDateTime",end);
   url.searchParams.set("LocationIds",LOCATION_ID);
 
+  console.log("Mindbody request:",url.toString());
+
   const resp=await fetch(url.toString(),{
     method:"GET",
     headers:{
@@ -158,11 +158,13 @@ async function fetchLiveClasses(dateISO){
     throw new Error(json?.Error?.Message || "Mindbody error");
   }
 
+  console.log("Mindbody classes received:",json.Classes?.length || 0);
+
   return json.Classes || [];
 }
 
 /* =================================
-CACHE FUNCTIONS
+CACHE
 ================================ */
 
 function getCachedClasses(dateISO){
@@ -174,9 +176,15 @@ function getCachedClasses(dateISO){
   const age = Date.now() - cached.updated;
 
   if(age > CACHE_MAX_AGE){
+
+    console.log("CACHE STALE:",dateISO);
+
     scheduleCache.delete(dateISO);
+
     return null;
   }
+
+  console.log("CACHE HIT:",dateISO);
 
   return cached.classes;
 }
@@ -195,6 +203,8 @@ CACHE WARMER
 ================================ */
 
 async function warmCache(){
+
+  console.log("Warming schedule cache...");
 
   const today = new Date();
 
@@ -228,23 +238,30 @@ async function warmCache(){
 }
 
 /* =================================
-MAIN HANDLER
+MAIN WEBHOOK HANDLER
 ================================ */
 
 async function handleMindbody(req,res){
+
+  console.log("----- WEBHOOK REQUEST -----");
+  console.log("Body:",JSON.stringify(req.body,null,2));
+  console.log("Query:",JSON.stringify(req.query,null,2));
+  console.log("---------------------------");
 
   const action =
     req.body?.action ||
     req.query?.action;
 
   if(action !== "get_schedule"){
-    return res.status(200).send("I'm not able to process that request.");
+    return res.status(200).send("Invalid action.");
   }
 
   const datePhrase =
     req.body?.date ||
     req.query?.date ||
     "today";
+
+  console.log("DATE PHRASE RECEIVED:",datePhrase);
 
   try{
 
@@ -261,6 +278,8 @@ async function handleMindbody(req,res){
 
     if(!classes){
 
+      console.log("CACHE MISS:",dateISO);
+
       const raw = await fetchLiveClasses(dateISO);
 
       classes = normalizeClasses(raw);
@@ -272,6 +291,10 @@ async function handleMindbody(req,res){
     }
 
     const speech = buildScheduleSay(spokenDate,classes);
+
+    console.log("----- WEBHOOK RESPONSE -----");
+    console.log(speech);
+    console.log("----------------------------");
 
     res.setHeader("Content-Type","text/plain");
 
@@ -299,23 +322,25 @@ app.post("/ghl/mindbody/speak",handleMindbody);
 app.get("/ghl/mindbody/speak",handleMindbody);
 
 /* =================================
-HEALTH
+DEBUG ENDPOINT
 ================================ */
 
-app.get("/",(_,res)=>res.send("ok"));
+app.get("/debug",(req,res)=>{
+  res.send("Webhook server alive");
+});
 
 /* =================================
-CACHE WARMER
+CACHE START
 ================================ */
 
 warmCache();
 
 setInterval(()=>{
   warmCache();
-}, 15 * 60 * 1000);
+},15*60*1000);
 
 /* =================================
-START SERVER
+SERVER START
 ================================ */
 
 app.listen(PORT,()=>{
