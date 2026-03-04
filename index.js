@@ -17,34 +17,15 @@ CACHE
 ================================ */
 
 const scheduleCache = new Map();
+const CACHE_MAX_AGE = 15 * 60 * 1000;
 
 /* =================================
 HELPERS
 ================================ */
 
-function safeString(v){
-  if(v === undefined || v === null) return "";
-  return String(v);
-}
-
-function decodeMaybe(v){
-  const s = safeString(v);
-  try{
-    return decodeURIComponent(s.replace(/\+/g," "));
-  }catch{
-    return s.replace(/\+/g," ");
-  }
-}
-
-/* =================================
-DATE PARSER
-================================ */
-
 function parseDatePhrase(input="today"){
 
   input = String(input).toLowerCase().trim();
-
-  console.log("DATE PHRASE RECEIVED:", input);
 
   input = input.replace(/(\d+)(st|nd|rd|th)/g,"$1");
 
@@ -57,32 +38,12 @@ function parseDatePhrase(input="today"){
     return today;
   }
 
-  const weekdays=[
-    "sunday","monday","tuesday",
-    "wednesday","thursday","friday","saturday"
-  ];
-
-  if(weekdays.includes(input)){
-    const target=weekdays.indexOf(input);
-    const now=today.getDay();
-
-    let delta=(target-now+7)%7;
-
-    if(delta===0) delta=0;
-
-    today.setDate(today.getDate()+delta);
-
-    return today;
-  }
-
   const parsed = new Date(input);
 
   if(!isNaN(parsed)){
 
-    const now = new Date();
-
     if(parsed.getFullYear() === 2001){
-      parsed.setFullYear(now.getFullYear());
+      parsed.setFullYear(today.getFullYear());
     }
 
     return parsed;
@@ -103,7 +64,7 @@ function buildWindow(dateISO){
 }
 
 /* =================================
-NORMALIZE CLASSES
+CLASS NORMALIZER
 ================================ */
 
 function normalizeClasses(rawClasses){
@@ -154,16 +115,17 @@ SPEECH BUILDER
 
 function buildScheduleSay(dateLabel,classes){
 
-  if(!classes.length)
+  if(!classes.length){
     return `I couldn't find any classes for ${dateLabel}.`;
+  }
 
-  const max=2;
+  const max = 2;
 
-  const list=classes.slice(0,max).map(c =>
-    `${c.time} ${c.name} with ${c.instructor}`
-  );
+  const list = classes
+    .slice(0,max)
+    .map(c => `${c.time} ${c.name} with ${c.instructor}`);
 
-  return `The next classes for ${dateLabel} are: ${list.join(", ")}. Would you like to book one?`;
+  return `The next classes for ${dateLabel} are: ${list.join(", ")}.`;
 }
 
 /* =================================
@@ -179,8 +141,6 @@ async function fetchLiveClasses(dateISO){
   url.searchParams.set("StartDateTime",start);
   url.searchParams.set("EndDateTime",end);
   url.searchParams.set("LocationIds",LOCATION_ID);
-
-  console.log("Fetching Mindbody classes for",dateISO);
 
   const resp=await fetch(url.toString(),{
     method:"GET",
@@ -198,20 +158,7 @@ async function fetchLiveClasses(dateISO){
     throw new Error(json?.Error?.Message || "Mindbody error");
   }
 
-  const rawClasses=json.Classes || [];
-
-  console.log("CLASSES FOUND:",rawClasses.length);
-
-  if(rawClasses.length>0){
-    console.log(
-      "LOCATION:",
-      rawClasses[0]?.Location?.Name,
-      "| ID:",
-      rawClasses[0]?.Location?.Id
-    );
-  }
-
-  return rawClasses;
+  return json.Classes || [];
 }
 
 /* =================================
@@ -219,12 +166,35 @@ CACHE FUNCTIONS
 ================================ */
 
 function getCachedClasses(dateISO){
-  return scheduleCache.get(dateISO) || null;
+
+  const cached = scheduleCache.get(dateISO);
+
+  if(!cached) return null;
+
+  const age = Date.now() - cached.updated;
+
+  if(age > CACHE_MAX_AGE){
+    scheduleCache.delete(dateISO);
+    return null;
+  }
+
+  return cached.classes;
 }
 
-async function warmCache(){
+function setCachedClasses(dateISO,classes){
 
-  console.log("Warming schedule cache...");
+  scheduleCache.set(dateISO,{
+    classes,
+    updated: Date.now()
+  });
+
+}
+
+/* =================================
+CACHE WARMER
+================================ */
+
+async function warmCache(){
 
   const today = new Date();
 
@@ -243,9 +213,9 @@ async function warmCache(){
 
       classes.sort((a,b)=> new Date(a.start)-new Date(b.start));
 
-      scheduleCache.set(dateISO, classes);
+      setCachedClasses(dateISO,classes);
 
-      console.log("Cache updated:",dateISO,"classes:",classes.length);
+      console.log("Cache updated:",dateISO);
 
     }catch(err){
 
@@ -261,29 +231,28 @@ async function warmCache(){
 MAIN HANDLER
 ================================ */
 
-async function handleSchedule(req,res){
+async function handleMindbody(req,res){
 
-  const q=req.query || {};
-  const b=req.body || {};
+  const action =
+    req.body?.action ||
+    req.query?.action;
+
+  if(action !== "get_schedule"){
+    return res.status(200).send("I'm not able to process that request.");
+  }
 
   const datePhrase =
-    decodeMaybe(
-      q.date ??
-      b.date ??
-      q.datePhrase ??
-      b.datePhrase ??
-      q.dateParam ??
-      b.dateParam ??
-      "today"
-    );
+    req.body?.date ||
+    req.query?.date ||
+    "today";
 
   try{
 
-    const date=parseDatePhrase(datePhrase);
+    const date = parseDatePhrase(datePhrase);
 
-    const dateISO=toISO(date);
+    const dateISO = toISO(date);
 
-    const spokenDate=date.toLocaleDateString(
+    const spokenDate = date.toLocaleDateString(
       "en-US",
       { weekday:"long", month:"long", day:"numeric" }
     );
@@ -292,39 +261,29 @@ async function handleSchedule(req,res){
 
     if(!classes){
 
-      console.log("CACHE MISS:",dateISO);
-
       const raw = await fetchLiveClasses(dateISO);
 
       classes = normalizeClasses(raw);
 
       classes.sort((a,b)=> new Date(a.start)-new Date(b.start));
 
-      scheduleCache.set(dateISO, classes);
-
-    }else{
-
-      console.log("CACHE HIT:",dateISO);
+      setCachedClasses(dateISO,classes);
 
     }
 
-    const speech=buildScheduleSay(spokenDate,classes);
+    const speech = buildScheduleSay(spokenDate,classes);
 
-    console.log("SPEECH OUTPUT:",speech);
+    res.setHeader("Content-Type","text/plain");
 
-    return res.status(200).json({
-      speech: speech,
-      classes: classes.slice(0,6)
-    });
+    return res.status(200).send(speech);
 
   }catch(err){
 
     console.log("ERROR:",err.message);
 
-    return res.status(200).json({
-      speech: "I'm having trouble retrieving the schedule right now."
-    });
-
+    return res
+      .status(200)
+      .send("I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?");
   }
 
 }
@@ -333,14 +292,14 @@ async function handleSchedule(req,res){
 ROUTES
 ================================ */
 
-app.post("/ghl/mindbody",handleSchedule);
-app.get("/ghl/mindbody",handleSchedule);
+app.post("/ghl/mindbody",handleMindbody);
+app.get("/ghl/mindbody",handleMindbody);
 
-app.post("/ghl/mindbody/speak",handleSchedule);
-app.get("/ghl/mindbody/speak",handleSchedule);
+app.post("/ghl/mindbody/speak",handleMindbody);
+app.get("/ghl/mindbody/speak",handleMindbody);
 
 /* =================================
-HEALTH CHECK
+HEALTH
 ================================ */
 
 app.get("/",(_,res)=>res.send("ok"));
