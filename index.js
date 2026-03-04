@@ -13,7 +13,7 @@ const BASE_URL = "https://api.mindbodyonline.com/public/v6";
 const LOCATION_ID = "1";
 
 /* =================================
-   HELPERS
+HELPERS
 ================================ */
 
 function safeString(v){
@@ -31,7 +31,7 @@ function decodeMaybe(v){
 }
 
 /* =================================
-   DATE PARSER
+DATE PARSER
 ================================ */
 
 function parseDatePhrase(input="today"){
@@ -40,7 +40,6 @@ function parseDatePhrase(input="today"){
 
   console.log("DATE PHRASE RECEIVED:", input);
 
-  /* remove ordinal suffix */
   input = input.replace(/(\d+)(st|nd|rd|th)/g,"$1");
 
   const today = new Date();
@@ -70,9 +69,18 @@ function parseDatePhrase(input="today"){
     return today;
   }
 
-  const parsed=new Date(input);
+  const parsed = new Date(input);
 
-  if(!isNaN(parsed)) return parsed;
+  if(!isNaN(parsed)){
+
+    const now = new Date();
+
+    if(parsed.getFullYear() === 2001){
+      parsed.setFullYear(now.getFullYear());
+    }
+
+    return parsed;
+  }
 
   return today;
 }
@@ -89,7 +97,7 @@ function buildWindow(dateISO){
 }
 
 /* =================================
-   NORMALIZE CLASSES
+NORMALIZE CLASSES
 ================================ */
 
 function normalizeClasses(rawClasses){
@@ -135,13 +143,13 @@ function normalizeClasses(rawClasses){
 }
 
 /* =================================
-   SPEECH BUILDER
+SPEECH BUILDER
 ================================ */
 
-function buildScheduleSay(dateISO,classes){
+function buildScheduleSay(dateLabel,classes){
 
   if(!classes.length)
-    return `I couldn't find any classes for ${dateISO}.`;
+    return `I couldn't find any classes for ${dateLabel}.`;
 
   const max=6;
 
@@ -149,11 +157,11 @@ function buildScheduleSay(dateISO,classes){
     `${c.time} ${c.name} with ${c.instructor}`
   );
 
-  return `The classes for ${dateISO} are: ${list.join(", ")}. Would you like to book one?`;
+  return `The classes for ${dateLabel} are: ${list.join(", ")}. Would you like to book one?`;
 }
 
 /* =================================
-   MINDBODY FETCH
+MINDBODY FETCH
 ================================ */
 
 async function fetchClasses(dateISO){
@@ -164,8 +172,6 @@ async function fetchClasses(dateISO){
 
   url.searchParams.set("StartDateTime",start);
   url.searchParams.set("EndDateTime",end);
-
-  /* force location 1 */
   url.searchParams.set("LocationIds",LOCATION_ID);
 
   console.log("Fetching Mindbody classes for",dateISO);
@@ -214,7 +220,7 @@ async function fetchClasses(dateISO){
 }
 
 /* =================================
-   MAIN HANDLER
+MAIN HANDLER
 ================================ */
 
 async function handleSchedule(req,res){
@@ -239,35 +245,40 @@ async function handleSchedule(req,res){
 
     const dateISO=toISO(date);
 
+    const spokenDate=new Date(dateISO).toLocaleDateString(
+      "en-US",
+      { weekday:"long", month:"long", day:"numeric" }
+    );
+
     const raw=await fetchClasses(dateISO);
 
     const classes=normalizeClasses(raw);
 
-    /* sort classes */
     classes.sort((a,b)=>{
       return new Date(a.start)-new Date(b.start);
     });
 
-    const speech=buildScheduleSay(dateISO,classes);
+    const speech=buildScheduleSay(spokenDate,classes);
 
     console.log("SPEECH OUTPUT:",speech);
 
-    res.setHeader("Content-Type","text/plain; charset=utf-8");
-
-    return res.status(200).send(speech);
+    return res.status(200).json({
+      speech: speech,
+      classes: classes.slice(0,6)
+    });
 
   }catch(err){
 
     console.log("ERROR:",err.message);
 
-    return res
-      .status(200)
-      .send("I'm having trouble retrieving the schedule right now.");
+    return res.status(200).json({
+      speech: "I'm having trouble retrieving the schedule right now."
+    });
   }
 }
 
 /* =================================
-   ROUTES (UNCHANGED)
+ROUTES (UNCHANGED)
 ================================ */
 
 app.post("/ghl/mindbody",handleSchedule);
@@ -277,7 +288,7 @@ app.post("/ghl/mindbody/speak",handleSchedule);
 app.get("/ghl/mindbody/speak",handleSchedule);
 
 /* =================================
-   HEALTH
+HEALTH
 ================================ */
 
 app.get("/",(_,res)=>res.send("ok"));
