@@ -12,133 +12,215 @@ const SITE_ID = process.env.MINDBODY_SITE_ID;
 const BASE_URL = "https://api.mindbodyonline.com/public/v6";
 const LOCATION_ID = "1";
 
-/* ===============================
+/* =================================
    HELPERS
-=============================== */
+================================ */
 
-function safeString(v) {
-  if (v === undefined || v === null) return "";
+function safeString(v){
+  if(v === undefined || v === null) return "";
   return String(v);
 }
 
-function decodeMaybe(v) {
+function decodeMaybe(v){
   const s = safeString(v);
-  try {
-    return decodeURIComponent(s.replace(/\+/g, " "));
-  } catch {
-    return s.replace(/\+/g, " ");
+  try{
+    return decodeURIComponent(s.replace(/\+/g," "));
+  }catch{
+    return s.replace(/\+/g," ");
   }
 }
 
-/* ===============================
+/* =================================
    DATE PARSER
-=============================== */
+================================ */
 
-function parseDatePhrase(input = "today") {
+function parseDatePhrase(input="today"){
+
   input = String(input).toLowerCase().trim();
 
   console.log("DATE PHRASE RECEIVED:", input);
 
+  /* remove ordinal suffix */
+  input = input.replace(/(\d+)(st|nd|rd|th)/g,"$1");
+
   const today = new Date();
 
-  if (input === "today") return today;
+  if(input==="today") return today;
 
-  if (input === "tomorrow") {
-    today.setDate(today.getDate() + 1);
+  if(input==="tomorrow"){
+    today.setDate(today.getDate()+1);
     return today;
   }
 
-  const weekdays = [
+  const weekdays=[
     "sunday","monday","tuesday",
     "wednesday","thursday","friday","saturday"
   ];
 
-  if (weekdays.includes(input)) {
-    const target = weekdays.indexOf(input);
-    const now = today.getDay();
+  if(weekdays.includes(input)){
+    const target=weekdays.indexOf(input);
+    const now=today.getDay();
 
-    let delta = (target - now + 7) % 7;
+    let delta=(target-now+7)%7;
 
-    if (delta === 0) delta = 0;
+    if(delta===0) delta=0;
 
-    today.setDate(today.getDate() + delta);
+    today.setDate(today.getDate()+delta);
 
     return today;
   }
 
-  const parsed = new Date(input);
+  const parsed=new Date(input);
 
-  if (!isNaN(parsed)) return parsed;
+  if(!isNaN(parsed)) return parsed;
 
   return today;
 }
 
-function toISO(date) {
+function toISO(date){
   return date.toISOString().split("T")[0];
 }
 
-function buildWindow(dateISO) {
-  return {
-    start: `${dateISO}T00:00:00`,
-    end: `${dateISO}T23:59:59`
+function buildWindow(dateISO){
+  return{
+    start:`${dateISO}T00:00:00`,
+    end:`${dateISO}T23:59:59`
   };
 }
 
-/* ===============================
+/* =================================
+   NORMALIZE CLASSES
+================================ */
+
+function normalizeClasses(rawClasses){
+
+  const classes=[];
+
+  for(const c of rawClasses||[]){
+
+    const name =
+      c?.ClassDescription?.Name ||
+      c?.Name ||
+      "Class";
+
+    const instructor =
+      c?.Staff?.Name ||
+      c?.Staff?.FirstName ||
+      "Instructor";
+
+    const start=c?.StartDateTime;
+
+    let time="";
+
+    if(start){
+      const dt=new Date(start);
+
+      time=new Intl.DateTimeFormat("en-US",{
+        hour:"numeric",
+        minute:"2-digit"
+      }).format(dt);
+    }
+
+    classes.push({
+      id:c?.Id,
+      name,
+      instructor,
+      time,
+      start
+    });
+
+  }
+
+  return classes;
+}
+
+/* =================================
+   SPEECH BUILDER
+================================ */
+
+function buildScheduleSay(dateISO,classes){
+
+  if(!classes.length)
+    return `I couldn't find any classes for ${dateISO}.`;
+
+  const max=6;
+
+  const list=classes.slice(0,max).map(c =>
+    `${c.time} ${c.name} with ${c.instructor}`
+  );
+
+  return `The classes for ${dateISO} are: ${list.join(", ")}. Would you like to book one?`;
+}
+
+/* =================================
    MINDBODY FETCH
-=============================== */
+================================ */
 
-async function fetchClasses(dateISO) {
+async function fetchClasses(dateISO){
 
-  const { start, end } = buildWindow(dateISO);
+  const {start,end}=buildWindow(dateISO);
 
-  const url = new URL(`${BASE_URL}/class/classes`);
+  const url=new URL(`${BASE_URL}/class/classes`);
 
-  url.searchParams.set("StartDateTime", start);
-  url.searchParams.set("EndDateTime", end);
+  url.searchParams.set("StartDateTime",start);
+  url.searchParams.set("EndDateTime",end);
 
-  /* FORCE LOCATION FILTER */
-  url.searchParams.set("LocationIds", LOCATION_ID);
+  /* force location 1 */
+  url.searchParams.set("LocationIds",LOCATION_ID);
 
-  console.log("MINDBODY REQUEST:", url.toString());
+  console.log("Fetching Mindbody classes for",dateISO);
 
-  const resp = await fetch(url.toString(), {
-    method: "GET",
-    headers: {
-      "Api-Key": API_KEY,
-      SiteId: SITE_ID,
-      "Content-Type": "application/json"
+  const resp=await fetch(url.toString(),{
+    method:"GET",
+    headers:{
+      "Api-Key":API_KEY,
+      SiteId:SITE_ID,
+      "Content-Type":"application/json"
     },
-    signal: AbortSignal.timeout(2500)
+    signal:AbortSignal.timeout(2500)
   });
 
-  const json = await resp.json();
+  const json=await resp.json();
 
-  console.log("RAW MINDBODY RESPONSE:");
-  console.log(JSON.stringify(json, null, 2));
-
-  if (!resp.ok) {
+  if(!resp.ok){
     throw new Error(json?.Error?.Message || "Mindbody error");
   }
 
-  const classes = json.Classes || [];
+  const rawClasses=json.Classes || [];
 
-  console.log("CLASSES FOUND:", classes.length);
+  console.log("CLASSES FOUND:",rawClasses.length);
 
-  return {
-    raw: json,
-    classes
-  };
+  if(rawClasses.length>0){
+    console.log(
+      "LOCATION:",
+      rawClasses[0]?.Location?.Name,
+      "| ID:",
+      rawClasses[0]?.Location?.Id
+    );
+  }
+
+  rawClasses.slice(0,5).forEach(c=>{
+    console.log(
+      "CLASS:",
+      c.Id,
+      "|",
+      c.ClassDescription?.Name,
+      "|",
+      c.StartDateTime
+    );
+  });
+
+  return rawClasses;
 }
 
-/* ===============================
+/* =================================
    MAIN HANDLER
-=============================== */
+================================ */
 
-async function handleSchedule(req, res) {
+async function handleSchedule(req,res){
 
-  const q = req.query || {};
-  const b = req.body || {};
+  const q=req.query || {};
+  const b=req.body || {};
 
   const datePhrase =
     decodeMaybe(
@@ -151,52 +233,55 @@ async function handleSchedule(req, res) {
       "today"
     );
 
-  try {
+  try{
 
-    const date = parseDatePhrase(datePhrase);
+    const date=parseDatePhrase(datePhrase);
 
-    const dateISO = toISO(date);
+    const dateISO=toISO(date);
 
-    const schedule = await fetchClasses(dateISO);
+    const raw=await fetchClasses(dateISO);
 
-    const speech =
-      "DEBUG MODE. Raw classes from Mindbody:\n\n" +
-      JSON.stringify(schedule.raw, null, 2);
+    const classes=normalizeClasses(raw);
 
-    console.log("SPEECH OUTPUT:");
-    console.log(speech);
+    /* sort classes */
+    classes.sort((a,b)=>{
+      return new Date(a.start)-new Date(b.start);
+    });
 
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    const speech=buildScheduleSay(dateISO,classes);
+
+    console.log("SPEECH OUTPUT:",speech);
+
+    res.setHeader("Content-Type","text/plain; charset=utf-8");
 
     return res.status(200).send(speech);
 
-  } catch (err) {
+  }catch(err){
 
-    console.log("ERROR:", err.message);
+    console.log("ERROR:",err.message);
 
     return res
       .status(200)
-      .send("Error retrieving classes from Mindbody.");
-
+      .send("I'm having trouble retrieving the schedule right now.");
   }
 }
 
-/* ===============================
+/* =================================
    ROUTES (UNCHANGED)
-=============================== */
+================================ */
 
-app.post("/ghl/mindbody", handleSchedule);
-app.get("/ghl/mindbody", handleSchedule);
+app.post("/ghl/mindbody",handleSchedule);
+app.get("/ghl/mindbody",handleSchedule);
 
-app.post("/ghl/mindbody/speak", handleSchedule);
-app.get("/ghl/mindbody/speak", handleSchedule);
+app.post("/ghl/mindbody/speak",handleSchedule);
+app.get("/ghl/mindbody/speak",handleSchedule);
 
-/* ===============================
-   HEALTH CHECK
-=============================== */
+/* =================================
+   HEALTH
+================================ */
 
-app.get("/", (_, res) => res.send("ok"));
+app.get("/",(_,res)=>res.send("ok"));
 
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+app.listen(PORT,()=>{
+  console.log("Server running on port",PORT);
 });
