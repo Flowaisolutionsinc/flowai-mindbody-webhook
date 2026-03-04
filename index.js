@@ -13,6 +13,12 @@ const BASE_URL = "https://api.mindbodyonline.com/public/v6";
 const LOCATION_ID = "1";
 
 /* =================================
+CACHE STORE
+================================ */
+
+const scheduleCache = new Map();
+
+/* =================================
 HELPERS
 ================================ */
 
@@ -40,7 +46,6 @@ function parseDatePhrase(input="today"){
 
   console.log("DATE PHRASE RECEIVED:", input);
 
-  /* remove ordinal suffix */
   input = input.replace(/(\d+)(st|nd|rd|th)/g,"$1");
 
   const today = new Date();
@@ -162,10 +167,10 @@ function buildScheduleSay(dateLabel,classes){
 }
 
 /* =================================
-MINDBODY FETCH
+MINDBODY LIVE FETCH
 ================================ */
 
-async function fetchClasses(dateISO){
+async function fetchLiveClasses(dateISO){
 
   const {start,end}=buildWindow(dateISO);
 
@@ -206,18 +211,50 @@ async function fetchClasses(dateISO){
     );
   }
 
-  rawClasses.slice(0,5).forEach(c=>{
-    console.log(
-      "CLASS:",
-      c.Id,
-      "|",
-      c.ClassDescription?.Name,
-      "|",
-      c.StartDateTime
-    );
-  });
-
   return rawClasses;
+}
+
+/* =================================
+CACHE FUNCTIONS
+================================ */
+
+function getCachedClasses(dateISO){
+  return scheduleCache.get(dateISO) || null;
+}
+
+async function warmCache(){
+
+  console.log("Warming schedule cache...");
+
+  const today = new Date();
+
+  for(let i=0;i<7;i++){
+
+    const d = new Date(today);
+    d.setDate(today.getDate()+i);
+
+    const dateISO = toISO(d);
+
+    try{
+
+      const raw = await fetchLiveClasses(dateISO);
+
+      const classes = normalizeClasses(raw);
+
+      classes.sort((a,b)=> new Date(a.start)-new Date(b.start));
+
+      scheduleCache.set(dateISO, classes);
+
+      console.log("Cache updated:",dateISO,"classes:",classes.length);
+
+    }catch(err){
+
+      console.log("Cache warm error:",err.message);
+
+    }
+
+  }
+
 }
 
 /* =================================
@@ -251,13 +288,25 @@ async function handleSchedule(req,res){
       { weekday:"long", month:"long", day:"numeric" }
     );
 
-    const raw=await fetchClasses(dateISO);
+    let classes = getCachedClasses(dateISO);
 
-    const classes=normalizeClasses(raw);
+    if(!classes){
 
-    classes.sort((a,b)=>{
-      return new Date(a.start)-new Date(b.start);
-    });
+      console.log("CACHE MISS:",dateISO);
+
+      const raw = await fetchLiveClasses(dateISO);
+
+      classes = normalizeClasses(raw);
+
+      classes.sort((a,b)=> new Date(a.start)-new Date(b.start));
+
+      scheduleCache.set(dateISO, classes);
+
+    }else{
+
+      console.log("CACHE HIT:",dateISO);
+
+    }
 
     const speech=buildScheduleSay(spokenDate,classes);
 
@@ -275,7 +324,9 @@ async function handleSchedule(req,res){
     return res.status(200).json({
       speech: "I'm having trouble retrieving the schedule right now."
     });
+
   }
+
 }
 
 /* =================================
@@ -289,10 +340,24 @@ app.post("/ghl/mindbody/speak",handleSchedule);
 app.get("/ghl/mindbody/speak",handleSchedule);
 
 /* =================================
-HEALTH CHECK
+HEALTH
 ================================ */
 
 app.get("/",(_,res)=>res.send("ok"));
+
+/* =================================
+CACHE WARMER
+================================ */
+
+warmCache();
+
+setInterval(()=>{
+  warmCache();
+}, 15 * 60 * 1000);
+
+/* =================================
+START SERVER
+================================ */
 
 app.listen(PORT,()=>{
   console.log("Server running on port",PORT);
