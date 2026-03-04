@@ -2,7 +2,7 @@ const express = require("express");
 const app = express();
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended:true }));
 
 const PORT = process.env.PORT || 8080;
 
@@ -12,16 +12,16 @@ const SITE_ID = process.env.MINDBODY_SITE_ID;
 const LOCATION_ID = "1";
 const BASE_URL = "https://api.mindbodyonline.com/public/v6";
 
-/* ===============================
+/* ==============================
 CACHE
-=============================== */
+============================== */
 
 const cache = new Map();
 const CACHE_TTL = 15 * 60 * 1000;
 
-/* ===============================
+/* ==============================
 DATE PARSER
-=============================== */
+============================== */
 
 function parseDate(input="today"){
 
@@ -53,34 +53,64 @@ function dateISO(date){
   return date.toISOString().split("T")[0];
 }
 
-/* ===============================
-FETCH MINDBODY
-=============================== */
+/* ==============================
+TIME OF DAY PARSER
+============================== */
+
+function parseTimeOfDay(text){
+
+  text = String(text || "").toLowerCase();
+
+  if(text.includes("morning")){
+    return { start:0, end:12 };
+  }
+
+  if(text.includes("afternoon")){
+    return { start:12, end:17 };
+  }
+
+  if(text.includes("evening")){
+    return { start:17, end:24 };
+  }
+
+  if(text.includes("night")){
+    return { start:19, end:24 };
+  }
+
+  return null;
+
+}
+
+/* ==============================
+FETCH CLASSES
+============================== */
 
 async function fetchClasses(date){
 
   const start = `${date}T00:00:00`;
   const end   = `${date}T23:59:59`;
 
-  const url = `${BASE_URL}/class/classes?StartDateTime=${start}&EndDateTime=${end}&LocationIds=${LOCATION_ID}`;
+  const url =
+  `${BASE_URL}/class/classes?StartDateTime=${start}&EndDateTime=${end}&LocationIds=${LOCATION_ID}`;
 
   console.log("Mindbody request:", url);
 
   const res = await fetch(url,{
     headers:{
-      "Api-Key": API_KEY,
-      "SiteId": SITE_ID
+      "Api-Key":API_KEY,
+      "SiteId":SITE_ID
     }
   });
 
   const json = await res.json();
 
   return json.Classes || [];
+
 }
 
-/* ===============================
+/* ==============================
 NORMALIZE CLASSES
-=============================== */
+============================== */
 
 function normalize(classes){
 
@@ -93,7 +123,7 @@ function normalize(classes){
       minute:"2-digit"
     });
 
-    return {
+    return{
       id:c.Id,
       name:c.ClassDescription?.Name || c.Name || "Class",
       instructor:c.Staff?.Name || "Instructor",
@@ -105,9 +135,9 @@ function normalize(classes){
 
 }
 
-/* ===============================
+/* ==============================
 BUILD SPEECH
-=============================== */
+============================== */
 
 function buildSpeech(dateLabel,classes){
 
@@ -115,16 +145,19 @@ function buildSpeech(dateLabel,classes){
     return `I couldn't find any classes for ${dateLabel}.`;
   }
 
-  const top = classes.slice(0,2);
+  const MAX_CLASSES = 6;
 
-  const list = top.map(c=>`${c.time} ${c.name} with ${c.instructor}`);
+  const list = classes
+  .slice(0,MAX_CLASSES)
+  .map(c=>`${c.time} ${c.name} with ${c.instructor}`);
 
-  return `The next classes for ${dateLabel} are: ${list.join(", ")}.`;
+  return `The classes for ${dateLabel} are: ${list.join(", ")}.`;
+
 }
 
-/* ===============================
+/* ==============================
 CACHE HELPERS
-=============================== */
+============================== */
 
 function getCache(date){
 
@@ -138,6 +171,7 @@ function getCache(date){
   }
 
   return entry.data;
+
 }
 
 function setCache(date,data){
@@ -149,13 +183,13 @@ function setCache(date,data){
 
 }
 
-/* ===============================
+/* ==============================
 CACHE WARMER
-=============================== */
+============================== */
 
 async function warmCache(){
 
-  console.log("Warming cache...");
+  console.log("Warming schedule cache...");
 
   const today = new Date();
 
@@ -173,11 +207,11 @@ async function warmCache(){
 
       setCache(iso,classes);
 
-      console.log("Cache updated:", iso);
+      console.log("Cache updated:",iso);
 
     }catch(err){
 
-      console.log("Cache warm error:", err.message);
+      console.log("Cache warm error:",err.message);
 
     }
 
@@ -185,30 +219,30 @@ async function warmCache(){
 
 }
 
-/* ===============================
+/* ==============================
 WEBHOOK HANDLER
-=============================== */
+============================== */
 
 async function handler(req,res){
 
   console.log("----- WEBHOOK REQUEST -----");
 
-  console.log("Body:", req.body);
-  console.log("Query:", req.query);
+  console.log("Body:",req.body);
+  console.log("Query:",req.query);
 
   const action = req.body.action || req.query.action;
 
   if(action !== "get_schedule"){
 
     return res.json({
-      results: "Unsupported action."
+      results:"Unsupported action."
     });
 
   }
 
   const datePhrase = req.body.date || req.query.date || "today";
 
-  console.log("DATE PHRASE RECEIVED:", datePhrase);
+  console.log("DATE PHRASE RECEIVED:",datePhrase);
 
   try{
 
@@ -219,16 +253,32 @@ async function handler(req,res){
 
     if(classes){
 
-      console.log("CACHE HIT:", iso);
+      console.log("CACHE HIT:",iso);
 
     }else{
 
-      console.log("CACHE MISS:", iso);
+      console.log("CACHE MISS:",iso);
 
       const raw = await fetchClasses(iso);
       classes = normalize(raw);
 
       setCache(iso,classes);
+
+    }
+
+    /* TIME OF DAY FILTER */
+
+    const timeFilter = parseTimeOfDay(datePhrase);
+
+    if(timeFilter){
+
+      classes = classes.filter(c=>{
+
+        const hour = new Date(c.start).getHours();
+
+        return hour >= timeFilter.start && hour < timeFilter.end;
+
+      });
 
     }
 
@@ -244,49 +294,50 @@ async function handler(req,res){
     console.log(speech);
 
     return res.json({
-      results: speech
+      results:speech
     });
 
   }catch(err){
 
-    console.log("ERROR:", err);
+    console.log("ERROR:",err);
 
     return res.json({
-      results: "I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?"
+      results:
+      "I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?"
     });
 
   }
 
 }
 
-/* ===============================
+/* ==============================
 ROUTES
-=============================== */
+============================== */
 
-app.post("/ghl/mindbody", handler);
-app.get("/ghl/mindbody", handler);
+app.post("/ghl/mindbody",handler);
+app.get("/ghl/mindbody",handler);
 
-app.post("/ghl/mindbody/speak", handler);
-app.get("/ghl/mindbody/speak", handler);
+app.post("/ghl/mindbody/speak",handler);
+app.get("/ghl/mindbody/speak",handler);
 
-/* ===============================
+/* ==============================
 HEALTH CHECK
-=============================== */
+============================== */
 
 app.get("/debug",(req,res)=>{
   res.send("Webhook server alive");
 });
 
-/* ===============================
+/* ==============================
 START SERVER
-=============================== */
+============================== */
 
 warmCache();
 
 setInterval(()=>{
   warmCache();
-}, 15 * 60 * 1000);
+},15*60*1000);
 
 app.listen(PORT,()=>{
-  console.log("Server running on port", PORT);
+  console.log("Server running on port",PORT);
 });
