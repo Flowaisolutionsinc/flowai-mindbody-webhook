@@ -185,7 +185,7 @@ function getMindbodyConfig() {
     requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
   const tokenUsername = requireEnv("MINDBODY_TOKEN_USERNAME");
   const tokenPassword = requireEnv("MINDBODY_TOKEN_PASSWORD");
-  return { mode, apiKey, siteId, baseUrl, tokenUsername, tokenPassword };
+ return { mode, apiKey, siteId, baseUrl, tokenUsername, tokenPassword, locationId: "1" };
 }
 
 function getTodayISOInTZ(timeZone) {
@@ -452,6 +452,8 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
   const url = new URL(`${cfg.baseUrl.replace(/\/$/, "")}/class/classes`);
   url.searchParams.set("StartDateTime", start);
   url.searchParams.set("EndDateTime", end);
+  url.searchParams.set("LocationIds", "1");
+console.log("Mindbody request:", url.toString());
 
   const resp = await fetch(url.toString(), {
     method: "GET",
@@ -747,6 +749,7 @@ async function mindbodyHandler(req, res) {
 
       const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
       let classes = schedule.classes;
+      classes = classes.filter(c => !c.locationId || c.locationId === "1");
       classes = sortClassesByStartTime(classes);
 
       if (!classes.length) {
