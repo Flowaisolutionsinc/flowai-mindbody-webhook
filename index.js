@@ -40,6 +40,7 @@ function parseDatePhrase(input="today"){
 
   console.log("DATE PHRASE RECEIVED:", input);
 
+  /* remove ordinal suffix */
   input = input.replace(/(\d+)(st|nd|rd|th)/g,"$1");
 
   const today = new Date();
@@ -245,7 +246,7 @@ async function handleSchedule(req,res){
 
     const dateISO=toISO(date);
 
-    const spokenDate=new Date(dateISO).toLocaleDateString(
+    const spokenDate=date.toLocaleDateString(
       "en-US",
       { weekday:"long", month:"long", day:"numeric" }
     );
@@ -288,7 +289,7 @@ app.post("/ghl/mindbody/speak",handleSchedule);
 app.get("/ghl/mindbody/speak",handleSchedule);
 
 /* =================================
-HEALTH
+HEALTH CHECK
 ================================ */
 
 app.get("/",(_,res)=>res.send("ok"));
