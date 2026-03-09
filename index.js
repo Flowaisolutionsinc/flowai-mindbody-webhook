@@ -342,6 +342,9 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
     searchTerms.push(`${firstName || ""} ${lastName || ""}`.trim());
   }
 
+  // Use cleaned phone for matching too
+  const phoneForMatching = cleanedPhone;
+
   let allClients = [];
 
   for (const term of searchTerms) {
@@ -373,7 +376,7 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
   console.log("Total unique clients found:", uniqueClients.length);
 
   let matched = uniqueClients.find(client =>
-    phoneMatches(client, phone) && namesMatch(client, firstName, lastName)
+    phoneMatches(client, phoneForMatching) && namesMatch(client, firstName, lastName)
   );
   if (matched) {
     console.log("Matched by phone + name:", matched.FirstName, matched.LastName);
@@ -389,7 +392,7 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
   }
 
   // Trust phone match alone — name spelling may differ (e.g. Braden vs Brayden)
-  matched = uniqueClients.find(client => phoneMatches(client, phone));
+  matched = uniqueClients.find(client => phoneMatches(client, phoneForMatching));
   if (matched) {
     console.log("Matched by phone only (name spelling may differ):", matched.FirstName, matched.LastName);
     return matched;
