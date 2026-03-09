@@ -346,6 +346,7 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
       );
 
       const clients = Array.isArray(json?.Clients) ? json.Clients : [];
+      console.log(`Client search for "${term}" returned ${clients.length} result(s)`);
       allClients = allClients.concat(clients);
     } catch (err) {
       console.log("Client search failed for term:", term, err.message);
@@ -361,6 +362,8 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
     seen.add(id);
     uniqueClients.push(client);
   }
+
+  console.log("Total unique clients found:", uniqueClients.length);
 
   let matched = uniqueClients.find(client =>
     phoneMatches(client, phone) && namesMatch(client, firstName, lastName)
@@ -486,6 +489,9 @@ async function resolveBookingClassId(classInput) {
   }
 
   const target = normalizeText(classInput);
+  console.log("Resolving class input:", classInput);
+  console.log("Normalized target:", target);
+
   const today = DateTime.now().setZone(STUDIO_TIMEZONE).startOf("day");
 
   const allClasses = [];
@@ -511,6 +517,9 @@ async function resolveBookingClassId(classInput) {
       console.log("Class resolution fetch failed for date:", iso, err.message);
     }
   }
+
+  console.log("Total classes available for matching:", allClasses.length);
+  console.log("Available class labels:", allClasses.map(c => `[${c.iso}] ${c.normalizedLabel}`));
 
   let match = allClasses.find(c => c.normalizedLabel === target);
 
@@ -697,6 +706,8 @@ async function handler(req, res) {
         email
       });
 
+      console.log("Client lookup result:", client ? `FOUND — ID: ${client.Id}, Name: ${client.FirstName} ${client.LastName}` : "NOT FOUND");
+
       if (!client || !client.Id) {
         return res.json({
           results: "I couldn't find an existing account with that information — would you like me to connect you with the front desk?"
@@ -705,11 +716,15 @@ async function handler(req, res) {
 
       const resolvedClassId = await resolveBookingClassId(classId);
 
+      console.log("Resolved class ID:", resolvedClassId !== null ? resolvedClassId : "NOT RESOLVED");
+
       if (!resolvedClassId) {
         return res.json({
           results: "I couldn't match that class exactly — would you like me to try again or connect you with the front desk?"
         });
       }
+
+      console.log("Attempting to book client", client.Id, "into class", resolvedClassId);
 
       const bookingResponse = await bookExistingClientIntoClass({
         clientId: client.Id,
@@ -719,6 +734,8 @@ async function handler(req, res) {
       const visits = Array.isArray(bookingResponse?.Visits) ? bookingResponse.Visits : [];
       const errorCode = bookingResponse?.ErrorCode;
       const message = bookingResponse?.Message || bookingResponse?.ErrorMessage || "";
+
+      console.log("Booking result — visits:", visits.length, "errorCode:", errorCode, "message:", message);
 
       if (visits.length > 0 && !errorCode) {
         return res.json({
