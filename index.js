@@ -268,7 +268,6 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
     }
   }
 
-  // Deduplicate by client ID
   const uniqueClients = [];
   const seen = new Set();
 
@@ -279,25 +278,19 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
     uniqueClients.push(client);
   }
 
-  // Strongest match first: phone + name
   let matched = uniqueClients.find(client =>
     phoneMatches(client, phone) && namesMatch(client, firstName, lastName)
   );
-
   if (matched) return matched;
 
-  // Next best: email + name
   matched = uniqueClients.find(client =>
     emailMatches(client, email) && namesMatch(client, firstName, lastName)
   );
-
   if (matched) return matched;
 
-  // Next: phone only
   matched = uniqueClients.find(client => phoneMatches(client, phone));
   if (matched) return matched;
 
-  // Last: email only
   matched = uniqueClients.find(client => emailMatches(client, email));
   if (matched) return matched;
 
@@ -354,7 +347,6 @@ function normalize(classes) {
   return classes
     .map(c => {
       const localStart = DateTime.fromISO(c.StartDateTime, { setZone: true }).setZone(STUDIO_TIMEZONE);
-
       const time = localStart.isValid ? localStart.toFormat("h:mm a") : "Time unavailable";
 
       return {
@@ -368,6 +360,115 @@ function normalize(classes) {
       };
     })
     .sort((a, b) => a.localMillis - b.localMillis);
+}
+
+/* =========================
+CLASS SELECTION RESOLUTION
+========================= */
+
+function buildClassSelectionLabel(c) {
+  return `${c.time} ${c.name} with ${c.instructor}`;
+}
+
+function normalizeSelectionText(value = "") {
+  return String(value)
+    .toLowerCase()
+    .replace(/15\/15\/15/g, "15 15 15")
+    .replace(/&/g, "and")
+    .replace(/[|]/g, " ")
+    .replace(/[^a-z0-9: ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreClassMatch(selection, cls) {
+  const target = normalizeSelectionText(selection);
+  const label = normalizeSelectionText(buildClassSelectionLabel(cls));
+  const timeOnly = normalizeSelectionText(cls.time);
+  const nameOnly = normalizeSelectionText(cls.name);
+  const instructorOnly = normalizeSelectionText(cls.instructor);
+
+  let score = 0;
+
+  if (label === target) score += 1000;
+  if (label.includes(target) || target.includes(label)) score += 400;
+  if (target.includes(timeOnly)) score += 120;
+  if (target.includes(nameOnly)) score += 220;
+  if (target.includes(instructorOnly)) score += 80;
+
+  return score;
+}
+
+async function getUpcomingClassesForResolution(days = 7) {
+  const today = DateTime.now().setZone(STUDIO_TIMEZONE).startOf("day");
+  const all = [];
+
+  for (let i = 0; i < days; i++) {
+    const d = today.plus({ days: i });
+    const iso = d.toFormat("yyyy-MM-dd");
+
+    let classes = getCache(iso);
+
+    if (!classes) {
+      try {
+        const raw = await fetchClasses(iso);
+        classes = normalize(raw);
+        setCache(iso, classes);
+      } catch (err) {
+        console.log("Class resolution fetch error:", iso, err.message);
+        classes = [];
+      }
+    }
+
+    for (const cls of classes || []) {
+      all.push({
+        ...cls,
+        date: iso
+      });
+    }
+  }
+
+  return all;
+}
+
+async function resolveClassId(inputClassId) {
+  if (!inputClassId) return null;
+
+  const raw = String(inputClassId).trim();
+
+  // Already a numeric class ID
+  if (/^\d+$/.test(raw)) {
+    return raw;
+  }
+
+  const allClasses = await getUpcomingClassesForResolution(7);
+
+  if (!allClasses.length) return null;
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const cls of allClasses) {
+    const score = scoreClassMatch(raw, cls);
+    if (score > bestScore) {
+      best = cls;
+      bestScore = score;
+    }
+  }
+
+  console.log("Class resolution input:", raw);
+  console.log("Class resolution best match:", best ? {
+    id: best.id,
+    date: best.date,
+    label: buildClassSelectionLabel(best),
+    score: bestScore
+  } : null);
+
+  if (!best || bestScore < 250) {
+    return null;
+  }
+
+  return String(best.id);
 }
 
 /* =========================
@@ -466,7 +567,7 @@ async function handler(req, res) {
   ========================= */
 
   if (action === "book_existing_client") {
-    const classId = req.body.classId || req.query.classId;
+    const incomingClassId = req.body.classId || req.query.classId;
     const firstName = req.body.firstName || req.query.firstName || "";
     const lastName = req.body.lastName || req.query.lastName || "";
     const phone = req.body.phone || req.query.phone || "";
@@ -474,7 +575,7 @@ async function handler(req, res) {
     const isNewClient = String(req.body.isNewClient || req.query.isNewClient || "").toLowerCase();
 
     console.log("BOOKING REQUEST:", {
-      classId,
+      classId: incomingClassId,
       firstName,
       lastName,
       phone,
@@ -482,7 +583,7 @@ async function handler(req, res) {
       isNewClient
     });
 
-    if (!classId) {
+    if (!incomingClassId) {
       return res.json({
         results: "I couldn't tell which class you wanted to book — would you like me to try again or connect you with the front desk?"
       });
@@ -501,6 +602,16 @@ async function handler(req, res) {
     }
 
     try {
+      const resolvedClassId = await resolveClassId(incomingClassId);
+
+      if (!resolvedClassId) {
+        return res.json({
+          results: "I couldn't match that class selection to a live class on the schedule — would you like me to try again or connect you with the front desk?"
+        });
+      }
+
+      console.log("Resolved booking classId:", resolvedClassId);
+
       const client = await findExistingClient({
         firstName,
         lastName,
@@ -516,7 +627,7 @@ async function handler(req, res) {
 
       const bookingResponse = await bookExistingClientIntoClass({
         clientId: client.Id,
-        classId
+        classId: resolvedClassId
       });
 
       const visits = Array.isArray(bookingResponse?.Visits) ? bookingResponse.Visits : [];
