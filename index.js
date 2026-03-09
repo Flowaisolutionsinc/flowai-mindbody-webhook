@@ -52,8 +52,8 @@ function parseDate(input = "today") {
 
   for (let i = 0; i < weekdays.length; i++) {
     if (input.includes(weekdays[i])) {
-      const target = i; // sunday=0 ... saturday=6
-      const current = today.weekday % 7; // luxon monday=1 ... sunday=7 => sunday becomes 0
+      const target = i;
+      const current = today.weekday % 7;
 
       let diff = target - current;
       if (diff <= 0) diff += 7;
@@ -301,8 +301,6 @@ async function handler(req, res) {
       setCache(iso, classes);
     }
 
-    /* TIME FILTER */
-
     const timeFilter = parseTimeOfDay(datePhrase);
 
     if (timeFilter && classes.length) {
@@ -316,8 +314,6 @@ async function handler(req, res) {
         return hour >= timeFilter.start && hour < timeFilter.end;
       });
     }
-
-    /* SPOKEN DATE */
 
     let spokenDate;
 
