@@ -1,4 +1,6 @@
 const express = require("express");
+const { DateTime } = require("luxon");
+
 const app = express();
 
 app.use(express.json());
@@ -11,6 +13,7 @@ const SITE_ID = process.env.MINDBODY_SITE_ID;
 
 const LOCATION_ID = "1";
 const BASE_URL = "https://api.mindbodyonline.com/public/v6";
+const STUDIO_TIMEZONE = "America/Vancouver";
 
 /* =========================
 CACHE
@@ -24,17 +27,17 @@ DATE PARSER
 ========================= */
 
 function parseDate(input = "today") {
-
   input = decodeURIComponent(input).toLowerCase().trim();
   input = input.replace(/(\d+)(st|nd|rd|th)/g, "$1");
 
-  const today = new Date();
+  const today = DateTime.now().setZone(STUDIO_TIMEZONE).startOf("day");
 
-  if (input.includes("today")) return today;
+  if (input.includes("today")) {
+    return today;
+  }
 
   if (input.includes("tomorrow")) {
-    today.setDate(today.getDate() + 1);
-    return today;
+    return today.plus({ days: 1 });
   }
 
   const weekdays = [
@@ -48,28 +51,44 @@ function parseDate(input = "today") {
   ];
 
   for (let i = 0; i < weekdays.length; i++) {
-
     if (input.includes(weekdays[i])) {
-
-      const target = i;
-      const current = today.getDay();
+      const target = i; // sunday=0 ... saturday=6
+      const current = today.weekday % 7; // luxon monday=1 ... sunday=7 => sunday becomes 0
 
       let diff = target - current;
-
       if (diff <= 0) diff += 7;
 
-      today.setDate(today.getDate() + diff);
-
-      return today;
+      return today.plus({ days: diff });
     }
   }
 
-  const parsed = new Date(input);
+  const formats = [
+    "yyyy-MM-dd",
+    "MMMM d",
+    "MMM d",
+    "M/d/yyyy",
+    "M/d",
+    "MMMM d yyyy",
+    "MMM d yyyy"
+  ];
 
-  if (!isNaN(parsed)) {
+  for (const fmt of formats) {
+    let parsed = DateTime.fromFormat(input, fmt, { zone: STUDIO_TIMEZONE });
 
-    if (parsed.getFullYear() === 2001) {
-      parsed.setFullYear(today.getFullYear());
+    if (parsed.isValid) {
+      if (!/\b\d{4}\b/.test(input)) {
+        parsed = parsed.set({ year: today.year });
+      }
+      return parsed.startOf("day");
+    }
+  }
+
+  const jsParsed = new Date(input);
+  if (!isNaN(jsParsed)) {
+    let parsed = DateTime.fromJSDate(jsParsed).setZone(STUDIO_TIMEZONE).startOf("day");
+
+    if (!/\b\d{4}\b/.test(input)) {
+      parsed = parsed.set({ year: today.year });
     }
 
     return parsed;
@@ -79,7 +98,7 @@ function parseDate(input = "today") {
 }
 
 function dateISO(date) {
-  return date.toISOString().split("T")[0];
+  return date.toFormat("yyyy-MM-dd");
 }
 
 /* =========================
@@ -87,7 +106,6 @@ TIME OF DAY PARSER
 ========================= */
 
 function parseTimeOfDay(text) {
-
   text = String(text || "").toLowerCase();
 
   if (text.includes("morning")) {
@@ -114,7 +132,6 @@ FETCH MINDBODY CLASSES
 ========================= */
 
 async function fetchClasses(date) {
-
   const start = `${date}T00:00:00`;
   const end = `${date}T23:59:59`;
 
@@ -140,26 +157,24 @@ NORMALIZE CLASSES
 ========================= */
 
 function normalize(classes) {
+  return classes
+    .map(c => {
+      const start = DateTime.fromISO(c.StartDateTime, { zone: STUDIO_TIMEZONE });
+      const time = start.isValid ? start.toFormat("h:mm a") : "Time unavailable";
 
-  return classes.map(c => {
-
-    const start = new Date(c.StartDateTime);
-
-    const time = start.toLocaleTimeString("en-US", {
-      hour: "numeric",
-      minute: "2-digit"
+      return {
+        id: c.Id,
+        name: c.ClassDescription?.Name || c.Name || "Class",
+        instructor: c.Staff?.Name || "Instructor",
+        time,
+        start: c.StartDateTime
+      };
+    })
+    .sort((a, b) => {
+      const aStart = DateTime.fromISO(a.start, { zone: STUDIO_TIMEZONE }).toMillis();
+      const bStart = DateTime.fromISO(b.start, { zone: STUDIO_TIMEZONE }).toMillis();
+      return aStart - bStart;
     });
-
-    return {
-      id: c.Id,
-      name: c.ClassDescription?.Name || c.Name || "Class",
-      instructor: c.Staff?.Name || "Instructor",
-      time,
-      start: c.StartDateTime
-    };
-
-  }).sort((a, b) => new Date(a.start) - new Date(b.start));
-
 }
 
 /* =========================
@@ -167,7 +182,6 @@ SPEECH BUILDER
 ========================= */
 
 function buildSpeech(dateLabel, classes, datePhrase) {
-
   if (!classes || classes.length === 0) {
     return `I couldn't find any classes for ${datePhrase}.`;
   }
@@ -178,14 +192,21 @@ function buildSpeech(dateLabel, classes, datePhrase) {
     .slice(0, MAX_CLASSES)
     .map(c => `${c.time} ${c.name} with ${c.instructor}`);
 
-  if (datePhrase.includes("morning"))
+  if (datePhrase.toLowerCase().includes("morning")) {
     return `The classes for ${dateLabel} morning are: ${list.join(", ")}.`;
+  }
 
-  if (datePhrase.includes("afternoon"))
+  if (datePhrase.toLowerCase().includes("afternoon")) {
     return `The classes for ${dateLabel} afternoon are: ${list.join(", ")}.`;
+  }
 
-  if (datePhrase.includes("evening"))
+  if (datePhrase.toLowerCase().includes("evening")) {
     return `The classes for ${dateLabel} evening are: ${list.join(", ")}.`;
+  }
+
+  if (datePhrase.toLowerCase().includes("night")) {
+    return `The classes for ${dateLabel} night are: ${list.join(", ")}.`;
+  }
 
   return `The classes for ${dateLabel} are: ${list.join(", ")}.`;
 }
@@ -195,7 +216,6 @@ CACHE HELPERS
 ========================= */
 
 function getCache(date) {
-
   const entry = cache.get(date);
 
   if (!entry) return null;
@@ -209,7 +229,6 @@ function getCache(date) {
 }
 
 function setCache(date, data) {
-
   cache.set(date, {
     data,
     time: Date.now()
@@ -221,31 +240,23 @@ CACHE WARMER
 ========================= */
 
 async function warmCache() {
-
   console.log("Warming schedule cache...");
 
-  const today = new Date();
+  const today = DateTime.now().setZone(STUDIO_TIMEZONE).startOf("day");
 
   for (let i = 0; i < 7; i++) {
-
-    const d = new Date(today);
-    d.setDate(today.getDate() + i);
-
-    const iso = dateISO(d);
+    const d = today.plus({ days: i });
+    const iso = d.toFormat("yyyy-MM-dd");
 
     try {
-
       const raw = await fetchClasses(iso);
       const classes = normalize(raw);
 
       setCache(iso, classes);
 
       console.log("Cache updated:", iso);
-
     } catch (err) {
-
       console.log("Cache warm error:", err.message);
-
     }
   }
 }
@@ -255,7 +266,6 @@ WEBHOOK HANDLER
 ========================= */
 
 async function handler(req, res) {
-
   console.log("----- WEBHOOK REQUEST -----");
   console.log("Body:", req.body);
   console.log("Query:", req.query);
@@ -275,18 +285,14 @@ async function handler(req, res) {
   console.log("DATE PHRASE RECEIVED:", datePhrase);
 
   try {
-
     const date = parseDate(datePhrase);
     const iso = dateISO(date);
 
     let classes = getCache(iso) || [];
 
     if (classes.length) {
-
       console.log("CACHE HIT:", iso);
-
     } else {
-
       console.log("CACHE MISS:", iso);
 
       const raw = await fetchClasses(iso);
@@ -300,13 +306,13 @@ async function handler(req, res) {
     const timeFilter = parseTimeOfDay(datePhrase);
 
     if (timeFilter && classes.length) {
-
       classes = classes.filter(c => {
-
         if (!c.start) return false;
 
-        const hour = new Date(c.start).getHours();
+        const start = DateTime.fromISO(c.start, { zone: STUDIO_TIMEZONE });
+        if (!start.isValid) return false;
 
+        const hour = start.hour;
         return hour >= timeFilter.start && hour < timeFilter.end;
       });
     }
@@ -315,18 +321,12 @@ async function handler(req, res) {
 
     let spokenDate;
 
-    if (datePhrase.includes("tomorrow")) {
+    if (datePhrase.toLowerCase().includes("tomorrow")) {
       spokenDate = "tomorrow";
-    }
-    else if (datePhrase.includes("today")) {
+    } else if (datePhrase.toLowerCase().includes("today")) {
       spokenDate = "today";
-    }
-    else {
-      spokenDate = date.toLocaleDateString("en-US", {
-        weekday: "long",
-        month: "long",
-        day: "numeric"
-      });
+    } else {
+      spokenDate = date.toFormat("cccc, LLLL d");
     }
 
     const speech = buildSpeech(spokenDate, classes, datePhrase);
@@ -337,9 +337,7 @@ async function handler(req, res) {
     return res.json({
       results: speech
     });
-
   } catch (err) {
-
     console.log("ERROR:", err);
 
     return res.json({
