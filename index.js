@@ -375,18 +375,31 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
   let matched = uniqueClients.find(client =>
     phoneMatches(client, phone) && namesMatch(client, firstName, lastName)
   );
-  if (matched) return matched;
+  if (matched) {
+    console.log("Matched by phone + name:", matched.FirstName, matched.LastName);
+    return matched;
+  }
 
   matched = uniqueClients.find(client =>
     emailMatches(client, email) && namesMatch(client, firstName, lastName)
   );
-  if (matched) return matched;
+  if (matched) {
+    console.log("Matched by email + name:", matched.FirstName, matched.LastName);
+    return matched;
+  }
 
+  // Trust phone match alone — name spelling may differ (e.g. Braden vs Brayden)
   matched = uniqueClients.find(client => phoneMatches(client, phone));
-  if (matched) return matched;
+  if (matched) {
+    console.log("Matched by phone only (name spelling may differ):", matched.FirstName, matched.LastName);
+    return matched;
+  }
 
   matched = uniqueClients.find(client => emailMatches(client, email));
-  if (matched) return matched;
+  if (matched) {
+    console.log("Matched by email only:", matched.FirstName, matched.LastName);
+    return matched;
+  }
 
   return null;
 }
