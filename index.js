@@ -755,12 +755,15 @@ async function handler(req, res) {
       });
 
       const visits = Array.isArray(bookingResponse?.Visits) ? bookingResponse.Visits : [];
+      const visit = bookingResponse?.Visit;
+      const action = bookingResponse?.Action || visit?.Action || "";
       const errorCode = bookingResponse?.ErrorCode;
       const message = bookingResponse?.Message || bookingResponse?.ErrorMessage || "";
 
-      console.log("Booking result — visits:", visits.length, "errorCode:", errorCode, "message:", message);
+      console.log("Booking result — visits:", visits.length, "action:", action, "errorCode:", errorCode, "message:", message);
 
-      if (visits.length > 0 && !errorCode) {
+      // Success if visits array has entries, OR single Visit object returned with Action: Added
+      if ((visits.length > 0 || action === "Added" || visit) && !errorCode) {
         return res.json({
           results: "You're all set — you're booked."
         });
