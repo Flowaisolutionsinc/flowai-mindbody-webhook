@@ -10,6 +10,8 @@ const PORT = process.env.PORT || 8080;
 
 const API_KEY = process.env.MINDBODY_API_KEY;
 const SITE_ID = process.env.MINDBODY_SITE_ID;
+const STAFF_USERNAME = process.env.MINDBODY_STAFF_USERNAME;
+const STAFF_PASSWORD = process.env.MINDBODY_STAFF_PASSWORD;
 
 const LOCATION_ID = "1";
 const BASE_URL = "https://api.mindbodyonline.com/public/v6";
@@ -21,6 +23,11 @@ CACHE
 
 const cache = new Map();
 const CACHE_TTL = 15 * 60 * 1000;
+
+let mindbodyTokenCache = {
+  accessToken: null,
+  expiresAt: 0
+};
 
 /* =========================
 DATE PARSER
@@ -131,7 +138,80 @@ function parseTimeOfDay(text) {
 MINDBODY HELPERS
 ========================= */
 
-async function mindbodyGet(path, query = {}) {
+function baseMindbodyHeaders() {
+  return {
+    "Api-Key": API_KEY,
+    "SiteId": SITE_ID,
+    "Content-Type": "application/json"
+  };
+}
+
+async function getMindbodyUserToken(forceRefresh = false) {
+  const now = Date.now();
+
+  if (
+    !forceRefresh &&
+    mindbodyTokenCache.accessToken &&
+    mindbodyTokenCache.expiresAt > now + 60 * 1000
+  ) {
+    return mindbodyTokenCache.accessToken;
+  }
+
+  if (!STAFF_USERNAME || !STAFF_PASSWORD) {
+    throw new Error("Missing MINDBODY_STAFF_USERNAME or MINDBODY_STAFF_PASSWORD");
+  }
+
+  const url = `${BASE_URL}/usertoken/issue`;
+  const body = {
+    Username: STAFF_USERNAME,
+    Password: STAFF_PASSWORD
+  };
+
+  console.log("Mindbody POST:", url);
+  console.log("Issuing Mindbody user token...");
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: baseMindbodyHeaders(),
+    body: JSON.stringify(body)
+  });
+
+  const text = await res.text();
+
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!res.ok) {
+    console.log("Mindbody user token error:", res.status, json);
+    throw new Error(`Mindbody user token failed: ${res.status}`);
+  }
+
+  const accessToken =
+    json?.AccessToken ||
+    json?.accessToken ||
+    json?.Token ||
+    json?.token;
+
+  if (!accessToken) {
+    console.log("Mindbody user token missing AccessToken:", json);
+    throw new Error("Mindbody user token missing AccessToken");
+  }
+
+  mindbodyTokenCache = {
+    accessToken,
+    expiresAt: now + 12 * 60 * 60 * 1000
+  };
+
+  return accessToken;
+}
+
+async function mindbodyGet(path, query = {}, options = {}) {
+  const { useUserToken = false } = options;
+
   const url = new URL(`${BASE_URL}${path}`);
 
   Object.entries(query).forEach(([key, value]) => {
@@ -140,16 +220,28 @@ async function mindbodyGet(path, query = {}) {
     }
   });
 
+  const headers = baseMindbodyHeaders();
+
+  if (useUserToken) {
+    headers["Authorization"] = await getMindbodyUserToken();
+  }
+
   console.log("Mindbody GET:", url.toString());
 
-  const res = await fetch(url.toString(), {
+  let res = await fetch(url.toString(), {
     method: "GET",
-    headers: {
-      "Api-Key": API_KEY,
-      "SiteId": SITE_ID,
-      "Content-Type": "application/json"
-    }
+    headers
   });
+
+  if (useUserToken && res.status === 401) {
+    console.log("Mindbody GET received 401, refreshing user token...");
+    headers["Authorization"] = await getMindbodyUserToken(true);
+
+    res = await fetch(url.toString(), {
+      method: "GET",
+      headers
+    });
+  }
 
   const text = await res.text();
 
@@ -168,21 +260,35 @@ async function mindbodyGet(path, query = {}) {
   return json;
 }
 
-async function mindbodyPost(path, body = {}) {
+async function mindbodyPost(path, body = {}, options = {}) {
+  const { useUserToken = false } = options;
+
   const url = `${BASE_URL}${path}`;
+  const headers = baseMindbodyHeaders();
+
+  if (useUserToken) {
+    headers["Authorization"] = await getMindbodyUserToken();
+  }
 
   console.log("Mindbody POST:", url);
   console.log("Mindbody POST body:", body);
 
-  const res = await fetch(url, {
+  let res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Api-Key": API_KEY,
-      "SiteId": SITE_ID,
-      "Content-Type": "application/json"
-    },
+    headers,
     body: JSON.stringify(body)
   });
+
+  if (useUserToken && res.status === 401) {
+    console.log("Mindbody POST received 401, refreshing user token...");
+    headers["Authorization"] = await getMindbodyUserToken(true);
+
+    res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body)
+    });
+  }
 
   const text = await res.text();
 
@@ -257,9 +363,11 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
 
   for (const term of searchTerms) {
     try {
-      const json = await mindbodyGet("/client/clients", {
-        SearchText: term
-      });
+      const json = await mindbodyGet(
+        "/client/clients",
+        { SearchText: term },
+        { useUserToken: true }
+      );
 
       const clients = Array.isArray(json?.Clients) ? json.Clients : [];
       allClients = allClients.concat(clients);
@@ -281,11 +389,13 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
   let matched = uniqueClients.find(client =>
     phoneMatches(client, phone) && namesMatch(client, firstName, lastName)
   );
+
   if (matched) return matched;
 
   matched = uniqueClients.find(client =>
     emailMatches(client, email) && namesMatch(client, firstName, lastName)
   );
+
   if (matched) return matched;
 
   matched = uniqueClients.find(client => phoneMatches(client, phone));
@@ -307,7 +417,9 @@ async function bookExistingClientIntoClass({ clientId, classId }) {
     RequirePayment: false
   };
 
-  const json = await mindbodyPost("/class/addclienttoclass", payload);
+  const json = await mindbodyPost("/class/addclienttoclass", payload, {
+    useUserToken: true
+  });
 
   console.log("AddClientToClass response:", json);
 
@@ -347,6 +459,7 @@ function normalize(classes) {
   return classes
     .map(c => {
       const localStart = DateTime.fromISO(c.StartDateTime, { setZone: true }).setZone(STUDIO_TIMEZONE);
+
       const time = localStart.isValid ? localStart.toFormat("h:mm a") : "Time unavailable";
 
       return {
@@ -360,115 +473,6 @@ function normalize(classes) {
       };
     })
     .sort((a, b) => a.localMillis - b.localMillis);
-}
-
-/* =========================
-CLASS SELECTION RESOLUTION
-========================= */
-
-function buildClassSelectionLabel(c) {
-  return `${c.time} ${c.name} with ${c.instructor}`;
-}
-
-function normalizeSelectionText(value = "") {
-  return String(value)
-    .toLowerCase()
-    .replace(/15\/15\/15/g, "15 15 15")
-    .replace(/&/g, "and")
-    .replace(/[|]/g, " ")
-    .replace(/[^a-z0-9: ]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function scoreClassMatch(selection, cls) {
-  const target = normalizeSelectionText(selection);
-  const label = normalizeSelectionText(buildClassSelectionLabel(cls));
-  const timeOnly = normalizeSelectionText(cls.time);
-  const nameOnly = normalizeSelectionText(cls.name);
-  const instructorOnly = normalizeSelectionText(cls.instructor);
-
-  let score = 0;
-
-  if (label === target) score += 1000;
-  if (label.includes(target) || target.includes(label)) score += 400;
-  if (target.includes(timeOnly)) score += 120;
-  if (target.includes(nameOnly)) score += 220;
-  if (target.includes(instructorOnly)) score += 80;
-
-  return score;
-}
-
-async function getUpcomingClassesForResolution(days = 7) {
-  const today = DateTime.now().setZone(STUDIO_TIMEZONE).startOf("day");
-  const all = [];
-
-  for (let i = 0; i < days; i++) {
-    const d = today.plus({ days: i });
-    const iso = d.toFormat("yyyy-MM-dd");
-
-    let classes = getCache(iso);
-
-    if (!classes) {
-      try {
-        const raw = await fetchClasses(iso);
-        classes = normalize(raw);
-        setCache(iso, classes);
-      } catch (err) {
-        console.log("Class resolution fetch error:", iso, err.message);
-        classes = [];
-      }
-    }
-
-    for (const cls of classes || []) {
-      all.push({
-        ...cls,
-        date: iso
-      });
-    }
-  }
-
-  return all;
-}
-
-async function resolveClassId(inputClassId) {
-  if (!inputClassId) return null;
-
-  const raw = String(inputClassId).trim();
-
-  // Already a numeric class ID
-  if (/^\d+$/.test(raw)) {
-    return raw;
-  }
-
-  const allClasses = await getUpcomingClassesForResolution(7);
-
-  if (!allClasses.length) return null;
-
-  let best = null;
-  let bestScore = 0;
-
-  for (const cls of allClasses) {
-    const score = scoreClassMatch(raw, cls);
-    if (score > bestScore) {
-      best = cls;
-      bestScore = score;
-    }
-  }
-
-  console.log("Class resolution input:", raw);
-  console.log("Class resolution best match:", best ? {
-    id: best.id,
-    date: best.date,
-    label: buildClassSelectionLabel(best),
-    score: bestScore
-  } : null);
-
-  if (!best || bestScore < 250) {
-    return null;
-  }
-
-  return String(best.id);
 }
 
 /* =========================
@@ -562,12 +566,8 @@ async function handler(req, res) {
 
   const action = req.body.action || req.query.action;
 
-  /* =========================
-  EXISTING CLIENT BOOKING
-  ========================= */
-
   if (action === "book_existing_client") {
-    const incomingClassId = req.body.classId || req.query.classId;
+    const classId = req.body.classId || req.query.classId;
     const firstName = req.body.firstName || req.query.firstName || "";
     const lastName = req.body.lastName || req.query.lastName || "";
     const phone = req.body.phone || req.query.phone || "";
@@ -575,7 +575,7 @@ async function handler(req, res) {
     const isNewClient = String(req.body.isNewClient || req.query.isNewClient || "").toLowerCase();
 
     console.log("BOOKING REQUEST:", {
-      classId: incomingClassId,
+      classId,
       firstName,
       lastName,
       phone,
@@ -583,7 +583,7 @@ async function handler(req, res) {
       isNewClient
     });
 
-    if (!incomingClassId) {
+    if (!classId) {
       return res.json({
         results: "I couldn't tell which class you wanted to book — would you like me to try again or connect you with the front desk?"
       });
@@ -602,16 +602,6 @@ async function handler(req, res) {
     }
 
     try {
-      const resolvedClassId = await resolveClassId(incomingClassId);
-
-      if (!resolvedClassId) {
-        return res.json({
-          results: "I couldn't match that class selection to a live class on the schedule — would you like me to try again or connect you with the front desk?"
-        });
-      }
-
-      console.log("Resolved booking classId:", resolvedClassId);
-
       const client = await findExistingClient({
         firstName,
         lastName,
@@ -627,7 +617,7 @@ async function handler(req, res) {
 
       const bookingResponse = await bookExistingClientIntoClass({
         clientId: client.Id,
-        classId: resolvedClassId
+        classId
       });
 
       const visits = Array.isArray(bookingResponse?.Visits) ? bookingResponse.Visits : [];
@@ -671,10 +661,6 @@ async function handler(req, res) {
       });
     }
   }
-
-  /* =========================
-  SCHEDULE
-  ========================= */
 
   if (action !== "get_schedule") {
     return res.json({
@@ -765,6 +751,14 @@ START SERVER
 ========================= */
 
 warmCache();
+
+getMindbodyUserToken()
+  .then(() => {
+    console.log("Mindbody user token ready");
+  })
+  .catch(err => {
+    console.log("Mindbody user token warmup failed:", err.message);
+  });
 
 setInterval(() => {
   warmCache();
