@@ -39,32 +39,20 @@ function parseDate(input = "today") {
 
   const today = DateTime.now().setZone(STUDIO_TIMEZONE).startOf("day");
 
-  if (input.includes("today")) {
-    return today;
-  }
-
-  if (input.includes("tomorrow")) {
-    return today.plus({ days: 1 });
-  }
+  if (input.includes("today")) return today;
+  if (input.includes("tomorrow")) return today.plus({ days: 1 });
 
   const weekdays = [
-    "sunday",
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday"
+    "sunday", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "saturday"
   ];
 
   for (let i = 0; i < weekdays.length; i++) {
     if (input.includes(weekdays[i])) {
       const target = i;
       const current = today.weekday % 7;
-
       let diff = target - current;
       if (diff <= 0) diff += 7;
-
       return today.plus({ days: diff });
     }
   }
@@ -93,11 +81,9 @@ function parseDate(input = "today") {
   const jsParsed = new Date(input);
   if (!isNaN(jsParsed)) {
     let parsed = DateTime.fromJSDate(jsParsed).setZone(STUDIO_TIMEZONE).startOf("day");
-
     if (!/\b\d{4}\b/.test(input)) {
       parsed = parsed.set({ year: today.year });
     }
-
     return parsed;
   }
 
@@ -115,21 +101,10 @@ TIME OF DAY PARSER
 function parseTimeOfDay(text) {
   text = String(text || "").toLowerCase();
 
-  if (text.includes("morning")) {
-    return { start: 0, end: 12 };
-  }
-
-  if (text.includes("afternoon")) {
-    return { start: 12, end: 17 };
-  }
-
-  if (text.includes("evening")) {
-    return { start: 17, end: 24 };
-  }
-
-  if (text.includes("night")) {
-    return { start: 19, end: 24 };
-  }
+  if (text.includes("morning")) return { start: 0, end: 12 };
+  if (text.includes("afternoon")) return { start: 12, end: 17 };
+  if (text.includes("evening")) return { start: 17, end: 24 };
+  if (text.includes("night")) return { start: 19, end: 24 };
 
   return null;
 }
@@ -223,7 +198,7 @@ async function mindbodyGet(path, query = {}, options = {}) {
   const headers = baseMindbodyHeaders();
 
   if (useUserToken) {
-    headers["Authorization"] = await getMindbodyUserToken();
+    headers["Authorization"] = `Bearer ${await getMindbodyUserToken()}`;
   }
 
   console.log("Mindbody GET:", url.toString());
@@ -235,7 +210,7 @@ async function mindbodyGet(path, query = {}, options = {}) {
 
   if (useUserToken && res.status === 401) {
     console.log("Mindbody GET received 401, refreshing user token...");
-    headers["Authorization"] = await getMindbodyUserToken(true);
+    headers["Authorization"] = `Bearer ${await getMindbodyUserToken(true)}`;
 
     res = await fetch(url.toString(), {
       method: "GET",
@@ -267,7 +242,7 @@ async function mindbodyPost(path, body = {}, options = {}) {
   const headers = baseMindbodyHeaders();
 
   if (useUserToken) {
-    headers["Authorization"] = await getMindbodyUserToken();
+    headers["Authorization"] = `Bearer ${await getMindbodyUserToken()}`;
   }
 
   console.log("Mindbody POST:", url);
@@ -281,7 +256,7 @@ async function mindbodyPost(path, body = {}, options = {}) {
 
   if (useUserToken && res.status === 401) {
     console.log("Mindbody POST received 401, refreshing user token...");
-    headers["Authorization"] = await getMindbodyUserToken(true);
+    headers["Authorization"] = `Bearer ${await getMindbodyUserToken(true)}`;
 
     res = await fetch(url, {
       method: "POST",
@@ -323,7 +298,6 @@ function namesMatch(client, firstName, lastName) {
   const inputLast = safeLower(lastName);
 
   if (!inputFirst && !inputLast) return true;
-
   if (inputFirst && clientFirst !== inputFirst) return false;
   if (inputLast && clientLast !== inputLast) return false;
 
@@ -357,7 +331,9 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
 
   if (phone) searchTerms.push(phone);
   if (email) searchTerms.push(email);
-  if (firstName || lastName) searchTerms.push(`${firstName || ""} ${lastName || ""}`.trim());
+  if (firstName || lastName) {
+    searchTerms.push(`${firstName || ""} ${lastName || ""}`.trim());
+  }
 
   let allClients = [];
 
@@ -389,13 +365,11 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
   let matched = uniqueClients.find(client =>
     phoneMatches(client, phone) && namesMatch(client, firstName, lastName)
   );
-
   if (matched) return matched;
 
   matched = uniqueClients.find(client =>
     emailMatches(client, email) && namesMatch(client, firstName, lastName)
   );
-
   if (matched) return matched;
 
   matched = uniqueClients.find(client => phoneMatches(client, phone));
@@ -459,7 +433,6 @@ function normalize(classes) {
   return classes
     .map(c => {
       const localStart = DateTime.fromISO(c.StartDateTime, { setZone: true }).setZone(STUDIO_TIMEZONE);
-
       const time = localStart.isValid ? localStart.toFormat("h:mm a") : "Time unavailable";
 
       return {
@@ -547,7 +520,6 @@ async function warmCache() {
       const classes = normalize(raw);
 
       setCache(iso, classes);
-
       console.log("Cache updated:", iso);
     } catch (err) {
       console.log("Cache warm error:", err.message);
@@ -668,9 +640,7 @@ async function handler(req, res) {
     });
   }
 
-  const datePhrase = decodeURIComponent(
-    req.body.date || req.query.date || "today"
-  );
+  const datePhrase = decodeURIComponent(req.body.date || req.query.date || "today");
 
   console.log("DATE PHRASE RECEIVED:", datePhrase);
 
@@ -687,7 +657,6 @@ async function handler(req, res) {
 
       const raw = await fetchClasses(iso);
       classes = normalize(raw);
-
       setCache(iso, classes);
     }
 
@@ -722,8 +691,7 @@ async function handler(req, res) {
     console.log("ERROR:", err);
 
     return res.json({
-      results:
-        "I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?"
+      results: "I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?"
     });
   }
 }
@@ -766,4 +734,4 @@ setInterval(() => {
 
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
-});
+}); does this all look good now?
