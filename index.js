@@ -697,4 +697,146 @@ async function handler(req, res) {
         classId: resolvedClassId
       });
 
-      const visits = Array
+      const visits = Array.isArray(bookingResponse?.Visits) ? bookingResponse.Visits : [];
+      const errorCode = bookingResponse?.ErrorCode;
+      const message = bookingResponse?.Message || bookingResponse?.ErrorMessage || "";
+
+      if (visits.length > 0 && !errorCode) {
+        return res.json({
+          results: "You're all set — you're booked."
+        });
+      }
+
+      const lowerMessage = String(message).toLowerCase();
+
+      if (lowerMessage.includes("already booked")) {
+        return res.json({
+          results: "It looks like you're already booked into that class."
+        });
+      }
+
+      if (lowerMessage.includes("waitlist")) {
+        return res.json({
+          results: "I couldn't complete that booking directly — it looks like that class may only be available by waitlist. Would you like me to connect you with the front desk?"
+        });
+      }
+
+      if (lowerMessage.includes("payment")) {
+        return res.json({
+          results: "I couldn't complete that booking because there may be a payment or pass issue on the account. Would you like me to connect you with the front desk?"
+        });
+      }
+
+      return res.json({
+        results: "I couldn't complete that booking — would you like me to try again or connect you with the front desk?"
+      });
+    } catch (err) {
+      console.log("BOOKING ERROR:", err);
+
+      return res.json({
+        results: "I couldn't complete that booking — would you like me to try again or connect you with the front desk?"
+      });
+    }
+  }
+
+  if (action !== "get_schedule") {
+    return res.json({
+      results: "Unsupported action."
+    });
+  }
+
+  const datePhrase = decodeURIComponent(req.body.date || req.query.date || "today");
+
+  console.log("DATE PHRASE RECEIVED:", datePhrase);
+
+  try {
+    const date = parseDate(datePhrase);
+    const iso = dateISO(date);
+
+    let classes = getCache(iso) || [];
+
+    if (classes.length) {
+      console.log("CACHE HIT:", iso);
+    } else {
+      console.log("CACHE MISS:", iso);
+
+      const raw = await fetchClasses(iso);
+      classes = normalize(raw);
+      setCache(iso, classes);
+    }
+
+    const timeFilter = parseTimeOfDay(datePhrase);
+
+    if (timeFilter && classes.length) {
+      classes = classes.filter(c => {
+        if (c.localHour === null) return false;
+        return c.localHour >= timeFilter.start && c.localHour < timeFilter.end;
+      });
+    }
+
+    let spokenDate;
+
+    if (datePhrase.toLowerCase().includes("tomorrow")) {
+      spokenDate = "tomorrow";
+    } else if (datePhrase.toLowerCase().includes("today")) {
+      spokenDate = "today";
+    } else {
+      spokenDate = date.toFormat("cccc, LLLL d");
+    }
+
+    const speech = buildSpeech(spokenDate, classes, datePhrase);
+
+    console.log("----- WEBHOOK RESPONSE -----");
+    console.log(speech);
+
+    return res.json({
+      results: speech
+    });
+  } catch (err) {
+    console.log("ERROR:", err);
+
+    return res.json({
+      results: "I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?"
+    });
+  }
+}
+
+/* =========================
+ROUTES
+========================= */
+
+app.post("/ghl/mindbody", handler);
+app.get("/ghl/mindbody", handler);
+
+app.post("/ghl/mindbody/speak", handler);
+app.get("/ghl/mindbody/speak", handler);
+
+/* =========================
+HEALTH CHECK
+========================= */
+
+app.get("/debug", (req, res) => {
+  res.send("Webhook server alive");
+});
+
+/* =========================
+START SERVER
+========================= */
+
+warmCache();
+
+getMindbodyUserToken()
+  .then(() => {
+    console.log("Mindbody user token ready");
+  })
+  .catch(err => {
+    console.log("Mindbody user token warmup failed:", err.message);
+  });
+
+setInterval(() => {
+  warmCache();
+}, 15 * 60 * 1000);
+
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
