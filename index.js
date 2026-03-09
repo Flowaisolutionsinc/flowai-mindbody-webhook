@@ -159,22 +159,21 @@ NORMALIZE CLASSES
 function normalize(classes) {
   return classes
     .map(c => {
-      const start = DateTime.fromISO(c.StartDateTime, { zone: STUDIO_TIMEZONE });
-      const time = start.isValid ? start.toFormat("h:mm a") : "Time unavailable";
+      const localStart = DateTime.fromISO(c.StartDateTime, { setZone: true }).setZone(STUDIO_TIMEZONE);
+
+      const time = localStart.isValid ? localStart.toFormat("h:mm a") : "Time unavailable";
 
       return {
         id: c.Id,
         name: c.ClassDescription?.Name || c.Name || "Class",
         instructor: c.Staff?.Name || "Instructor",
         time,
-        start: c.StartDateTime
+        start: c.StartDateTime,
+        localHour: localStart.isValid ? localStart.hour : null,
+        localMillis: localStart.isValid ? localStart.toMillis() : 0
       };
     })
-    .sort((a, b) => {
-      const aStart = DateTime.fromISO(a.start, { zone: STUDIO_TIMEZONE }).toMillis();
-      const bStart = DateTime.fromISO(b.start, { zone: STUDIO_TIMEZONE }).toMillis();
-      return aStart - bStart;
-    });
+    .sort((a, b) => a.localMillis - b.localMillis);
 }
 
 /* =========================
@@ -186,11 +185,7 @@ function buildSpeech(dateLabel, classes, datePhrase) {
     return `I couldn't find any classes for ${datePhrase}.`;
   }
 
-  const MAX_CLASSES = 6;
-
-  const list = classes
-    .slice(0, MAX_CLASSES)
-    .map(c => `${c.time} ${c.name} with ${c.instructor}`);
+  const list = classes.map(c => `${c.time} ${c.name} with ${c.instructor}`);
 
   if (datePhrase.toLowerCase().includes("morning")) {
     return `The classes for ${dateLabel} morning are: ${list.join(", ")}.`;
@@ -305,13 +300,8 @@ async function handler(req, res) {
 
     if (timeFilter && classes.length) {
       classes = classes.filter(c => {
-        if (!c.start) return false;
-
-        const start = DateTime.fromISO(c.start, { zone: STUDIO_TIMEZONE });
-        if (!start.isValid) return false;
-
-        const hour = start.hour;
-        return hour >= timeFilter.start && hour < timeFilter.end;
+        if (c.localHour === null) return false;
+        return c.localHour >= timeFilter.start && c.localHour < timeFilter.end;
       });
     }
 
