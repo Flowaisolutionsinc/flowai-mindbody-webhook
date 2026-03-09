@@ -128,6 +128,200 @@ function parseTimeOfDay(text) {
 }
 
 /* =========================
+MINDBODY HELPERS
+========================= */
+
+async function mindbodyGet(path, query = {}) {
+  const url = new URL(`${BASE_URL}${path}`);
+
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.append(key, String(value));
+    }
+  });
+
+  console.log("Mindbody GET:", url.toString());
+
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      "Api-Key": API_KEY,
+      "SiteId": SITE_ID,
+      "Content-Type": "application/json"
+    }
+  });
+
+  const text = await res.text();
+
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!res.ok) {
+    console.log("Mindbody GET error:", res.status, json);
+    throw new Error(`Mindbody GET failed: ${res.status}`);
+  }
+
+  return json;
+}
+
+async function mindbodyPost(path, body = {}) {
+  const url = `${BASE_URL}${path}`;
+
+  console.log("Mindbody POST:", url);
+  console.log("Mindbody POST body:", body);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Api-Key": API_KEY,
+      "SiteId": SITE_ID,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  const text = await res.text();
+
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!res.ok) {
+    console.log("Mindbody POST error:", res.status, json);
+    throw new Error(`Mindbody POST failed: ${res.status}`);
+  }
+
+  return json;
+}
+
+function normalizePhone(phone = "") {
+  return String(phone).replace(/\D/g, "");
+}
+
+function safeLower(value = "") {
+  return String(value || "").trim().toLowerCase();
+}
+
+function namesMatch(client, firstName, lastName) {
+  const clientFirst = safeLower(client?.FirstName);
+  const clientLast = safeLower(client?.LastName);
+
+  const inputFirst = safeLower(firstName);
+  const inputLast = safeLower(lastName);
+
+  if (!inputFirst && !inputLast) return true;
+
+  if (inputFirst && clientFirst !== inputFirst) return false;
+  if (inputLast && clientLast !== inputLast) return false;
+
+  return true;
+}
+
+function phoneMatches(client, phone) {
+  if (!phone) return false;
+
+  const target = normalizePhone(phone);
+
+  const possiblePhones = [
+    client?.MobilePhone,
+    client?.HomePhone,
+    client?.WorkPhone,
+    client?.Phone
+  ]
+    .filter(Boolean)
+    .map(normalizePhone);
+
+  return possiblePhones.includes(target);
+}
+
+function emailMatches(client, email) {
+  if (!email) return false;
+  return safeLower(client?.Email) === safeLower(email);
+}
+
+async function findExistingClient({ firstName, lastName, phone, email }) {
+  const searchTerms = [];
+
+  if (phone) searchTerms.push(phone);
+  if (email) searchTerms.push(email);
+  if (firstName || lastName) searchTerms.push(`${firstName || ""} ${lastName || ""}`.trim());
+
+  let allClients = [];
+
+  for (const term of searchTerms) {
+    try {
+      const json = await mindbodyGet("/client/clients", {
+        SearchText: term
+      });
+
+      const clients = Array.isArray(json?.Clients) ? json.Clients : [];
+      allClients = allClients.concat(clients);
+    } catch (err) {
+      console.log("Client search failed for term:", term, err.message);
+    }
+  }
+
+  // Deduplicate by client ID
+  const uniqueClients = [];
+  const seen = new Set();
+
+  for (const client of allClients) {
+    const id = client?.Id;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    uniqueClients.push(client);
+  }
+
+  // Strongest match first: phone + name
+  let matched = uniqueClients.find(client =>
+    phoneMatches(client, phone) && namesMatch(client, firstName, lastName)
+  );
+
+  if (matched) return matched;
+
+  // Next best: email + name
+  matched = uniqueClients.find(client =>
+    emailMatches(client, email) && namesMatch(client, firstName, lastName)
+  );
+
+  if (matched) return matched;
+
+  // Next: phone only
+  matched = uniqueClients.find(client => phoneMatches(client, phone));
+  if (matched) return matched;
+
+  // Last: email only
+  matched = uniqueClients.find(client => emailMatches(client, email));
+  if (matched) return matched;
+
+  return null;
+}
+
+async function bookExistingClientIntoClass({ clientId, classId }) {
+  const payload = {
+    ClientID: clientId,
+    ClassID: classId,
+    Waitlist: false,
+    SendEmail: false,
+    Test: false,
+    RequirePayment: false
+  };
+
+  const json = await mindbodyPost("/class/addclienttoclass", payload);
+
+  console.log("AddClientToClass response:", json);
+
+  return json;
+}
+
+/* =========================
 FETCH MINDBODY CLASSES
 ========================= */
 
@@ -266,6 +460,110 @@ async function handler(req, res) {
   console.log("Query:", req.query);
 
   const action = req.body.action || req.query.action;
+
+  /* =========================
+  EXISTING CLIENT BOOKING
+  ========================= */
+
+  if (action === "book_existing_client") {
+    const classId = req.body.classId || req.query.classId;
+    const firstName = req.body.firstName || req.query.firstName || "";
+    const lastName = req.body.lastName || req.query.lastName || "";
+    const phone = req.body.phone || req.query.phone || "";
+    const email = req.body.email || req.query.email || "";
+    const isNewClient = String(req.body.isNewClient || req.query.isNewClient || "").toLowerCase();
+
+    console.log("BOOKING REQUEST:", {
+      classId,
+      firstName,
+      lastName,
+      phone,
+      email,
+      isNewClient
+    });
+
+    if (!classId) {
+      return res.json({
+        results: "I couldn't tell which class you wanted to book — would you like me to try again or connect you with the front desk?"
+      });
+    }
+
+    if (isNewClient === "true") {
+      return res.json({
+        results: "New clients need to get started through the intro offer first."
+      });
+    }
+
+    if (!firstName || !lastName || !phone) {
+      return res.json({
+        results: "I need your first name, last name, and phone number to complete that booking."
+      });
+    }
+
+    try {
+      const client = await findExistingClient({
+        firstName,
+        lastName,
+        phone,
+        email
+      });
+
+      if (!client || !client.Id) {
+        return res.json({
+          results: "I couldn't find an existing account with that information — would you like me to connect you with the front desk?"
+        });
+      }
+
+      const bookingResponse = await bookExistingClientIntoClass({
+        clientId: client.Id,
+        classId
+      });
+
+      const visits = Array.isArray(bookingResponse?.Visits) ? bookingResponse.Visits : [];
+      const errorCode = bookingResponse?.ErrorCode;
+      const message = bookingResponse?.Message || bookingResponse?.ErrorMessage || "";
+
+      if (visits.length > 0 && !errorCode) {
+        return res.json({
+          results: "You're all set — you're booked."
+        });
+      }
+
+      const lowerMessage = String(message).toLowerCase();
+
+      if (lowerMessage.includes("already booked")) {
+        return res.json({
+          results: "It looks like you're already booked into that class."
+        });
+      }
+
+      if (lowerMessage.includes("waitlist")) {
+        return res.json({
+          results: "I couldn't complete that booking directly — it looks like that class may only be available by waitlist. Would you like me to connect you with the front desk?"
+        });
+      }
+
+      if (lowerMessage.includes("payment")) {
+        return res.json({
+          results: "I couldn't complete that booking because there may be a payment or pass issue on the account. Would you like me to connect you with the front desk?"
+        });
+      }
+
+      return res.json({
+        results: "I couldn't complete that booking — would you like me to try a different time or connect you with the front desk?"
+      });
+    } catch (err) {
+      console.log("BOOKING ERROR:", err);
+
+      return res.json({
+        results: "I couldn't complete that booking — would you like me to try a different time or connect you with the front desk?"
+      });
+    }
+  }
+
+  /* =========================
+  SCHEDULE
+  ========================= */
 
   if (action !== "get_schedule") {
     return res.json({
