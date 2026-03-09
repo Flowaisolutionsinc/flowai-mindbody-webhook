@@ -531,6 +531,25 @@ async function resolveBookingClassId(classInput) {
 
   if (!match) {
     match = allClasses.find(c =>
+      target.includes(c.normalizedName) &&
+      target.includes(c.normalizedTime)
+    );
+  }
+
+  if (!match) {
+    match = allClasses.find(c =>
+      target.includes(c.normalizedName)
+    );
+  }
+
+  if (!match) {
+    match = allClasses.find(c =>
+      target.includes(c.normalizedTime)
+    );
+  }
+
+  if (!match) {
+    match = allClasses.find(c =>
       c.normalizedLabel.includes(target) || target.includes(c.normalizedLabel)
     );
   }
