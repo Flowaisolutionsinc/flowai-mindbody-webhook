@@ -329,7 +329,14 @@ function emailMatches(client, email) {
 async function findExistingClient({ firstName, lastName, phone, email }) {
   const searchTerms = [];
 
-  if (phone) searchTerms.push(phone);
+  // Strip +1 or 1 country code prefix for Mindbody search compatibility
+  let cleanedPhone = phone ? normalizePhone(phone) : "";
+  if (cleanedPhone.length === 11 && cleanedPhone.startsWith("1")) {
+    cleanedPhone = cleanedPhone.slice(1);
+  }
+  console.log("Original phone:", phone, "→ Cleaned phone for search:", cleanedPhone);
+
+  if (cleanedPhone) searchTerms.push(cleanedPhone);
   if (email) searchTerms.push(email);
   if (firstName || lastName) {
     searchTerms.push(`${firstName || ""} ${lastName || ""}`.trim());
