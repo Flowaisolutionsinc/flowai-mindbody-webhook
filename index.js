@@ -448,6 +448,103 @@ function normalize(classes) {
     .sort((a, b) => a.localMillis - b.localMillis);
 }
 
+function normalizeText(value = "") {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s]/g, "")
+    .trim();
+}
+
+function buildClassLabel(c) {
+  return `${c.time} ${c.name} with ${c.instructor}`;
+}
+
+async function getClassesForDate(iso) {
+  let classes = getCache(iso) || [];
+
+  if (classes.length) {
+    console.log("CACHE HIT:", iso);
+    return classes;
+  }
+
+  console.log("CACHE MISS:", iso);
+
+  const raw = await fetchClasses(iso);
+  classes = normalize(raw);
+  setCache(iso, classes);
+
+  return classes;
+}
+
+async function resolveBookingClassId(classInput) {
+  if (!classInput) return null;
+
+  if (/^\d+$/.test(String(classInput).trim())) {
+    return String(classInput).trim();
+  }
+
+  const target = normalizeText(classInput);
+  const today = DateTime.now().setZone(STUDIO_TIMEZONE).startOf("day");
+
+  const allClasses = [];
+
+  for (let i = 0; i < 7; i++) {
+    const d = today.plus({ days: i });
+    const iso = d.toFormat("yyyy-MM-dd");
+
+    try {
+      const classes = await getClassesForDate(iso);
+      for (const c of classes) {
+        allClasses.push({
+          ...c,
+          iso,
+          label: buildClassLabel(c),
+          normalizedLabel: normalizeText(buildClassLabel(c)),
+          normalizedName: normalizeText(c.name),
+          normalizedTime: normalizeText(c.time),
+          normalizedInstructor: normalizeText(c.instructor)
+        });
+      }
+    } catch (err) {
+      console.log("Class resolution fetch failed for date:", iso, err.message);
+    }
+  }
+
+  let match = allClasses.find(c => c.normalizedLabel === target);
+
+  if (!match) {
+    match = allClasses.find(c =>
+      target.includes(c.normalizedTime) &&
+      target.includes(c.normalizedName) &&
+      target.includes(c.normalizedInstructor)
+    );
+  }
+
+  if (!match) {
+    match = allClasses.find(c =>
+      target.includes(c.normalizedTime) &&
+      target.includes(c.normalizedName)
+    );
+  }
+
+  if (!match) {
+    match = allClasses.find(c =>
+      c.normalizedLabel.includes(target) || target.includes(c.normalizedLabel)
+    );
+  }
+
+  if (!match) {
+    console.log("Could not resolve class input:", classInput);
+    return null;
+  }
+
+  console.log("Resolved booking classId:", match.id, "for label:", match.label, "on", match.iso);
+
+  return match.id;
+}
+
 /* =========================
 SPEECH BUILDER
 ========================= */
@@ -587,151 +684,17 @@ async function handler(req, res) {
         });
       }
 
+      const resolvedClassId = await resolveBookingClassId(classId);
+
+      if (!resolvedClassId) {
+        return res.json({
+          results: "I couldn't match that class exactly — would you like me to try again or connect you with the front desk?"
+        });
+      }
+
       const bookingResponse = await bookExistingClientIntoClass({
         clientId: client.Id,
-        classId
+        classId: resolvedClassId
       });
 
-      const visits = Array.isArray(bookingResponse?.Visits) ? bookingResponse.Visits : [];
-      const errorCode = bookingResponse?.ErrorCode;
-      const message = bookingResponse?.Message || bookingResponse?.ErrorMessage || "";
-
-      if (visits.length > 0 && !errorCode) {
-        return res.json({
-          results: "You're all set — you're booked."
-        });
-      }
-
-      const lowerMessage = String(message).toLowerCase();
-
-      if (lowerMessage.includes("already booked")) {
-        return res.json({
-          results: "It looks like you're already booked into that class."
-        });
-      }
-
-      if (lowerMessage.includes("waitlist")) {
-        return res.json({
-          results: "I couldn't complete that booking directly — it looks like that class may only be available by waitlist. Would you like me to connect you with the front desk?"
-        });
-      }
-
-      if (lowerMessage.includes("payment")) {
-        return res.json({
-          results: "I couldn't complete that booking because there may be a payment or pass issue on the account. Would you like me to connect you with the front desk?"
-        });
-      }
-
-      return res.json({
-        results: "I couldn't complete that booking — would you like me to try a different time or connect you with the front desk?"
-      });
-    } catch (err) {
-      console.log("BOOKING ERROR:", err);
-
-      return res.json({
-        results: "I couldn't complete that booking — would you like me to try a different time or connect you with the front desk?"
-      });
-    }
-  }
-
-  if (action !== "get_schedule") {
-    return res.json({
-      results: "Unsupported action."
-    });
-  }
-
-  const datePhrase = decodeURIComponent(req.body.date || req.query.date || "today");
-
-  console.log("DATE PHRASE RECEIVED:", datePhrase);
-
-  try {
-    const date = parseDate(datePhrase);
-    const iso = dateISO(date);
-
-    let classes = getCache(iso) || [];
-
-    if (classes.length) {
-      console.log("CACHE HIT:", iso);
-    } else {
-      console.log("CACHE MISS:", iso);
-
-      const raw = await fetchClasses(iso);
-      classes = normalize(raw);
-      setCache(iso, classes);
-    }
-
-    const timeFilter = parseTimeOfDay(datePhrase);
-
-    if (timeFilter && classes.length) {
-      classes = classes.filter(c => {
-        if (c.localHour === null) return false;
-        return c.localHour >= timeFilter.start && c.localHour < timeFilter.end;
-      });
-    }
-
-    let spokenDate;
-
-    if (datePhrase.toLowerCase().includes("tomorrow")) {
-      spokenDate = "tomorrow";
-    } else if (datePhrase.toLowerCase().includes("today")) {
-      spokenDate = "today";
-    } else {
-      spokenDate = date.toFormat("cccc, LLLL d");
-    }
-
-    const speech = buildSpeech(spokenDate, classes, datePhrase);
-
-    console.log("----- WEBHOOK RESPONSE -----");
-    console.log(speech);
-
-    return res.json({
-      results: speech
-    });
-  } catch (err) {
-    console.log("ERROR:", err);
-
-    return res.json({
-      results: "I'm not able to pull the schedule up right now — would you like me to connect you with the front desk?"
-    });
-  }
-}
-
-/* =========================
-ROUTES
-========================= */
-
-app.post("/ghl/mindbody", handler);
-app.get("/ghl/mindbody", handler);
-
-app.post("/ghl/mindbody/speak", handler);
-app.get("/ghl/mindbody/speak", handler);
-
-/* =========================
-HEALTH CHECK
-========================= */
-
-app.get("/debug", (req, res) => {
-  res.send("Webhook server alive");
-});
-
-/* =========================
-START SERVER
-========================= */
-
-warmCache();
-
-getMindbodyUserToken()
-  .then(() => {
-    console.log("Mindbody user token ready");
-  })
-  .catch(err => {
-    console.log("Mindbody user token warmup failed:", err.message);
-  });
-
-setInterval(() => {
-  warmCache();
-}, 15 * 60 * 1000);
-
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+      const visits = Array
