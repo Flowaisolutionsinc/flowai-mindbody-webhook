@@ -102,7 +102,7 @@ function parseTimeOfDay(text) {
   text = String(text || "").toLowerCase();
 
   if (text.includes("morning")) return { start: 0, end: 12 };
-  if (text.includes("afternoon")) return { start: 12, end: 17 };
+  if (text.includes("afternoon")) return { start: 12, end: 24 };
   if (text.includes("evening")) return { start: 17, end: 24 };
   if (text.includes("night")) return { start: 19, end: 24 };
 
@@ -740,6 +740,33 @@ async function handler(req, res) {
       const resolvedClassId = await resolveBookingClassId(classId);
 
       console.log("Resolved class ID:", resolvedClassId !== null ? resolvedClassId : "NOT RESOLVED");
+
+      // Block bookings more than 7 days in advance
+      if (resolvedClassId) {
+        const allClasses = [];
+        const today = DateTime.now().setZone(STUDIO_TIMEZONE).startOf("day");
+        for (let i = 0; i < 8; i++) {
+          const d = today.plus({ days: i });
+          const iso = d.toFormat("yyyy-MM-dd");
+          try {
+            const classes = await getClassesForDate(iso);
+            for (const c of classes) {
+              if (String(c.id) === String(resolvedClassId)) {
+                const classDate = DateTime.fromISO(c.start, { setZone: true }).setZone(STUDIO_TIMEZONE).startOf("day");
+                const daysAhead = classDate.diff(today, "days").days;
+                if (daysAhead > 7) {
+                  console.log("Booking blocked — class is more than 7 days out:", daysAhead, "days");
+                  return res.json({
+                    results: "Sorry, bookings can only be made up to 7 days in advance."
+                  });
+                }
+              }
+            }
+          } catch (err) {
+            console.log("Date check error:", err.message);
+          }
+        }
+      }
 
       if (!resolvedClassId) {
         return res.json({
