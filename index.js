@@ -398,14 +398,19 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
     return matched;
   }
 
-  matched = uniqueClients.find(client => emailMatches(client, email));
+   matched = uniqueClients.find(client => emailMatches(client, email));
   if (matched) {
     console.log("Matched by email only:", matched.FirstName, matched.LastName);
     return matched;
   }
 
+  // If exactly one client found and name matches, trust it
+  if (uniqueClients.length === 1 && namesMatch(uniqueClients[0], firstName, lastName)) {
+    console.log("Matched by name only (single result):", uniqueClients[0].FirstName, uniqueClients[0].LastName);
+    return uniqueClients[0];
+  }
+
   return null;
-}
 
 async function bookExistingClientIntoClass({ clientId, classId }) {
   const payload = {
