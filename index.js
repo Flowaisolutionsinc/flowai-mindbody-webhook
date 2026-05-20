@@ -410,7 +410,8 @@ async function findExistingClient({ firstName, lastName, phone, email }) {
     return uniqueClients[0];
   }
 
-  return null;
+    return null;
+}
 
 async function bookExistingClientIntoClass({ clientId, classId }) {
   const payload = {
