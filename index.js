@@ -695,25 +695,26 @@ function buildSpeech(dateLabel, classes, datePhrase) {
     return `I couldn't find any classes for ${datePhrase}.`;
   }
 
-  const list = classes.map(c => `${c.time} ${c.name} with ${c.instructor}`);
+  const list = classes.map(c => `${c.time}, ${c.name} with ${c.instructor}.`);
+  const listText = list.join(" ");
 
   if (datePhrase.toLowerCase().includes("morning")) {
-    return `The classes for ${dateLabel} morning are: ${list.join(", ")}.`;
+    return `The classes for ${dateLabel} morning are: ${listText}`;
   }
 
   if (datePhrase.toLowerCase().includes("afternoon")) {
-    return `The classes for ${dateLabel} afternoon are: ${list.join(", ")}.`;
+    return `The classes for ${dateLabel} afternoon are: ${listText}`;
   }
 
   if (datePhrase.toLowerCase().includes("evening")) {
-    return `The classes for ${dateLabel} evening are: ${list.join(", ")}.`;
+    return `The classes for ${dateLabel} evening are: ${listText}`;
   }
 
   if (datePhrase.toLowerCase().includes("night")) {
-    return `The classes for ${dateLabel} night are: ${list.join(", ")}.`;
+    return `The classes for ${dateLabel} night are: ${listText}`;
   }
 
-  return `The classes for ${dateLabel} are: ${list.join(", ")}.`;
+  return `The classes for ${dateLabel} are: ${listText}`;
 }
 
 /* =========================
