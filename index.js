@@ -548,7 +548,7 @@ NORMALIZE CLASSES
 function normalize(classes, timezone) {
   return classes
     .map(c => {
-      const localStart = DateTime.fromISO(c.StartDateTime, { setZone: true }).setZone(timezone);
+      const localStart = DateTime.fromISO(c.StartDateTime, { zone: timezone });
       const time = localStart.isValid ? localStart.toFormat("h:mm a") : "Time unavailable";
 
       return {
@@ -850,7 +850,7 @@ async function handler(req, res) {
             const classes = await getClassesForDate(effectiveStudioKey, studio, iso);
             for (const c of classes) {
               if (String(c.id) === String(resolvedClassId)) {
-                const classDate = DateTime.fromISO(c.start, { setZone: true }).setZone(studio.timezone).startOf("day");
+                const classDate = DateTime.fromISO(c.start, { zone: studio.timezone }).startOf("day");
                 const daysAhead = classDate.diff(today, "days").days;
                 if (daysAhead > 7) {
                   console.log(`[${effectiveStudioKey}] Booking blocked — class is more than 7 days out:`, daysAhead, "days");
