@@ -12,6 +12,11 @@ const BASE_URL = process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.co
 
 const API_KEY = process.env.MINDBODY_API_KEY;
 
+// Global booking window.
+// Keep Railway variable DAYS_AHEAD_MAX set to 7 for Oxygen.
+// If the policy changes later, update Railway only — no code edit needed.
+const DAYS_AHEAD_MAX = Number(process.env.DAYS_AHEAD_MAX || 7);
+
 /*
   SCALING SETUP:
   - One Railway service.
@@ -513,7 +518,7 @@ async function handler(req, res) {
             for (const c of classes) {
               if (String(c.id) === String(resolvedClassId)) {
                 const daysAhead = DateTime.fromISO(c.start, { zone: studio.timezone }).startOf("day").diff(today, "days").days;
-                if (daysAhead > 7) return res.json({ results: "Sorry, bookings can only be made up to 7 days in advance." });
+                if (daysAhead > DAYS_AHEAD_MAX) return res.json({ results: `Sorry, bookings can only be made up to ${DAYS_AHEAD_MAX} days in advance.` });
               }
             }
           } catch (err) {
@@ -602,4 +607,5 @@ START SERVER
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
   console.log("Configured studios:", Object.keys(STUDIO_CONFIG).join(", ") || "(none)");
+  console.log("Days ahead max:", DAYS_AHEAD_MAX);
 });
