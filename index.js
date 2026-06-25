@@ -37,6 +37,10 @@ function normalizeStudioKey(value = "") {
   return String(value || "").trim();
 }
 
+function configuredStudioKeys() {
+  return Object.keys(STUDIO_CONFIG).sort();
+}
+
 function resolveStudioConfig(studioKey) {
   const key = normalizeStudioKey(studioKey);
   if (!key) return null;
@@ -452,8 +456,22 @@ async function handler(req, res) {
   console.log("Body:", req.body);
   console.log("Query:", req.query);
 
-  if (!studio) {
+  if (!studioKey) {
+    console.log("Missing studioKey. Configured studios:", configuredStudioKeys().join(", ") || "(none)");
     return res.json({
+      success: false,
+      error: "missing_studio_key",
+      results: "This studio isn't configured yet — please contact support."
+    });
+  }
+
+  if (!studio) {
+    console.log(`Invalid studioKey received: "${studioKey}"`);
+    console.log("Configured studios:", configuredStudioKeys().join(", ") || "(none)");
+    return res.json({
+      success: false,
+      error: "invalid_studio_key",
+      studioKey,
       results: "This studio isn't configured yet — please contact support."
     });
   }
@@ -606,6 +624,6 @@ START SERVER
 
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
-  console.log("Configured studios:", Object.keys(STUDIO_CONFIG).join(", ") || "(none)");
+  console.log("Configured studios:", configuredStudioKeys().join(", ") || "(none)");
   console.log("Days ahead max:", DAYS_AHEAD_MAX);
 });
