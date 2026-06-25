@@ -12,13 +12,13 @@ const BASE_URL = process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.co
 
 const API_KEY = process.env.MINDBODY_API_KEY;
 
-const LEGACY_CONFIG = {
-  siteId: process.env.MINDBODY_SITE_ID,
-  locationId: process.env.MINDBODY_LOCATION_ID || "1",
-  staffUsername: process.env.MINDBODY_STAFF_USERNAME,
-  staffPassword: process.env.MINDBODY_STAFF_PASSWORD,
-  timezone: process.env.TZ || "America/Vancouver"
-};
+/*
+  SCALING SETUP:
+  - One Railway service.
+  - One shared codebase.
+  - Every studio lives inside STUDIO_CONFIG_JSON.
+  - GHL sends studioKey, for example: oxygen_roundhouse, fort_mcmurray, manning.
+*/
 
 let STUDIO_CONFIG = {};
 try {
@@ -28,10 +28,15 @@ try {
   STUDIO_CONFIG = {};
 }
 
-function resolveStudioConfig(studioKey) {
-  if (!studioKey) return LEGACY_CONFIG;
+function normalizeStudioKey(value = "") {
+  return String(value || "").trim();
+}
 
-  const config = STUDIO_CONFIG[studioKey];
+function resolveStudioConfig(studioKey) {
+  const key = normalizeStudioKey(studioKey);
+  if (!key) return null;
+
+  const config = STUDIO_CONFIG[key];
   if (!config) return null;
 
   return {
@@ -410,55 +415,45 @@ function buildSpeech(dateLabel, classes, datePhrase) {
   return `The classes for ${dateLabel} are: ${listText}`;
 }
 
-async function warmCacheForStudio(studioKey, studio) {
-  const today = DateTime.now().setZone(studio.timezone).startOf("day");
-  for (let i = 0; i < 7; i++) {
-    const iso = today.plus({ days: i }).toFormat("yyyy-MM-dd");
-    try {
-      const raw = await fetchClasses(studioKey, studio, iso);
-      setCache(studioKey, iso, normalize(raw, studio.timezone));
-      console.log(`[${studioKey}] Cache updated:`, iso);
-    } catch (err) {
-      console.log(`[${studioKey}] Cache warm error:`, err.message);
-    }
-  }
-}
+/*
+  No global cache warming.
 
-function allStudios() {
-  const entries = [["__legacy__", LEGACY_CONFIG]];
-  for (const [key] of Object.entries(STUDIO_CONFIG)) {
-    const resolved = resolveStudioConfig(key);
-    if (resolved) entries.push([key, resolved]);
-  }
-  return entries;
-}
+  Important for scaling:
+  The old version refreshed every studio every 15 minutes.
+  At 200 studios, that would mean 200 studios x 7 days = 1,400 schedule fetches
+  every 15 minutes, even if nobody called.
 
-async function warmAllCaches() {
-  console.log("Warming schedule cache for all studios...");
-  for (const [studioKey, studio] of allStudios()) {
-    if (!studio.siteId) continue;
-    await warmCacheForStudio(studioKey, studio);
-  }
-}
+  This version loads schedules on demand:
+  - First caller for a studio/date = cache miss, fetch from Mindbody.
+  - Next callers for the same studio/date within 15 minutes = cache hit.
+*/
 
 /* =========================
 WEBHOOK HANDLER
 ========================= */
 
 async function handler(req, res) {
-  const studioKey = req.params.studioKey || null;
+  const studioKey = normalizeStudioKey(
+    req.params.studioKey ||
+    req.body.studioKey ||
+    req.query.studioKey ||
+    ""
+  );
+
   const studio = resolveStudioConfig(studioKey);
 
   console.log("----- WEBHOOK REQUEST -----");
-  console.log("Studio key:", studioKey || "(legacy/default)");
+  console.log("Studio key:", studioKey || "(missing)");
   console.log("Body:", req.body);
   console.log("Query:", req.query);
 
   if (!studio) {
-    return res.json({ results: "This studio isn't configured yet — please contact support." });
+    return res.json({
+      results: "This studio isn't configured yet — please contact support."
+    });
   }
 
-  const effectiveStudioKey = studioKey || "__legacy__";
+  const effectiveStudioKey = studioKey;
   const action = req.body.action || req.query.action;
 
   // Lookup caller by inbound phone number at the start of every call
@@ -604,12 +599,7 @@ app.get("/debug", (req, res) => { res.send("Webhook server alive"); });
 START SERVER
 ========================= */
 
-warmAllCaches();
-
-getMindbodyUserToken("__legacy__", LEGACY_CONFIG)
-  .then(() => console.log("Mindbody user token ready for legacy studio"))
-  .catch(err => console.log("Mindbody user token warmup failed for legacy studio:", err.message));
-
-setInterval(warmAllCaches, 15 * 60 * 1000);
-
-app.listen(PORT, () => { console.log("Server running on port", PORT); });
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+  console.log("Configured studios:", Object.keys(STUDIO_CONFIG).join(", ") || "(none)");
+});
