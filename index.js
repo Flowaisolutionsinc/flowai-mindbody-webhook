@@ -128,10 +128,19 @@ function dateISO(date) { return date.toFormat("yyyy-MM-dd"); }
 
 function parseTimeOfDay(text) {
   text = String(text || "").toLowerCase();
-  if (text.includes("morning")) return { start: 0, end: 12 };
-  if (text.includes("afternoon")) return { start: 12, end: 24 };
-  if (text.includes("evening")) return { start: 17, end: 24 };
-  if (text.includes("night")) return { start: 19, end: 24 };
+
+  if (text.includes("morning")) {
+    return { label: "morning", start: 0, end: 12 };
+  }
+
+  if (text.includes("afternoon")) {
+    return { label: "afternoon", start: 12, end: 17 };
+  }
+
+  if (text.includes("evening") || text.includes("night")) {
+    return { label: "evening", start: 17, end: 24 };
+  }
+
   return null;
 }
 
@@ -415,13 +424,39 @@ async function resolveBookingClassId(studioKey, studio, classInput) {
 }
 
 function buildSpeech(dateLabel, classes, datePhrase) {
-  if (!classes || classes.length === 0) return `I couldn't find any classes for ${datePhrase}.`;
-  const listText = classes.map(c => `${c.time}, ${c.name} with ${c.instructor}.`).join(" ");
-  if (datePhrase.toLowerCase().includes("morning")) return `The classes for ${dateLabel} morning are: ${listText}`;
-  if (datePhrase.toLowerCase().includes("afternoon")) return `The classes for ${dateLabel} afternoon are: ${listText}`;
-  if (datePhrase.toLowerCase().includes("evening")) return `The classes for ${dateLabel} evening are: ${listText}`;
-  if (datePhrase.toLowerCase().includes("night")) return `The classes for ${dateLabel} night are: ${listText}`;
-  return `The classes for ${dateLabel} are: ${listText}`;
+  if (!classes || classes.length === 0) {
+    return `I couldn't find any classes for ${datePhrase}.`;
+  }
+
+  const lowerDatePhrase = String(datePhrase || "").toLowerCase();
+  const hasTimeOfDay =
+    lowerDatePhrase.includes("morning") ||
+    lowerDatePhrase.includes("afternoon") ||
+    lowerDatePhrase.includes("evening") ||
+    lowerDatePhrase.includes("night");
+
+  // If the caller asks broadly, do not make the AI read a long full-day list.
+  // This keeps the receptionist sounding natural and makes the caller choose a smaller window first.
+  if (!hasTimeOfDay && classes.length > 4) {
+    return `There are quite a few classes for ${dateLabel}. Ask the caller: "Are you looking for morning, afternoon, or evening classes?" Do not read the full schedule yet.`;
+  }
+
+  const classesToRead = classes.slice(0, 4);
+
+  // Blank lines and full sentences help GoHighLevel Voice AI pause between class options.
+  const listText = classesToRead
+    .map(c => `At ${c.time}, there is ${c.name} with ${c.instructor}.`)
+    .join("\n\n");
+
+  const moreText =
+    classes.length > 4
+      ? "\n\nThere are more options too. Ask if they'd like to hear more."
+      : "";
+
+  const timeOfDay = parseTimeOfDay(datePhrase);
+  const timeLabel = timeOfDay?.label ? ` ${timeOfDay.label}` : "";
+
+  return `Here are the classes for ${dateLabel}${timeLabel}:\n\n${listText}${moreText}`;
 }
 
 /*
